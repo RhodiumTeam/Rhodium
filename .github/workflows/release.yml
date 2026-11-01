@@ -1,0 +1,76 @@
+# Make the install packages for a release (#385): scripts/package.sh on an x86_64 and an arm64
+# runner, then a draft GitHub Release v<version> with both and their SHA256SUMS, for a maintainer to
+# read and publish. Run by hand only, and only in the public repository: the private one carries this
+# file too. How to run it: deploy/README.md, 打安装包.
+name: Release packages
+
+on: workflow_dispatch
+
+permissions: {}
+
+# Two runs at once would make two drafts of one version.
+concurrency: release
+
+jobs:
+  package:
+    if: github.repository == 'RhodiumTeam/Rhodium'
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.versions.outputs.rhodium }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The Bun the notices are written for (scripts/notices.ts): rhodium carries its runtime.
+      - id: versions
+        run: |
+          bun=$(basename release/licenses/bun-*.md .md)
+          echo "bun=${bun#bun-}" >>"$GITHUB_OUTPUT"
+          echo "rhodium=$(jq -r .version package.json)" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.versions.outputs.bun }}
+      # package.sh installs the Rust its notices are written for itself.
+      - run: scripts/package.sh dist ${{ matrix.arch }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.arch }}
+          path: dist/*.tar.xz
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.package.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - working-directory: dist
+        run: sha256sum -- *.tar.xz | tee SHA256SUMS
+      # A draft of this version already there gets this run's files in place of its own, its notes
+      # kept; a published one is never touched.
+      - run: |
+          tag="v$VERSION"
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
+            [ "$draft" = true ] || { echo "$tag 已经发布过了：先升 package.json 和 holder/Cargo.toml 里的版本" >&2; exit 1; }
+            gh release view "$tag" --json assets --jq '.assets[].name' | while read -r a; do gh release delete-asset "$tag" "$a" --yes; done
+            gh release edit "$tag" --target "$GITHUB_SHA"
+          else
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Rhodium $VERSION" \
+              --notes "Linux 的安装包，x86_64 和 arm64 各一个。装法见包里的 INSTALLATION.md。下载后可以用 sha256sum -c --ignore-missing SHA256SUMS 校验。"
+          fi
+          gh release upload "$tag" dist/*

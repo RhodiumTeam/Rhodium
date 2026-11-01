@@ -1,0 +1,6 @@
+0 {"id":"get_state-0","type":"get_state"}
+1158 {"id":"new_session-1","type":"new_session"}
+1265 {"id":"get_state-2","type":"get_state"}
+2423 {"id":"switch_session-3","type":"switch_session","sessionPath":"/tmp/scratchpad/pi-probe-9/sessions/2026-01-01T00-00-00-386Z_00000000-0000-4000-8000-4c4a2a950dc8.jsonl"}
+2536 {"id":"get_state-4","type":"get_state"}
+3694 {"id":"get_messages-5","type":"get_messages"}

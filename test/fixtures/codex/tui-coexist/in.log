@@ -1,0 +1,4 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":true,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/resume","params":{"threadId":"00000000-0000-7000-8000-8d5c554c3185","cwd":"/tmp/codex-probe/work/project","excludeTurns":true}}
+3409 {"id":2,"method":"thread/loaded/list","params":{}}

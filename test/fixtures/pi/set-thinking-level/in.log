@@ -1,0 +1,3 @@
+0 {"id":"set_thinking_level-0","type":"set_thinking_level","level":"bogus"}
+142 {"id":"set_thinking_level-2","type":"set_thinking_level","level":"low"}
+284 {"id":"get_state-4","type":"get_state"}

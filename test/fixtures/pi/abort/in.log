@@ -1,0 +1,2 @@
+0 {"id":"prompt-0","type":"prompt","message":"Run `sleep 30` with the bash tool."}
+19231 {"id":"abort-32","type":"abort"}

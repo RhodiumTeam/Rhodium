@@ -1,0 +1,5 @@
+{"id":0,"result":{"userAgent":"rhodium_probe/0.162.1 (Ubuntu 24.4.0; x86_64) unknown (rhodium_probe; 0.0.0)","codexHome":"/home/user/.codex","platformFamily":"unix","platformOs":"linux"}}
+{"method":"configWarning","params":{"summary":"Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces.","details":null},"emittedAtMs":1767225600750}
+{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"myhost","installationId":"redacted-installationId","environmentId":null},"emittedAtMs":1767225600750}
+{"error":{"code":-32600,"message":"thread 00000000-0000-7000-8000-8d5c554c3185 already has an active writer"},"id":1}
+{"method":"account/updated","params":{"authMode":"chatgpt","planType":"plus"},"emittedAtMs":1767225601316}

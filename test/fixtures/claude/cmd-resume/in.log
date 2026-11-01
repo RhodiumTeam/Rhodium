@@ -1,0 +1,2 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22295 {"type":"user","uuid":"00000000-0000-4000-8000-630a49a7cd23","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Which word did I ask you to remember? Reply with just the word."}]}}

@@ -1,0 +1,6 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":true,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/start","params":{"cwd":"/tmp/codex-probe/work/project","model":"gpt-6-luna","approvalPolicy":"on-request","sandbox":"read-only"}}
+3159 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-ca62b46ae96f","input":[{"type":"text","text":"Create an empty file pending.txt with `touch pending.txt`. You need write access, so request escalated permissions.","text_elements":[]}],"effort":"low"}}
+15887 {"id":3,"method":"turn/interrupt","params":{"threadId":"00000000-0000-7000-8000-ca62b46ae96f","turnId":"00000000-0000-7000-8000-134b477f83b5"}}
+16974 {"id":0,"result":{"decision":"accept"}}

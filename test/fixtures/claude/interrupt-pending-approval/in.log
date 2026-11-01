@@ -1,0 +1,4 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22299 {"type":"user","uuid":"00000000-0000-4000-8000-2d3533c78458","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Use the Bash tool to run exactly: touch c.txt"}]}}
+31901 {"type":"control_request","request_id":"rh-1-2","request":{"subtype":"interrupt"}}
+37339 {"type":"user","uuid":"00000000-0000-4000-8000-6a89ffc72ccb","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Never mind that. Reply with exactly: OK"}]}}

@@ -1,0 +1,3 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22309 {"type":"user","uuid":"00000000-0000-4000-8000-ee0e46e8f27c","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Use the Agent tool with run_in_background set to true to start one general-purpose subagent with this task: \"Run the Bash command `sleep 30`, then reply with exactly SUB-DONE.\" Do not wait for it. Reply STARTED and end your turn."}]}}
+44823 {"type":"user","uuid":"00000000-0000-4000-8000-dcb8fd9e3c55","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Reply with exactly: SECOND"}]}}

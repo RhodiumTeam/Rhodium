@@ -1,0 +1,5 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22299 {"type":"user","uuid":"00000000-0000-4000-8000-d24b59d7e303","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Use the Bash tool to run exactly: echo first > a.txt"}]}}
+31287 {"type":"control_response","response":{"subtype":"success","request_id":"00000000-0000-4000-8000-32d1010c41b4","response":{"behavior":"allow","updatedInput":{"command":"echo first > a.txt","description":"Write \"first\" into a.txt"},"decisionClassification":"user_temporary"}}}
+41425 {"type":"user","uuid":"00000000-0000-4000-8000-171f0d3352c1","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Use the Bash tool to run exactly: echo second > b.txt"}]}}
+50411 {"type":"control_response","response":{"subtype":"success","request_id":"00000000-0000-4000-8000-dbfa6f978e0b","response":{"behavior":"deny","message":"The user denied this command.","decisionClassification":"user_reject"}}}

@@ -1,0 +1,1 @@
+{"agent":"claude","version":"2.1.304","scenario":"approvals-off-questions","edited":true,"note":"Real probe 6 recording; the question answer in in.log gained decisionClassification user_temporary, which the driver puts on every allow."}

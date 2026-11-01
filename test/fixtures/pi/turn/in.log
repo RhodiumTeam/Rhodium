@@ -1,0 +1,3 @@
+0 {"id":"prompt-0","type":"prompt","message":"Run `echo hello from bash` with the bash tool, then reply with the single word: done."}
+31290 {"id":"get_state-47","type":"get_state"}
+32449 {"id":"get_entries-48","type":"get_entries"}

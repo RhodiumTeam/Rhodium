@@ -1,0 +1,2 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22299 {"type":"control_request","request_id":"rh-1-2","request":{"subtype":"get_context_usage","detail":"summary"}}

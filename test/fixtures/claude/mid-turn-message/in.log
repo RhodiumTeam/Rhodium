@@ -1,0 +1,3 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22299 {"type":"user","uuid":"00000000-0000-4000-8000-59ae0e1fae8a","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Count from 1 to 40, one number per line, nothing else."}]}}
+27376 {"type":"user","uuid":"00000000-0000-4000-8000-5bee55879095","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Also, after the last number, write the word DONE."}]}}

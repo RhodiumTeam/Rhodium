@@ -1,0 +1,4 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":true,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/resume","params":{"threadId":"00000000-0000-7000-8000-8d5c554c3185","cwd":"/tmp/codex-probe/work/project"}}
+5249 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-8d5c554c3185","input":[{"type":"text","text":"Which file did you create earlier in this conversation? Reply with just the file name.","text_elements":[]}],"effort":"low","model":"gpt-5.6-luna"}}

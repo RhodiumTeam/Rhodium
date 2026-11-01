@@ -1,0 +1,3 @@
+[test]
+# Every bun test process caps its own memory first (docs/agents/testing.md).
+preload = ["./test/cap.ts"]

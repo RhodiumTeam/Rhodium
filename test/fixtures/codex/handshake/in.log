@@ -1,0 +1,6 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":true,"requestAttestation":false}}}
+563 {"method":"initialized"}
+563 {"id":1,"method":"model/list","params":{"includeHidden":false}}
+9551 {"id":2,"method":"account/read","params":{"refreshToken":false}}
+9925 {"id":3,"method":"account/rateLimits/read","params":{}}
+10795 {"id":4,"method":"thread/list","params":{"limit":3,"cwd":"/tmp/codex-probe/work/project","sourceKinds":["appServer","cli","vscode","exec"]}}

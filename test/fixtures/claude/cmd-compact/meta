@@ -1,0 +1,1 @@
+{"agent":"claude","version":"2.1.304","scenario":"cmd-compact","edited":true,"note":"Real cmd-compact recording; the line of the compaction summary that retold a plugin's SessionStart hook was taken out."}

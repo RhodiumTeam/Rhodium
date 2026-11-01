@@ -1,0 +1,4 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":false,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/start","params":{"cwd":"/tmp/rhodium-test-codex-probe-431/project","model":"gpt-5.6-terra","approvalPolicy":"never","sandbox":"danger-full-access"}}
+3245 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-692e078c3329","input":[{"type":"text","text":"Spawn one sub-agent (model gpt-6-luna, reasoning effort low) to run the shell command `sleep 20 && touch agent-done.txt`. Do not wait for it: right after spawning it, reply with the single word: ok.","text_elements":[]}],"effort":"ultra","model":"gpt-5.6-terra","clientUserMessageId":"c-1"}}

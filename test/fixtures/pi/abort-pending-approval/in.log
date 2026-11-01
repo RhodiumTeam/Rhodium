@@ -1,0 +1,4 @@
+0 {"id":"prompt-0","type":"prompt","message":"Run `echo pending` with the bash tool."}
+19163 {"id":"abort-31","type":"abort"}
+29400 {"type":"extension_ui_response","id":"00000000-0000-4000-8000-75acedd0fb5a","value":"allow"}
+29400 {"id":"get_state-42","type":"get_state"}

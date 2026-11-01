@@ -1,0 +1,3 @@
+#!/bin/sh
+# rh for the dev instance rhodium-dev, with its socket as deploy/upgrade.sh finds it (deploy/README.md).
+RHODIUM_SOCKET=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/rhodium-dev/rh.sock exec "$HOME/.local/opt/rhodium-dev/current/rh" "$@"

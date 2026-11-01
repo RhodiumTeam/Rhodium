@@ -1,0 +1,2 @@
+0 {"id":"prompt-0","type":"prompt","message":"Read notes.txt with the read tool, then run `echo approved` with the bash tool, then reply with the single word: done."}
+26126 {"type":"extension_ui_response","id":"00000000-0000-4000-8000-958512fd646c","value":"allow"}

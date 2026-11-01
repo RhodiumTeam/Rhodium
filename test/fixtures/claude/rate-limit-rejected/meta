@@ -1,0 +1,1 @@
+{"agent":"claude","version":"2.1.304","scenario":"rate-limit-rejected","edited":true,"note":"Real cmd-status recording, reshaped by hand: rate_limit_event set to rejected, the streamed reply replaced by the synthetic error message and error result the CLI sends when a limit rejects the request (shape from the 2.1.304 binary, not observed live)."}

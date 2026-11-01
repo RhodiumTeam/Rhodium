@@ -1,0 +1,208 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<defs>
+<style>
+.b0{fill:none;stroke:#3a4049;stroke-width:15;stroke-linejoin:round}
+.b1{fill:none;stroke:url(#ag);stroke-width:12;stroke-linejoin:round}
+.b2{fill:none;stroke:#fbfcfd;stroke-width:5;stroke-linejoin:round}
+.r0{fill:none;stroke:#2e0001;stroke-width:5.5;stroke-linejoin:round;stroke-linecap:round}
+.r1{fill:none;stroke:url(#ag);stroke-width:3.2;stroke-linejoin:round;stroke-linecap:round}
+.r2{fill:none;stroke:#fff;stroke-width:1;stroke-linejoin:round;stroke-linecap:round;transform:translate(-.6px,-.7px)}
+.ao{fill:#1d0000;opacity:.7;filter:url(#blur)}
+.f{fill:url(#eFr)}.t{fill:url(#eIn)}.l{fill:url(#eLip)}.h{fill:url(#hl)}
+.k0{fill:none;stroke:#3a4049;stroke-width:4.6;stroke-linejoin:round;stroke-linecap:round}
+.k1{fill:none;stroke:url(#as);stroke-width:2.4;stroke-linejoin:round;stroke-linecap:round}
+</style>
+<filter id="blur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="5"/></filter>
+<filter id="soft" x="-10%" y="-10%" width="120%" height="120%"><feGaussianBlur stdDeviation="2"/></filter>
+<linearGradient id="ag" gradientUnits="userSpaceOnUse" x1="100" y1="40" x2="400" y2="340">
+<stop offset="0" stop-color="#f7f9fb"/>
+<stop offset=".12" stop-color="#c3c9d1"/>
+<stop offset=".22" stop-color="#fff"/>
+<stop offset=".38" stop-color="#a7aeb8"/>
+<stop offset=".5" stop-color="#eef1f5"/>
+<stop offset=".64" stop-color="#8b939f"/>
+<stop offset=".78" stop-color="#e3e7ec"/>
+<stop offset=".9" stop-color="#9da4af"/>
+<stop offset="1" stop-color="#d9dde3"/>
+</linearGradient>
+<!-- silver rim on the steel parts: kept bright so they read on a dark page -->
+<linearGradient id="as" gradientUnits="userSpaceOnUse" x1="130" y1="330" x2="380" y2="510">
+<stop offset="0" stop-color="#fff"/>
+<stop offset=".25" stop-color="#d3d8de"/>
+<stop offset=".45" stop-color="#f4f6f8"/>
+<stop offset=".7" stop-color="#bfc5cd"/>
+<stop offset="1" stop-color="#eef1f4"/>
+</linearGradient>
+<!-- enamel reds sampled from the banner's rose: ruby-black, candy-apple, warm coral and peach highlights -->
+<radialGradient id="eIn" gradientUnits="userSpaceOnUse" cx="258" cy="170" r="175">
+<stop offset=".3" stop-color="#2e0001"/>
+<stop offset=".62" stop-color="#74070d"/>
+<stop offset=".86" stop-color="#cc0722"/>
+<stop offset="1" stop-color="#e34e4d"/>
+</radialGradient>
+<radialGradient id="eBud" gradientUnits="userSpaceOnUse" cx="264" cy="102" r="74" gradientTransform="translate(264 102) scale(1 .8) translate(-264 -102)">
+<stop offset="0" stop-color="#3a0102"/>
+<stop offset=".45" stop-color="#74070d"/>
+<stop offset=".8" stop-color="#cc0722"/>
+<stop offset="1" stop-color="#e34e4d"/>
+</radialGradient>
+<radialGradient id="eFr" cx=".36" cy=".42" r=".78">
+<stop offset="0" stop-color="#e34e4d"/>
+<stop offset=".18" stop-color="#cc0722"/>
+<stop offset=".42" stop-color="#980916"/>
+<stop offset=".7" stop-color="#5c0205"/>
+<stop offset="1" stop-color="#2e0001"/>
+</radialGradient>
+<linearGradient id="eLip" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#fd9f93"/>
+<stop offset=".3" stop-color="#e34e4d"/>
+<stop offset=".7" stop-color="#cc0722"/>
+<stop offset="1" stop-color="#980916"/>
+</linearGradient>
+<linearGradient id="hl" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#fef2ea" stop-opacity="0"/>
+<stop offset=".35" stop-color="#fef2ea" stop-opacity=".9"/>
+<stop offset=".7" stop-color="#fef2ea" stop-opacity=".55"/>
+<stop offset="1" stop-color="#fef2ea" stop-opacity="0"/>
+</linearGradient>
+<linearGradient id="hs" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#fef2ea" stop-opacity="0"/>
+<stop offset=".2" stop-color="#fef2ea" stop-opacity=".95"/>
+<stop offset=".6" stop-color="#fef2ea" stop-opacity=".8"/>
+<stop offset="1" stop-color="#fef2ea" stop-opacity="0"/>
+</linearGradient>
+<!-- green-black steel sampled from the banner's leaves: lit half with a green sheen, a dark fold, shadow half -->
+<linearGradient id="st" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#99c69c"/>
+<stop offset=".08" stop-color="#619669"/>
+<stop offset=".22" stop-color="#284b2f"/>
+<stop offset=".45" stop-color="#102213"/>
+<stop offset=".48" stop-color="#051408"/>
+<stop offset=".62" stop-color="#172f1b"/>
+<stop offset=".8" stop-color="#0d1c0f"/>
+<stop offset="1" stop-color="#09170c"/>
+</linearGradient>
+<linearGradient id="leafR" href="#st" gradientUnits="userSpaceOnUse" x1="294" y1="380" x2="312" y2="431"/>
+<linearGradient id="leafL" href="#st" gradientUnits="userSpaceOnUse" x1="193" y1="432" x2="186" y2="478"/>
+<linearGradient id="sep" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="#386a42"/>
+<stop offset=".45" stop-color="#172f1b"/>
+<stop offset="1" stop-color="#0c1a0d"/>
+</linearGradient>
+<pattern id="gu" width="9" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(-24)">
+<path d="M0 2Q2.25 0 4.5 2T9 2" fill="none" stroke="#260000" stroke-width=".7"/>
+</pattern>
+
+<path id="obl" d="M240 96C224 70 188 62 160 70C134 78 114 96 98 114C108 124 110 138 108 156C106 196 120 226 150 250L260 236Z"/>
+<path id="lobl" d="M217 75C205 67 182 64 160 70C134 78 114 96 98 114C116 106 136 92 160 83C182 76 204 76 217 75Z"/>
+<path id="obr" d="M290 96C306 70 342 60 370 66C394 72 410 88 420 104C410 116 406 130 406 148C406 190 392 222 366 252L256 240Z"/>
+<path id="lobr" d="M312 76C326 66 348 62 370 66C394 72 410 88 420 104C404 94 388 85 368 80C348 76 328 76 312 76Z"/>
+<path id="core" d="M150 120C170 84 220 74 258 74C300 74 350 84 368 120L370 240C330 290 186 292 150 244Z"/>
+<path id="bud" d="M205 106C205 53.1 333 53.1 333 106C333 150 300 176 266 176C230 176 205 150 205 106Z"/>
+<path id="sp" d="M271 106C271 116.6 249 116.6 249 106C249 91.1 285 91.1 285 106C285 131.9 231 131.9 231 106C231 74.6 307 74.6 307 106C307 155 205 155 205 106"/>
+<path id="l3l" d="M198 112C198 150 232 176 290 178C286 202 266 220 238 228C206 216 190 172 198 112Z"/>
+<path id="ll3l" d="M198 112C198 150 232 176 290 178C290 182 289 186 288 190C228 188 198 158 198 112Z"/>
+<path id="l3r" d="M338 106C338 150 300 180 232 182C240 204 260 222 288 228C322 214 344 170 338 106Z"/>
+<path id="ll3r" d="M338 106C338 150 300 180 232 182C233 186 233 190 234 194C304 192 340 156 338 106Z"/>
+<path id="l2l" d="M150 118C160 170 204 212 278 218C274 244 254 266 224 278C180 264 150 216 150 118Z"/>
+<path id="ll2l" d="M150 118C160 170 204 212 278 218C277 223 277 227 276 231C204 226 156 184 150 118Z"/>
+<path id="l2r" d="M372 104C364 162 318 210 236 218C242 246 262 268 296 278C338 262 370 212 372 104Z"/>
+<path id="ll2r" d="M372 104C364 162 318 210 236 218C237 223 237 227 238 231C322 224 368 174 372 104Z"/>
+<path id="f1" d="M104 200C130 240 190 264 270 266C314 266 352 254 386 232L330 296L272 332L258 342C146 330 98 270 104 200Z"/>
+<path id="lf1" d="M104 200C130 240 190 264 270 266C314 266 352 254 386 232C356 262 316 278 270 280C190 278 130 252 104 200Z"/>
+<path id="f2" d="M412 178C394 238 326 284 238 292C224 293 210 293 198 292C206 316 228 334 258 342C346 334 416 268 412 178Z"/>
+<path id="lf2" d="M412 178C394 238 326 284 238 292C224 293 210 293 198 292C214 302 228 306 242 306C332 300 398 252 412 178Z"/>
+<!-- calyx: narrow sepals curling back from under the bloom -->
+<path id="cxL" d="M250 328C230 328 212 336 200 350C192 359 189 369 181 383C192 372 199 363 208 355C220 346 236 341 252 340Z"/>
+<path id="cxR" d="M266 328C286 327 306 333 318 346C326 355 330 366 336 378C326 368 318 360 308 354C296 346 280 341 264 340Z"/>
+<path id="cxF" d="M252 337C254 354 250 368 241 383C256 372 266 356 268 337Z"/>
+<path id="stem" d="M268 342C270 392 232 434 240 504"/>
+<path id="lfR" d="M249 430Q253 424 260 405Q265 403 274 390Q280 390 291 381Q298 383 310 378Q316 380 329 378Q337 382 350 381Q357 382 372 386Q367 387 357 399Q351 400 342 412Q336 412 326 423Q320 423 309 432Q303 431 291 437Q284 435 272 438Q264 434 249 430Z"/>
+<path id="lfL" d="M240 468Q236 463 226 448Q222 448 211 438Q206 439 196 433Q190 435 179 432Q173 436 162 436Q156 441 144 442Q139 444 126 450Q131 450 141 459Q146 458 157 467Q162 466 172 473Q178 472 188 478Q194 476 205 480Q210 477 222 478Q227 473 240 468Z"/>
+<path id="th1" d="M257 398Q248 419 228 431Q243 427 254 426Z"/>
+<path id="th2" d="M244 452Q251 469 265 481Q252 478 242 475Z"/>
+<clipPath id="cb"><use href="#obl"/><use href="#obr"/><use href="#bud"/><use href="#f1"/><use href="#f2"/><use href="#l2l"/><use href="#l2r"/><use href="#core"/></clipPath>
+<clipPath id="cbud"><use href="#bud"/></clipPath>
+<clipPath id="cf1"><use href="#f1"/></clipPath>
+<clipPath id="cf2"><use href="#f2"/></clipPath>
+<clipPath id="cl2l"><use href="#l2l"/></clipPath>
+</defs>
+
+<!-- stem: green-black steel inside a bright silver rim -->
+<g fill="none" stroke-linecap="round">
+<use href="#stem" stroke="#3a4049" stroke-width="13"/>
+<use href="#stem" stroke="url(#as)" stroke-width="10.6"/>
+<use href="#stem" stroke="#0c1a0d" stroke-width="6.4"/>
+<use href="#stem" stroke="#386a42" stroke-width="2" transform="translate(-1.4 0)"/>
+<use href="#stem" stroke="#a5cfa8" stroke-width=".8" transform="translate(-1.9 0)"/>
+</g>
+<!-- thorns -->
+<use href="#th1" fill="url(#sep)"/><use href="#th1" class="k0" style="stroke-width:3.6"/><use href="#th1" class="k1" style="stroke-width:1.6"/>
+<use href="#th2" fill="url(#sep)"/><use href="#th2" class="k0" style="stroke-width:3.6"/><use href="#th2" class="k1" style="stroke-width:1.6"/>
+<!-- leaves -->
+<use href="#lfR" fill="url(#leafR)"/>
+<use href="#lfL" fill="url(#leafL)"/>
+<path d="M275 417L285 390M275 417L299 429M297 408L307 383M297 408L320 420M319 400L332 382M319 400L341 408M339 394L354 383M339 394L359 396M215 461L202 439M215 461L197 475M195 456L182 437M195 456L177 470M175 453L160 439M175 453L157 463M156 451L141 445M156 451L139 456" fill="none" stroke="#4f8558" stroke-width="1.2" stroke-linecap="round"/>
+<path d="M249 430Q307 399 372 386M240 468Q185 449 126 450" fill="none" stroke="#c3c9d1" stroke-width="1.5" stroke-linecap="round"/>
+<use href="#lfR" class="k0"/><use href="#lfR" class="k1"/>
+<use href="#lfL" class="k0"/><use href="#lfL" class="k1"/>
+
+<g transform="rotate(-4 258 200)">
+<!-- calyx -->
+<use href="#cxL" fill="url(#sep)"/><use href="#cxL" class="k0"/><use href="#cxL" class="k1"/>
+<use href="#cxR" fill="url(#sep)"/><use href="#cxR" class="k0"/><use href="#cxR" class="k1"/>
+<use href="#cxF" fill="url(#sep)"/><use href="#cxF" class="k0"/><use href="#cxF" class="k1"/>
+<!-- bezel -->
+<g>
+<use href="#obl" class="b0"/><use href="#obr" class="b0"/><use href="#bud" class="b0"/><use href="#l2l" class="b0"/><use href="#l2r" class="b0"/><use href="#f1" class="b0"/><use href="#f2" class="b0"/>
+<use href="#obl" class="b1"/><use href="#obr" class="b1"/><use href="#bud" class="b1"/><use href="#l2l" class="b1"/><use href="#l2r" class="b1"/><use href="#f1" class="b1"/><use href="#f2" class="b1"/>
+<use href="#obl" class="b2"/><use href="#obr" class="b2"/><use href="#bud" class="b2"/><use href="#l2l" class="b2"/><use href="#l2r" class="b2"/><use href="#f1" class="b2"/><use href="#f2" class="b2"/>
+</g>
+<use href="#core" fill="#1d0000"/>
+
+<!-- outer back petals -->
+<use href="#obl" class="t"/><use href="#obl" fill="url(#gu)" opacity=".22"/><use href="#lobl" class="l"/>
+<use href="#obl" class="r0"/><use href="#obl" class="r1"/><use href="#obl" class="r2"/>
+<use href="#obr" class="t"/><use href="#obr" fill="url(#gu)" opacity=".22"/><use href="#lobr" class="l"/>
+<use href="#obr" class="r0"/><use href="#obr" class="r1"/><use href="#obr" class="r2"/>
+
+<!-- bud: spiral of petal edges, crevice above each edge, rolled lip below -->
+<g clip-path="url(#cb)"><use href="#bud" class="ao"/></g>
+<use href="#bud" fill="url(#eBud)"/>
+<g clip-path="url(#cbud)" fill="none">
+<use href="#sp" stroke="#1d0000" stroke-width="8" opacity=".75" filter="url(#soft)" transform="translate(0 -3.5)"/>
+<use href="#sp" stroke="#fd9f93" stroke-width="2.6" opacity=".85" transform="translate(0 3.4)"/>
+</g>
+<path clip-path="url(#cbud)" d="M213 100C214 80 232 68 258 66C238 74 224 86 220 104Z" class="h"/>
+<use href="#bud" class="r0"/><use href="#bud" class="r1"/><use href="#bud" class="r2"/>
+<use href="#sp" class="r0"/><use href="#sp" class="r1"/><use href="#sp" class="r2"/>
+
+<!-- petals wrapping the bud -->
+<g clip-path="url(#cb)"><use href="#l3l" class="ao"/></g>
+<use href="#l3l" class="f"/><use href="#ll3l" class="l"/>
+<use href="#l3l" class="r0"/><use href="#l3l" class="r1"/><use href="#l3l" class="r2"/>
+<g clip-path="url(#cb)"><use href="#l3r" class="ao"/></g>
+<use href="#l3r" class="f"/><use href="#ll3r" class="l"/>
+<use href="#l3r" class="r0"/><use href="#l3r" class="r1"/><use href="#l3r" class="r2"/>
+
+<g clip-path="url(#cb)"><use href="#l2l" class="ao"/></g>
+<use href="#l2l" class="f"/><use href="#l2l" fill="url(#gu)" opacity=".22"/><use href="#ll2l" class="l"/>
+<path clip-path="url(#cl2l)" d="M162 190C180 222 206 240 236 248C202 252 174 234 162 210Z" class="h"/>
+<use href="#l2l" class="r0"/><use href="#l2l" class="r1"/><use href="#l2l" class="r2"/>
+<g clip-path="url(#cb)"><use href="#l2r" class="ao"/></g>
+<use href="#l2r" class="f"/><use href="#l2r" fill="url(#gu)" opacity=".22"/><use href="#ll2r" class="l"/>
+<use href="#l2r" class="r0"/><use href="#l2r" class="r1"/><use href="#l2r" class="r2"/>
+
+<g clip-path="url(#cb)"><use href="#f1" class="ao"/></g>
+<use href="#f1" class="f"/><use href="#f1" fill="url(#gu)" opacity=".22"/><use href="#lf1" class="l"/>
+<path clip-path="url(#cf1)" d="M124 250C150 284 186 304 228 312C182 318 142 296 124 268Z" class="h" opacity=".55"/>
+<path clip-path="url(#cf1)" d="M120 232C136 262 164 282 200 294C166 292 136 274 120 246Z" fill="url(#hs)"/>
+<use href="#f1" class="r0"/><use href="#f1" class="r1"/><use href="#f1" class="r2"/>
+<g clip-path="url(#cb)"><use href="#f2" class="ao"/></g>
+<use href="#f2" class="f"/><use href="#f2" fill="url(#gu)" opacity=".22"/><use href="#lf2" class="l"/>
+<path clip-path="url(#cf2)" d="M372 262C350 290 318 308 280 318C320 320 354 300 372 280Z" class="h" opacity=".55"/>
+<path clip-path="url(#cf2)" d="M394 226C384 252 364 272 336 286C368 280 390 258 398 236Z" fill="url(#hs)"/>
+<use href="#f2" class="r0"/><use href="#f2" class="r1"/><use href="#f2" class="r2"/>
+
+</g>
+</svg>

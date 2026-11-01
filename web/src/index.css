@@ -1,0 +1,309 @@
+/* shadcn/ui's base-nova theme (neutral), as `shadcn init` writes it, but dark follows the system
+   unless chosen on the page (data-theme on the root, #286), and the font is the system's, which has the Chinese glyphs. Plus the board's group colors and the
+   chat's tool kinds'. */
+@import "tailwindcss";
+@import "shadcn/tailwind.css";
+/* The classes Streamdown renders Markdown with. */
+@source "../../node_modules/streamdown/dist/*.js";
+
+/* Dark: chosen, or the system's with light not chosen. Tailwind's dark: and the colours below follow it. */
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *) {
+      @slot;
+    }
+  }
+}
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: system-ui, -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+  /* Product §4's groups: needs you, running, done, idle; and what went wrong. */
+  --color-needs: var(--needs);
+  --color-running: var(--running);
+  --color-done: var(--done);
+  --color-idle: var(--idle);
+  /* A card under the mouse (#404): a shade off its ground, in either theme. */
+  --color-card-hover: color-mix(in oklab, var(--foreground) 4%, var(--card));
+  /* Maximize mode's sidebar, a shade off the chat's ground. */
+  --color-sidebar: var(--sidebar);
+  /* The kinds of tool call (web/src/tools.tsx): looking at files and the web, changing files,
+     commands, subagents. Away from the groups' amber. */
+  --color-tool-look: var(--tool-look);
+  --color-tool-edit: var(--tool-edit);
+  --color-tool-command: var(--tool-command);
+  --color-tool-agent: var(--tool-agent);
+}
+
+:root {
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --radius: 0.625rem;
+  --needs: #c77d12;
+  --running: #2f72bd;
+  --done: #2f8a55;
+  --idle: #8c8c86;
+  --sidebar: oklch(0.968 0 0);
+  --tool-look: #0284c7;
+  --tool-edit: #059669;
+  --tool-command: #7c3aed;
+  --tool-agent: #db2777;
+
+  @variant dark {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --needs: #e8a33d;
+    --running: #5aa0e6;
+    --done: #4fb97c;
+    --idle: #9c9a94;
+    --sidebar: oklch(0.178 0 0);
+    --tool-look: #38bdf8;
+    --tool-edit: #34d399;
+    --tool-command: #a78bfa;
+    --tool-agent: #f472b6;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    color-scheme: light;
+    @variant dark {
+      color-scheme: dark;
+    }
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* A screen 480px high or more: an info card's title and foot stay in place as the rest scrolls (story 520). */
+@custom-variant tall (@media (min-height: 30rem));
+
+/* An info card's scroller (story 523), and a code block's or table's sideways one (#498, #502): a thin
+   round thumb clear of the box's round corners, with no arrows. Chromium draws ::-webkit-scrollbar only
+   where scrollbar-width and -color are auto; a browser without it keeps the thin bar every scroller has. */
+@utility card-scroll {
+  @supports selector(::-webkit-scrollbar) {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+  &::-webkit-scrollbar {
+    width: 0.625rem;
+    height: 0.625rem;
+  }
+  &::-webkit-scrollbar-track {
+    margin-block: 0.75rem;
+  }
+  &::-webkit-scrollbar-track:horizontal {
+    margin: 0 0.5rem;
+  }
+  &::-webkit-scrollbar-thumb {
+    border: 0.1875rem solid transparent;
+    border-radius: 9999px;
+    background: color-mix(in oklab, var(--foreground) 18%, transparent) padding-box;
+  }
+}
+
+/* A code block's scroller, unwrapped (#507), and a table's (#502), its edges faded as T3 Code's tables
+   are (Base UI ScrollArea's gradient scroll fade): the text is gone 12px inside an edge and fades in
+   over 24px, each no wider than how far the scroller can still go that way (--os, --oe, from
+   tools.tsx), so it grows as a scroll starts and there is none where nothing is hidden. card-scroll's
+   10px bar stays whole. The build adds -webkit-mask, for iOS Safari. */
+@utility edge-fade {
+  --cs: min(0.75rem, var(--os, 0px));
+  --fs: min(1.5rem, var(--os, 0px));
+  --ce: min(0.75rem, var(--oe, 0px));
+  --fe: min(1.5rem, var(--oe, 0px));
+  --fade:
+    linear-gradient(to right, transparent var(--cs), #000 calc(var(--cs) + var(--fs)), #000 calc(100% - var(--ce) - var(--fe)), transparent calc(100% - var(--ce))) top / 100% calc(100% - 0.625rem) no-repeat,
+    linear-gradient(#000, #000) bottom / 100% 0.625rem no-repeat;
+  mask: var(--fade);
+}
+
+/* A table's header ground (#502). Streamdown's bg-muted/80 on the thead is painted once per cell, and
+   where a cell's edge falls inside a device pixel, as on a phone, the two cells there each cover only
+   part of it: a dark seam between every two columns. So the same colour, made opaque over the card, is
+   painted again once over the whole thead as an inset shadow as deep as any, hiding the seams.
+   WebKit, every iPhone's browser, paints no shadow on a row group: there the background stays. */
+@utility table-head {
+  & thead {
+    box-shadow: inset 0 0 0 100vmax color-mix(in srgb, var(--muted) 80%, var(--card));
+  }
+}
+
+/* The ground of a tool call's icon: its colour, faint, over the page. */
+@utility tint {
+  background-color: color-mix(in oklab, currentColor 14%, var(--background));
+}
+
+/* A control under the mouse, with no ground of its own (#404): a faint round one in either theme, as
+   the sidebar's buttons have, inside the 44px tap. hover: holds only where the pointer hovers: a phone
+   shows none. A key's focus rings that round, not the tap, so it stays in a slim row (#503); a mouse or
+   a finger shows none. --round-inset, how far in the round sits, is 4px unless set. */
+@utility hover-round {
+  padding: var(--round-inset, --spacing(1));
+  outline-offset: calc(-2px - var(--round-inset, --spacing(1)));
+  @apply rounded-full bg-clip-content transition-colors hover:not-disabled:bg-foreground/5 focus-visible:outline-2 focus-visible:outline-ring;
+}
+
+/* A 44px tap around the control you see, its first child: a key's focus rings that control along its
+   edge, not the tap, so it stays in the box (#503); a mouse or a finger shows none. Written out, not
+   outline-2: a child with a shadcn button's look has outline-none, which would draw none. */
+@utility focus-child {
+  @apply outline-none;
+  &:focus-visible > :first-child {
+    outline: 2px solid var(--color-ring);
+    outline-offset: -2px;
+  }
+}
+
+/* A call still running: a light sweeps across its words, unless you asked for less motion. From T3
+   Code's live-tool-shine (github.com/pingdotgg/t3code, MIT, Copyright (c) 2026 T3 Tools Inc.). */
+@keyframes live-shine {
+  from {
+    background-position:
+      -4.5rem 0,
+      0 0;
+  }
+  to {
+    background-position:
+      calc(100% + 4.5rem) 0,
+      0 0;
+  }
+}
+
+@utility live-shine {
+  @media (prefers-reduced-motion: no-preference) and (forced-colors: none) {
+    color: transparent;
+    background-image:
+      linear-gradient(to right, transparent, var(--foreground), transparent),
+      linear-gradient(var(--muted-foreground), var(--muted-foreground));
+    background-size:
+      4.5rem 100%,
+      100% 100%;
+    background-repeat: no-repeat;
+    background-clip: text;
+    animation: live-shine 2.2s steps(30) infinite;
+  }
+}
+
+/* A running slot's dot: a ring spreads from it, unless you asked for less motion. */
+@theme {
+  --animate-ripple: ripple 2.4s ease-out infinite;
+  @keyframes ripple {
+    70%,
+    to {
+      transform: scale(2.4);
+      opacity: 0;
+    }
+  }
+}
+
+/* The thinking level at max or ultra (story 525): white motes over its fill, drifting right where
+ *  motion-safe: has it, a tile a step wide so the loop has no seam. */
+@utility stardust {
+  background-image:
+    radial-gradient(circle at 15% 30%, white 0.5px, transparent 1.5px),
+    radial-gradient(circle at 45% 75%, rgb(255 255 255 / 0.7) 0.5px, transparent 1.5px),
+    radial-gradient(circle at 70% 20%, rgb(255 255 255 / 0.5) 0.5px, transparent 1px),
+    radial-gradient(circle at 90% 60%, white 0.5px, transparent 1.5px);
+  background-size: 2.5rem 100%;
+}
+@theme {
+  --animate-drift: drift 3s linear infinite;
+  @keyframes drift {
+    to {
+      background-position-x: 2.5rem;
+    }
+  }
+}
+
+/* A toast's 撤销 runs out: the bar along its foot shrinks to nothing in 8 s, smoothly. */
+@theme {
+  --animate-undo: undo 8s linear forwards;
+  @keyframes undo {
+    to {
+      transform: scaleX(0);
+    }
+  }
+}
+
+/* Scroll bars: thin and in the page's own grey, not the browser's; the sidebar's only under the
+   pointer or with the focus in it. */
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--foreground) 18%, transparent) transparent;
+  }
+  [data-quiet-scroll] {
+    scrollbar-color: transparent transparent;
+  }
+  [data-quiet-scroll]:hover,
+  [data-quiet-scroll]:focus-within {
+    scrollbar-color: color-mix(in oklab, var(--foreground) 22%, transparent) transparent;
+  }
+}

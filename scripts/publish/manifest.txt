@@ -1,0 +1,34 @@
+# What the public snapshot carries (#523): one glob per line, matched against the paths in the
+# commit. A path goes only if some line takes it; a line starting with ! leaves matching paths out,
+# whatever takes them. A new top-level file or directory stays private until it is listed here.
+.gitignore
+AGENTS.md
+CLAUDE.md
+CONTRIBUTING.md
+CONTRIBUTING_zh.md
+GLOSSARY.md
+LICENSE
+NOTICE.md
+README.md
+README_zh.md
+bun.lock
+bunfig.toml
+components.json
+package.json
+tsconfig.json
+# The workflow that makes a release's packages, which runs only there (#385).
+.github/**
+deploy/**
+docs/**
+holder/**
+# The package's own docs and notices (scripts/package.sh), so the public repo can make it too (#525).
+release/**
+scripts/**
+src/**
+test/**
+web/**
+# This machine's own facts (AGENTS.md "This machine").
+!**/*.local.md
+# The maintainer's own tools and their test (AGENTS.local.md "Maintainer tools").
+!scripts/agents/**
+!test/agent-scripts.test.ts

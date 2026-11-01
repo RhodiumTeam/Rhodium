@@ -1,0 +1,5 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":false,"requestAttestation":false}}}
+585 {"method":"initialized"}
+585 {"id":1,"method":"account/read","params":{"refreshToken":false}}
+670 {"id":2,"method":"model/list","params":{}}
+10462 {"id":3,"method":"thread/start","params":{"cwd":"/tmp/rhodium-test-codex-doctor-probe/project","ephemeral":true,"approvalPolicy":"untrusted","sandbox":"danger-full-access"}}

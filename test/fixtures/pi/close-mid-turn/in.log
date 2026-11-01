@@ -1,0 +1,2 @@
+0 {"id":"prompt-0","type":"prompt","message":"Run `sleep 4 && touch late.txt` with the bash tool, then reply with the single word: done."}
+20410 {"id":"get_state-36","type":"get_state"}

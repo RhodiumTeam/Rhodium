@@ -1,0 +1,4 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":true,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/start","params":{"cwd":"/tmp/codex-probe/work/project","model":"gpt-6-luna","approvalPolicy":"never","sandbox":"danger-full-access"}}
+3140 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-41fbaa1e424a","input":[{"type":"text","text":"Run the shell command `sleep 6 && touch closed.txt`, then reply with the single word: ok.","text_elements":[]}],"effort":"low"}}

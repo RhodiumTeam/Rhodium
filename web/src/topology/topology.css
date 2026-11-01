@@ -1,0 +1,61 @@
+/* The topology view's: React Flow's own styles, in Tailwind's base layer so its utilities win, as
+   unlayered they would not (spec web-topology); the lines' colours, and the drafts' reds (spec web-write
+   "草稿"): a line a change removes, darker than a change in conflict; the details' spawn tree. It comes
+   with the view's code, not on the first screen. */
+@import "@xyflow/react/dist/style.css" layer(base);
+
+:root {
+  --bind: oklch(0.45 0 0);
+  --tree: oklch(0.72 0 0);
+  --draft-removed: #a3433e;
+  --draft-conflict: var(--destructive);
+}
+/* Dark as index.css has it: chosen, or the system's with light not chosen (#286). */
+:root[data-theme="dark"] {
+  --bind: oklch(0.78 0 0);
+  --tree: oklch(0.48 0 0);
+  --draft-removed: #a85550;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bind: oklch(0.78 0 0);
+    --tree: oklch(0.48 0 0);
+    --draft-removed: #a85550;
+  }
+}
+.react-flow {
+  --xy-background-color: var(--background);
+}
+/* Laid out anew (spec web-write "重排"), nodes and lines slide to where they go, as the camera does. */
+.sliding .react-flow__node {
+  transition: transform 0.3s cubic-bezier(0.65, 0, 0.35, 1);
+}
+.sliding .react-flow__edge-path {
+  transition: d 0.3s cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+/* The details' spawn tree, as the canvas draws it: an elbow into each child from its parent's left
+   (tick), and the line running on past it to the next sibling (more). */
+.tick {
+  position: relative;
+  overflow: visible;
+}
+.tick::before {
+  content: "";
+  position: absolute;
+  left: -11px;
+  top: -7px;
+  height: calc(50% + 7px);
+  width: 10px;
+  border: solid var(--tree);
+  border-width: 0 0 1.25px 1.25px;
+  border-bottom-left-radius: 4px;
+}
+.tick.more::after {
+  content: "";
+  position: absolute;
+  left: -11px;
+  top: 50%;
+  bottom: -7px;
+  border-left: 1.25px solid var(--tree);
+}

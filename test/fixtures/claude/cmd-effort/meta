@@ -1,0 +1,1 @@
+{"agent":"claude","version":"2.1.309","scenario":"cmd-effort","edited":true,"note":"Real recording plus a second get_settings, inserted by hand with its answer a copy of the first: /effort listing the levels asks for applied.effort before /effort low asks for ultracode (#454)."}

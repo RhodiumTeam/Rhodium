@@ -1,0 +1,3 @@
+0 {"id":"set_model-0","type":"set_model","provider":"deepseek","modelId":"deepseek-v4-pro"}
+702 {"id":"set_model-1","type":"set_model","provider":"deepseek","modelId":"no-such-model"}
+829 {"id":"get_state-2","type":"get_state"}

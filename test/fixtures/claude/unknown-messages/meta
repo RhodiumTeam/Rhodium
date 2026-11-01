@@ -1,0 +1,1 @@
+{"agent":"claude","version":"2.1.304","scenario":"unknown-messages","edited":true,"note":"Real basic-turn recording plus hand-inserted unknown type, system subtype, stream event, fields and capability, a non-JSON line, and an unknown CLI control request whose error reply is in in.log."}

@@ -1,0 +1,11 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":false,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/start","params":{"cwd":"/tmp/rhodium-test-codex430-probe/project","model":"gpt-6-luna","approvalPolicy":"untrusted","sandbox":"danger-full-access"}}
+3232 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-63d43a9d34ff","input":[{"type":"text","text":"Run the shell command `ls`. Then run `touch a.txt`. Then use apply_patch to create b.txt containing the line hi. Then reply with the single word: done.","text_elements":[]}],"effort":"low"}}
+7648 {"id":0,"result":{"decision":"accept"}}
+9912 {"id":1,"result":{"decision":"accept"}}
+11666 {"id":2,"result":{"decision":"accept"}}
+17016 {"id":3,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-63d43a9d34ff","input":[{"type":"text","text":"Run the shell command `rm a.txt`, then reply with the single word: done.","text_elements":[]}],"effort":"low"}}
+19962 {"id":3,"result":{"decision":"decline"}}
+19962 {"id":4,"method":"turn/steer","params":{"threadId":"00000000-0000-7000-8000-63d43a9d34ff","expectedTurnId":"00000000-0000-7000-8000-79a3f54a7a39","input":[{"type":"text","text":"Don't delete a.txt. Rename it to a.txt.bak instead, then reply with the single word: renamed.","text_elements":[]}]}}
+24125 {"id":4,"result":{"decision":"accept"}}

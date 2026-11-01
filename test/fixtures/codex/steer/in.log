@@ -1,0 +1,6 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":true,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/start","params":{"cwd":"/tmp/codex-probe/work/project","model":"gpt-6-luna","approvalPolicy":"never","sandbox":"danger-full-access"}}
+3140 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-7c737ca8eb48","input":[{"type":"text","text":"Run the shell command `sleep 4 && echo one` and tell me its output.","text_elements":[]}],"effort":"low"}}
+12008 {"id":3,"method":"turn/steer","params":{"threadId":"00000000-0000-7000-8000-7c737ca8eb48","expectedTurnId":"00000000-0000-7000-8000-68f7daa106d9","input":[{"type":"text","text":"Also end your reply with the word banana.","text_elements":[]}]}}
+22458 {"id":4,"method":"turn/steer","params":{"threadId":"00000000-0000-7000-8000-7c737ca8eb48","expectedTurnId":"00000000-0000-7000-8000-68f7daa106d9","input":[{"type":"text","text":"x","text_elements":[]}]}}

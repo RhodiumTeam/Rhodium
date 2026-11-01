@@ -1,0 +1,2 @@
+0 {"id":"prompt-0","type":"prompt","message":"Run `sleep 3 && echo one` with the bash tool and tell me its output."}
+25361 {"id":"prompt-55","type":"prompt","message":"Also end your reply with the word banana.","streamingBehavior":"steer"}

@@ -1,0 +1,2 @@
+0 {"type":"control_request","request_id":"rh-1-1","request":{"subtype":"initialize","perTaskStopAffordance":true}}
+22299 {"type":"user","uuid":"00000000-0000-4000-8000-c53aabafceb4","parent_tool_use_id":null,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Reply with exactly: OK"}]}}

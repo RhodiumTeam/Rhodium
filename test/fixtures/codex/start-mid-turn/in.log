@@ -1,0 +1,7 @@
+0 {"id":0,"method":"initialize","params":{"clientInfo":{"name":"rhodium_probe","title":"Rhodium probe","version":"0.0.0"},"capabilities":{"experimentalApi":false,"requestAttestation":false}}}
+550 {"method":"initialized"}
+550 {"id":1,"method":"thread/start","params":{"cwd":"/tmp/codex-probe-429/project","model":"gpt-6-luna","approvalPolicy":"never","sandbox":"danger-full-access"}}
+3239 {"id":2,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-948696bce8f1","input":[{"type":"text","text":"Run the shell command `sleep 5; env | grep ^CODEX_ | cut -d= -f1 | sort`, then reply with the single word: ok.","text_elements":[]}],"effort":"low","clientUserMessageId":"c-1"}}
+6786 {"id":3,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-948696bce8f1","input":[{"type":"text","text":"Also end your reply with the word banana.","text_elements":[]}],"clientUserMessageId":"c-2"}}
+13372 {"id":4,"method":"turn/start","params":{"threadId":"00000000-0000-7000-8000-948696bce8f1","input":[{"type":"text","text":"Run the shell command `sleep 4`, then reply with the single word: ok.","text_elements":[]}],"effort":"low","clientUserMessageId":"c-3"}}
+15532 {"id":5,"method":"turn/steer","params":{"threadId":"00000000-0000-7000-8000-948696bce8f1","expectedTurnId":"00000000-0000-7000-8000-c0062c227962","input":[{"type":"text","text":"Also end your reply with the word pear.","text_elements":[]}],"clientUserMessageId":"c-4"}}

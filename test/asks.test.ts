@@ -2,7 +2,6 @@
 // with buttons, your reply of a number or words answers it as well, and one nobody answers in time
 // gets Rhodium's careful answer.
 // The fake claude replays the probe recordings of #10, or plays a script where none fits.
-import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -11,7 +10,7 @@ import { installFakeAgent } from "./fake-agent/fake-agent";
 import { asking, endTurn, on, startTurn, type FakeAsk } from "./fake-agent/scripts";
 import { askLine, askText, parseAnswer } from "../src/asks";
 import { sourceLine } from "../src/prompt";
-import { newInstance, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
+import { newInstance, recorded, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
 
 const FIXTURES = join(import.meta.dir, "fixtures/claude");
 const ME = "you-openid";
@@ -43,14 +42,7 @@ async function posts(n: number): Promise<Posted[]> {
 
 /** Waits until rhodium has recorded that the open ask reached you: killed between the platform
  *  taking it and that record, it rightly takes it for not sent (#117). */
-async function pushed(): Promise<void> {
-  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
-  try {
-    await until(() => db.query("SELECT 1 FROM ask WHERE status = 'open' AND pushedAt IS NOT NULL").get() !== null, 15_000);
-  } finally {
-    db.close();
-  }
-}
+const pushed = () => recorded(rhodium, "SELECT 1 FROM ask WHERE status = 'open' AND pushedAt IS NOT NULL");
 
 test("stories 84, 78: AskUserQuestion reaches IM with numbered options, and a plain reply of a number answers it", async () => {
   await slot({ claude: { replay: join(FIXTURES, "question"), sourceLines: [VIA] } });
@@ -263,7 +255,7 @@ test("story 80: unanswered, a question gets 'answer by your best judgement', an 
   expect(question).toEqual(["q-1", "allow", { ...TEA, answers: { "Tea or coffee?": BEST_JUDGEMENT } }]);
   expect(approval).toEqual(["p-1", "deny", BEST_JUDGEMENT]);
   expect(plan!.slice(0, 2)).toEqual(["plan-1", "deny"]);
-  expect(plan![2]).toContain("用 rh send me 把计划摘要发给用户，然后停下来，等用户回复");
+  expect(plan![2]).toContain("用 rh send me 把计划摘要发给用户（你有父槽位时，见 rh send me 的说明），然后停下来，等用户回复");
   // The three asks went out, then the turn's reply; nothing was said about the timeouts.
   expect((await posts(4)).map((p) => p.text.split("\n")[0])).toEqual(["Tea or coffee?", "要运行这条命令，允许吗？", "写好了计划，批准后才动手：", "answered"]);
 }, 30_000);
@@ -491,6 +483,7 @@ test("pi: kill -9 rhodium while an allowed command still runs: after the restart
   expect(await nth(2)).toBe("已允许运行这条命令。");
   // The answer went to pi's stdin, so the out.log replayed after the restart never shows it.
   await until(() => sent().some((m) => m.type === "extension_ui_response"), 15_000);
+  await recorded(rhodium, "SELECT 1 FROM ask WHERE status = 'delivered'");
   await rhodium.kill9();
   await rhodium.start();
   await Bun.sleep(500); // the replay is done by now, and a second push would show up

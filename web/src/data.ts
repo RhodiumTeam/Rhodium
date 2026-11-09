@@ -2,7 +2,7 @@
 // and keeps it live.
 import { QueryClient } from "@tanstack/react-query";
 import type { Block, MessagesData, SlotEvent } from "../../src/board";
-import { FROM_BOARD } from "../../src/contracts";
+import { fromBoard } from "../../src/contracts";
 
 export type { Block, BoardData, Card, Command, Episode, MessagesData, RhodiumData, SlotData, SlotEvent, TopologyData } from "../../src/board";
 
@@ -139,6 +139,11 @@ export async function prefetch(): Promise<boolean> {
  *  the stream also says what heard is told. Returns a function that stops it all. */
 export function follow(changed: () => void, live: (on: boolean) => void, slot?: string): () => void {
   let events: EventSource;
+  // Whether the page is in front, for where rh send me goes (product §5.9): told the board by the open
+  // stream's id, as it opens, each time that changes and every 30 s while in front, as a page may drop
+  // off without a word. Once the stream closes, or 70 s pass with no word, the board takes it for gone.
+  let stream = "";
+  const front = () => void (stream && request("api/front", { method: "POST", body: new URLSearchParams({ stream, front: document.visibilityState === "visible" ? "1" : "" }), keepalive: true }).catch(() => {}));
   let burst: ReturnType<typeof setTimeout> | undefined;
   let retry: ReturnType<typeof setTimeout> | undefined;
   const connect = () => {
@@ -151,8 +156,10 @@ export function follow(changed: () => void, live: (on: boolean) => void, slot?: 
       if (e.type) seen.forEach((f) => f(e));
     };
     events.addEventListener("page", (e) => {
-      const { entry } = JSON.parse((e as MessageEvent<string>).data) as { entry: string | null };
+      const { entry, stream: id } = JSON.parse((e as MessageEvent<string>).data) as { entry: string | null; stream?: string };
       builds.forEach((f) => f(entry));
+      stream = id ?? "";
+      front();
     });
     // Not in the event table: told to the chat alone, and the rest of the page stays.
     for (const what of ["grew", "delta", "said", "exit"]) {
@@ -175,11 +182,16 @@ export function follow(changed: () => void, live: (on: boolean) => void, slot?: 
   };
   connect();
   const minute = setInterval(changed, 60_000);
+  const beat = setInterval(() => stream && document.visibilityState === "visible" && front(), 30_000);
+  // Fired at the document, it bubbles up to the window.
+  addEventListener("visibilitychange", front);
   return () => {
+    removeEventListener("visibilitychange", front);
     events.close();
     clearTimeout(burst);
     clearTimeout(retry);
     clearInterval(minute);
+    clearInterval(beat);
   };
 }
 
@@ -197,7 +209,7 @@ export function unread(sent: Sent[], blocks: Block[]): Sent[] {
   return sent.filter((s) => {
     s.from = Math.max(s.from, past);
     if (s.failed !== undefined) return true;
-    const b = blocks.find((b) => b.kind === "user" && b.source === FROM_BOARD && line(b) >= s.from && b.text.startsWith(s.text));
+    const b = blocks.find((b) => b.kind === "user" && fromBoard(b.source) && line(b) >= s.from && b.text.startsWith(s.text));
     if (!b) return true;
     past = line(b) + 1;
     return false;
@@ -244,6 +256,15 @@ export class Messages {
       const added = p.blocks.filter((b) => line(b) >= this.end);
       this.blocks = [...this.blocks, ...added];
       this.end = p.end;
+      // An rh send's call read before it ran came with no send_me event, or another send's: its result
+      // here, its own is known. Read again from its line (spec web-images), and put it in place of the call,
+      // wherever that is once read: a page before may have come meanwhile.
+      for (const r of added) {
+        if (r.kind !== "result") continue;
+        const call = this.blocks.find((b) => b.kind === "tool" && b.id === r.id && b.send);
+        const again = call && (await this.get(`${this.url}&after=${line(call)}`)).blocks.find((b) => b.kind === "tool" && b.id === r.id);
+        if (again) this.blocks = this.blocks.map((b) => (b === call ? again : b));
+      }
       for (const b of added) if (b.kind === "assistant" && this.drafts[0]?.whole) this.drafts.shift();
       this.sent = unread(this.sent, this.blocks);
     }
@@ -273,12 +294,16 @@ export class Messages {
     }
   }
 
-  /** Brings the page before the blocks shown. */
-  async older(): Promise<void> {
-    const p = await this.get(`${this.url}&before=${this.start}`);
-    if (p.conversation !== this.conversation) return;
-    this.blocks = [...p.blocks.filter((b) => line(b) < this.start), ...this.blocks];
-    this.start = Math.min(this.start, p.start);
+  /** Brings the page before the blocks shown, if the conversation has one; says whether there may be more. */
+  async older(): Promise<boolean> {
+    const start = this.start;
+    if (start <= 0) return false;
+    const p = await this.get(`${this.url}&before=${start}`);
+    if (p.conversation === this.conversation) {
+      this.blocks = [...p.blocks.filter((b) => line(b) < this.start), ...this.blocks];
+      this.start = Math.min(this.start, p.start);
+    }
+    return this.start !== start;
   }
 }
 

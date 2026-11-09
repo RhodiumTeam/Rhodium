@@ -254,6 +254,13 @@ test("two notices from one input on a QQ bot whose active quota has no count yet
   await holderGone();
 }, 30_000);
 
+/** What the agent's rh calls printed, once there are n. */
+async function receipts(n: number): Promise<string[]> {
+  const out = () => rhodium.claude.runs().flatMap((r) => r.rh.map((c) => c.out));
+  await until(() => out().length >= n, 15_000);
+  return out();
+}
+
 // rh send me goes the way a notice does (product §5.5, architecture §8.7).
 const FORWARDED = "假 IM Bot q 的私聊那边发不出去，改发在这里。\n\n";
 
@@ -314,11 +321,26 @@ test("an active message QQ turns down for its quota comes through the Telegram b
   await posts("q", 1);
   await rhodium.ok("send", "w/a", plan(["send", "me", "one"]));
   expect((await posts("t", 1))[0]!.text).toBe(`${FORWARDED}one`);
+  // rh send waits for that try, and says where it went (story 577).
+  expect(await receipts(1)).toEqual(["假 IM Bot q 的私聊发不出去，改发到了假 IM Bot t 的私聊。\n"]);
   await rhodium.ok("send", "w/a", plan(["send", "me", "two"]));
   expect((await posts("t", 2))[1]!.text).toBe(`${FORWARDED}two`);
   // Not tried on QQ first.
   expect(daemon.logs.filter((l) => l.msg === "send failed")).toHaveLength(1);
   expect(await log("q")).toHaveLength(1);
+}, 30_000);
+
+test("story 580: rh send q that QQ turns down for another reason than its quota comes through the Telegram bot, saying so, and the next still goes on QQ", async () => {
+  await begin({ claude: { script: obey } });
+  await say("q", "hello");
+  await posts("q", 1);
+  await rhodium.im.next("q", "refuse");
+  await rhodium.ok("send", "w/a", plan(["send", "q", "one"]));
+  expect((await posts("t", 1))[0]!.text).toBe(`${FORWARDED}one`);
+  expect(await receipts(1)).toEqual(["假 IM Bot q 的私聊发不出去，改发到了假 IM Bot t 的私聊。\n"]);
+  await rhodium.ok("send", "w/a", plan(["send", "me", "two"]));
+  expect((await posts("q", 2))[1]!.text).toBe("two");
+  expect(await log("t")).toHaveLength(1);
 }, 30_000);
 
 test("an active message QQ turns down goes through a bot on another platform, before the main chat's bot on QQ (product §5.5)", async () => {
@@ -369,7 +391,7 @@ test("a bot's label is what its chat goes by, to you and to the agent; commands 
   const first = run.stdin.map((l) => JSON.parse(l)).find((m) => m.type === "user");
   expect(first.message.content[0].text).toStartWith(`${sourceLine("假 IM Bot Echo Agent 的私聊")}\n`);
   // So do the bot's format limits in the system prompt, for the agent to match them up (2026-10-23).
-  expect(readFileSync(run.argv[run.argv.indexOf("--append-system-prompt-file") + 1]!, "utf8")).toMatch(/^- 假 IM Bot Echo Agent 的私聊：.*2000 字/m);
+  expect(readFileSync(run.argv[run.argv.indexOf("--append-system-prompt-file") + 1]!, "utf8")).toMatch(/^- 假 IM Bot Echo Agent 的私聊（`rh send q`）：.*2000 字/m);
   expect(await rhodium.ok("bind", "q", "w/a")).toContain("Bot q");
 }, 30_000);
 
@@ -381,7 +403,48 @@ test("with QQ alone, an active message it turns down for its quota stays failed"
   await until(() => daemon.logs.some((l) => l.msg === "send failed"), 15_000);
   await Bun.sleep(500); // another try would show up by now
   expect(daemon.logs.filter((l) => l.msg === "send failed")).toHaveLength(1);
+  expect(await receipts(1)).toEqual(["没发出去：发到假 IM 私聊时出错。\n"]);
   expect(await log("q")).toHaveLength(1);
+}, 30_000);
+
+test("story 577: an active message QQ turns down for its quota, which then fails on the Telegram bot too, is said not to have gone", async () => {
+  await begin({ claude: { script: obey }, platform: { activeMessages: 0 } });
+  await say("q", "hello");
+  await posts("q", 1);
+  await rhodium.im.next("t", "fail");
+  await rhodium.ok("send", "w/a", plan(["send", "me", "one"]));
+  expect(await receipts(1)).toEqual(["没发出去：发到假 IM Bot t 的私聊时出错。\n"]);
+}, 30_000);
+
+test("story 577: with QQ alone, rh send me whose file QQ turns down for its quota, its text gone, says the one did not go", async () => {
+  await begin({ only: "q", claude: { script: obey }, platform: { activeMessages: 1 } });
+  await say("q", "hello");
+  await posts("q", 1);
+  writeFileSync(join(rhodium.dir, "w/notes.txt"), "12 wicks\n");
+  await rhodium.ok("send", "w/a", plan(["send", "me", "--file", "notes.txt", "one"]));
+  expect(await receipts(1)).toEqual(["有 1 条没发出去：发到假 IM 私聊时出错。\n"]);
+  expect((await log("q")).map((p) => p.text)).toEqual(["done", "one"]);
+}, 30_000);
+
+test("story 577: rh send me whose file QQ turns down for its quota, its text gone, says the one moved to the Telegram bot", async () => {
+  await begin({ claude: { script: obey }, platform: { activeMessages: 1 } });
+  await say("q", "hello");
+  await posts("q", 1);
+  writeFileSync(join(rhodium.dir, "w/notes.txt"), "12 wicks\n");
+  await rhodium.ok("send", "w/a", plan(["send", "me", "--file", "notes.txt", "one"]));
+  expect(await receipts(1)).toEqual(["有 1 条在假 IM Bot q 的私聊发不出去，改发到了假 IM Bot t 的私聊。\n"]);
+  expect((await log("q")).map((p) => p.text)).toEqual(["done", "one"]);
+}, 30_000);
+
+test("story 577: rh send me whose text fails and whose file may have gone says which is which", async () => {
+  await begin({ only: "q", claude: { script: obey } });
+  await say("q", "hello");
+  await posts("q", 1);
+  writeFileSync(join(rhodium.dir, "w/notes.txt"), "12 wicks\n");
+  await rhodium.im.next("q", "fail");
+  await rhodium.im.next("q", "timeout");
+  await rhodium.ok("send", "w/a", plan(["send", "me", "--file", "notes.txt", "one"]));
+  expect(await receipts(1)).toEqual(["有 1 条没发出去，有 1 条不知道发出去没有：发到假 IM 私聊时出错。\n"]);
 }, 30_000);
 
 test("rh send me goes to a chat that goes to the slot now, of those the one that last wrote to a slot", async () => {
@@ -426,7 +489,7 @@ test("story 479: rh send me and a confirm request of a slot no chat goes to any 
   expect(await log("q")).toHaveLength(2);
 }, 30_000);
 
-test("story 481: a child's rh send me goes to the chat that goes to its root, not to the chat that last wrote to the child", async () => {
+test("story 481: a child's confirm request goes to the chat that goes to its root, not to the chat that last wrote to the child", async () => {
   await begin({ tb: true, toml: `mainChat = "t/${TG_ME}"`, claude: { script: obey } });
   await say("q", plan(["spawn", "c", plan()])); // q's chat goes to w/a, the root
   await until(async () => (await rhodium.state("w/c")) === "空闲", 15_000);
@@ -435,8 +498,10 @@ test("story 481: a child's rh send me goes to the chat that goes to its root, no
   await until(async () => (await log("t")).some((p) => p.text === "done"), 15_000);
   await say("t", "/rh_use b");
   const before = (await posts("t", 3)).length;
-  await rhodium.ok("send", "w/c", plan(["send", "me", "hi"]));
-  await until(async () => (await log("q")).some((p) => p.text === "〔w/c〕\nhi"), 15_000);
+  // Not its rh send me: with its parent there, that goes to the parent alone (story 578).
+  await rhodium.ok("send", "w/c", plan(["rename", "w/b", "z"]));
+  await until(async () => (await log("q")).some((p) => p.text.includes("rh rename w/b z")), 15_000);
+  expect((await log("q")).find((p) => p.text.includes("rh rename w/b z"))!.text).toContain("w/c");
   expect(await log("t")).toHaveLength(before);
 }, 30_000);
 

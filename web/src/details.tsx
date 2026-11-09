@@ -11,7 +11,7 @@ import { Events, type SlotData, type SlotEvent } from "./data";
 import { Stick } from "./stick";
 import { inTurn, Timeline } from "./timeline";
 import { toast } from "./toast";
-import { act, Spin, useAct } from "./write";
+import { act, Spin, useAct, useEdges } from "./write";
 
 export const KIND: Record<string, string> = { question: "选择题", plan: "计划确认", permission: "审批", confirm: "确认请求" };
 const ASKED: Record<string, string> = { deferred: "等你", open: "等你", answered: "已答", delivered: "已答", timeout: "超时", cancelled: "作废" };
@@ -89,20 +89,22 @@ export function Details({ d }: { d: SlotData }) {
     return { events, query: { queryKey: ["slot-events", d.id, ++opened], queryFn: async () => (await events.newest(), events.list) } };
   });
   useQuery(query);
+  const timeline = useEdges<HTMLDetailsElement>(); // its cut ends fading (#638)
   return (
     <>
       {d.process && <ProcessLine p={d.process} slot={d.id} />}
       <Settings d={d} />
       {/* Folded: the events are what 详情 is read for. */}
       {d.timeline.length > 0 && (
-        <details className="max-h-[60dvh] shrink-0 overflow-y-auto px-4 pb-3">
-          <summary className="flex min-h-11 cursor-pointer items-center gap-2 text-sm text-muted-foreground transition-colors hover:text-foreground">
-            时间线<span className="tabular-nums">{d.timeline.length}</span>
+        <details {...timeline} className="group/timeline card-scroll edge-fade-y max-h-[60dvh] shrink-0 overflow-y-auto px-4 pb-3">
+          <summary className="flex min-h-11 cursor-pointer list-none items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden">
+            <ChevronRight className="size-4 transition-transform group-open/timeline:rotate-90" />
+            时间线<span className="ml-1 tabular-nums">{d.timeline.length}</span>
           </summary>
           <Timeline slot={d.id} list={d.timeline} turn={inTurn(d)} />
         </details>
       )}
-      <Stick label="事件" reset={d.id} tail={events.list.at(-1)?.seq} older={() => events.older()} className="border-t">
+      <Stick label="事件" fade reset={d.id} tail={events.list.at(-1)?.seq} older={() => events.older()} className="border-t *:card-scroll">
         {() => (
           <ul className="grid gap-2.5 px-4 pt-3 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
             {events.list.map((e) => (

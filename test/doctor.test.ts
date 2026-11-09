@@ -306,6 +306,13 @@ test("rh doctor warns of a Herdr whose protocol is not the one the Herdr bridge 
   expect(await rhodium.ok("doctor")).toMatch(/^告警：连不上 Herdr，没核对它的协议版本：Herdr 会话 \S+ 没在运行$/m);
 });
 
+test("story 587: without Herdr installed, rh doctor checks no Herdr: neither that it cannot reach it nor its auto-resume", async () => {
+  rhodium = newInstance();
+  rmSync(join(rhodium.dir, "bin/herdr"));
+  await rhodium.start();
+  expect(await rhodium.ok("doctor")).not.toContain("Herdr");
+});
+
 test("anyone may run rh doctor, as it changes nothing: a caller rh cannot recognize, as an agent running deploy/upgrade.sh is, and a slot's agent", async () => {
   const script: Script = { on, steps: [...startTurn, { rh: ["doctor"] }, ...endTurn("done")] };
   rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" } }, claude: { script } });

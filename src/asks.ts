@@ -23,7 +23,7 @@ type Question = { question: string; options?: { label: string; description?: str
 const questions = (p: AskPrompt): Question[] => (Array.isArray(p.input?.questions) ? p.input.questions : []);
 
 export const TIMEOUT = "用户暂时无法回答，请按你的最佳判断继续";
-const PLAN_TIMEOUT = "用户暂时无法回答，没有批准这个计划。请用 rh send me 把计划摘要发给用户，然后停下来，等用户回复再继续。";
+const PLAN_TIMEOUT = "用户暂时无法回答，没有批准这个计划。请用 rh send me 把计划摘要发给用户（你有父槽位时，见 rh send me 的说明），然后停下来，等用户回复再继续。";
 
 /** A path as you read it: your home as ~, and past 40 characters its middle as …, keeping its last two parts. */
 export function shortPath(path: string): string {

@@ -198,6 +198,24 @@ test("a reply to your old picture brings it as kept, its path too; Telegram's ca
   expect(texts().slice(1)).toEqual([`> the chart\n> [图片] ${stored(PNG)}\n\nwhat about this?`, "> an old one\n\nand this?", "> chart\n\nthis bit?"]);
 }, 30_000);
 
+test("story 574: a reply to a whole message of 300 characters brings the agent its first 100 and …; a part of 300 you picked comes whole", async () => {
+  api = botApi();
+  rhodium = newInstance({
+    toml: ["[bots.t]", 'platform = "telegram"', `token = "${TOKEN}"`, `apiRoot = "${api.url}"`, `owner = "${ME}"`, 'target = "w/a"'].join("\n"),
+  });
+  await rhodium.start();
+  await rhodium.slots("a");
+  const long = Array.from({ length: 300 }, (_, i) => "一二三四五六七八九十"[i % 10]).join("");
+  const texts = () => users().map((c: { type: string; text?: string }[]) => c.filter((b) => b.type === "text").map((b) => b.text).join("\n"));
+  const reply = { message_id: 7, date: 0, chat: { id: ME, type: "private" }, from: { id: 1, is_bot: true, first_name: "bot" }, text: long + long };
+  api.say({ text: "第二处呢", reply_to_message: reply });
+  await until(() => users().length === 1, 15_000);
+  api.say({ text: "这段呢", reply_to_message: reply, quote: { text: long, position: 0 } });
+  await until(() => users().length === 2, 15_000);
+
+  expect(texts()).toEqual([`> ${long.slice(0, 100)}…\n\n第二处呢`, `${long.replace(/^/gm, "> ")}\n\n这段呢`]);
+}, 30_000);
+
 test("a voice message of yours is not for the agent yet: you are told so, and a stranger is not", async () => {
   api = botApi();
   rhodium = newInstance({

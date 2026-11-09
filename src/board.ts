@@ -18,18 +18,18 @@ import { askCard, askText, type AskCard, type AskPrompt } from "./asks";
 import { avatarDir } from "./avatars";
 import { frameUuid } from "./claude";
 import { log } from "./daemon";
-import { COMMON, type AgentEvent, type AgentKind, type BoardAct, type Platform } from "./contracts";
-import { owners, type BotConfig, type Config } from "./config";
+import { COMMON, SENT_AT, type AgentEvent, type AgentKind, type BoardAct, type Platform } from "./contracts";
+import { hasHerdr, owners, type BotConfig, type Config } from "./config";
 import { call, sessionSocket } from "./herdr";
 import { holderPaths } from "./holder";
-import { imageType, mediaLine, saveMedia, withoutMedia } from "./media";
+import { imageType, makeCopy, MAX_PIXELS, mediaLine, pictureType, saveMedia, withoutMedia, type Media } from "./media";
 import { moment } from "./panels";
 import { agentCommands } from "./commands";
 import { askGone, contactOf, resumeWaits, settingsOf, slotState, STATE, target, WEB_PAUSED, WEB_QUEUE, workspaceName, type Payload, type RhReply } from "./router";
 import { namesOf, type Ask, type Bot, type Chat, type Conversation, type Event, type Outbound, type Slot, type Store, type Tx } from "./store";
 import { PLATFORMS } from "./platforms";
 import { withoutSource } from "./prompt";
-import { describe, fullText, lastSaid, messagePage, transcriptFile, type Block as Read, type Message } from "./transcript";
+import { describe, fullText, lastSaid, messagePage, transcriptFile, type Block as Read } from "./transcript";
 
 /** The page and its files as Vite built them: embedded in the built binary, and in web/dist when
  *  run from source. */
@@ -54,17 +54,19 @@ export type Card = {
   lifetime: Slot["lifetime"];
   turnEndedAt: number | null;
   archivedAt: number | null;
-  last: (Message & { at: number | null; source?: string }) | null;
+  last: Awaited<ReturnType<typeof lastSaid>>;
   bots: string[];
   terminal: string | null;
   mode: Slot["mode"];
   activeAt: number;
   pinnedAt: number | null;
 };
-/** GET /api/board. bots: as /api/topology has them. */
+/** GET /api/board. bots: as /api/topology has them. noHerdr: herdr is not where switching to the
+ *  terminal looks for it, so the page hides its ways there (spec web-write "终端入口"); whether it runs is not asked. */
 export type BoardData = {
   workspaces: { name: string; dir: string; groups: Record<Group, Card[]>; archived: Card[] }[];
   bots: Pick<TopologyData["bots"][number], "id" | "name" | "platform" | "avatar">[];
+  noHerdr?: true;
 };
 
 /** How long a slot whose turn ended counts as done (product §7). */
@@ -148,6 +150,7 @@ async function board(store: Store, cfg: Config, now: number): Promise<BoardData>
     return topo.bots.filter((b) => bots.has(b.id)).map((b) => b.id);
   };
   return {
+    ...(!hasHerdr(cfg) && { noHerdr: true }),
     bots: await Promise.all(topo.bots.map(async ({ id, name, platform }) => ({ id, name, platform, avatar: await avatarOf(cfg, id) }))),
     workspaces: workspaces.sort(byName).map((w) => {
       const groups: Record<Group, Card[]> = { needsYou: [], running: [], done: [], idle: [] };
@@ -360,7 +363,7 @@ const count = (v: string | null) => (v !== null && /^\d{1,15}$/.test(v) ? Number
 
 /** The slot's current conversation, or with conversation that one, and its transcript file, if it
  *  has them; undefined for no such slot or conversation. */
-async function current(store: Store, slot: string, conversation?: string): Promise<{ conversation: string | null; file: string | null; dir: string } | undefined> {
+async function current(store: Store, slot: string, conversation?: string): Promise<{ slot: string; conversation: string | null; file: string | null; dir: string } | undefined> {
   const found = store.tx((tx) => {
     if (conversation !== undefined) {
       const c = tx.get("conversation", conversation);
@@ -373,7 +376,7 @@ async function current(store: Store, slot: string, conversation?: string): Promi
   if (!found) return undefined;
   const { slot: s, conv } = found;
   // ponytail: looks in the slot's directory now; a conversation begun before rh set dir moved it is not found there.
-  return { conversation: conv?.id ?? null, file: conv?.sessionId ? await transcriptFile(s.dir, conv.agent, conv.sessionId) : null, dir: s.dir };
+  return { slot: s.id, conversation: conv?.id ?? null, file: conv?.sessionId ? await transcriptFile(s.dir, conv.agent, conv.sessionId) : null, dir: s.dir };
 }
 
 /** Who your message came through (spec web-topology): the platform, the bot's name, the bot's avatar
@@ -385,7 +388,7 @@ export type From = { platform: Platform; bot: string | null; botAvatar: string |
 export type Block = Exclude<Read, { kind: "user" }> | (Extract<Read, { kind: "user" }> & { from: From | null });
 
 // A source line naming a chat (router's chatName): the platform, the bot when it has several, which chat.
-const THROUGH = new RegExp(`^(${Object.values(PLATFORMS).map((p) => p.label).join("|")})(?: Bot (.+) 的| ?)(私聊|聊天窗口)(?:，发送于 .*)?$`);
+const THROUGH = new RegExp(`^(${Object.values(PLATFORMS).map((p) => p.label).join("|")})(?: Bot (.+) 的| ?)(私聊|聊天窗口)(?:${SENT_AT}.*)?$`);
 
 /** The bot and chat a source line names, as the bots are now (each by the name chats call it).
  *  Written when its platform had one bot, the line names none: the platform's only bot now, if it
@@ -425,6 +428,72 @@ async function withFrom(store: Store, cfg: Config, conversation: string | null, 
   );
 }
 
+/** A kept file's picture type by its first bytes, and a picture's width and height as shown, upright;
+ *  null for a file not there. By hash, as what one holds never changes. */
+// ponytail: kept for each picture shown since rhodium started, a few dozen bytes each; drop the oldest if that grows.
+const looked = new Map<string, { type: string | null; w?: number; h?: number }>();
+async function look(dir: string, hash: string): Promise<{ type: string | null; w?: number; h?: number } | null> {
+  const known = looked.get(hash);
+  if (known) return known;
+  const head = await Bun.file(join(dir, hash)).slice(0, 12).bytes().catch(() => null);
+  if (!head) return null;
+  const type = pictureType(head);
+  // Only its header is read, whatever its size.
+  const sides = type && (await new Bun.Image(join(dir, hash), { maxPixels: Number.MAX_SAFE_INTEGER }).metadata().catch(() => null));
+  const it = { type, ...(sides && { w: sides.width, h: sides.height }) };
+  looked.set(hash, it);
+  return it;
+}
+
+/** How far after its call an rh send's send_me event may be, past the call's result or, with that on
+ *  another page, its line: the event falls between them, a call waiting for your approval or behind a
+ *  long one minutes after its line, and nearest its result, which comes once rh returns. Never before
+ *  the call, which is when it began (a Codex call's too, blocksOf): one that never ran takes no earlier send's. */
+const SENT_NEAR = 120_000;
+
+/** The blocks with what your messages, the agent's rh send to you and its tools' results carried as the
+ *  media dir has it (spec web-images "消息块里的图和 rh send 的话"): a picture by its first bytes, else a file, with its
+ *  sides and a name to save it by, the hash and its type's extension where it came with none. An rh
+ *  send's files are its send_me event's, the one nearest its call (SENT_NEAR) that no call nearer took, with as many,
+ *  none for text alone; one with no such event has no media, as one that never ran. */
+async function withMedia(store: Store, cfg: Config, slot: string, blocks: Block[]): Promise<Block[]> {
+  const dir = join(cfg.stateDir, "media");
+  const shown = (list: Media[]) =>
+    Promise.all(
+      list.map(async (m): Promise<Media> => {
+        const it = await look(dir, m.hash);
+        if (!it) return m; // gone: the page says so
+        return { ...m, kind: it.type ? "image" : "file", name: m.name ?? (it.type ? `${m.hash}.${it.type.split("/")[1]}` : m.hash), ...(it.w && { w: it.w, h: it.h }) };
+      }),
+    );
+  // Whether the command failed says nothing of its rh send: it may fail after it, or succeed with none run.
+  const calls = blocks.filter((b): b is Extract<Block, { kind: "tool" }> => b.kind === "tool" && !!b.send && b.time !== null);
+  const filesOf = (e: { data: unknown }) => (e.data as { files?: Media[] } | null)?.files ?? [];
+  const sent = new Map<Block, Media[]>();
+  if (calls.length) {
+    const [from, to] = [(c: (typeof calls)[number]) => c.time!, (c: (typeof calls)[number]) => c.result?.time ?? c.time!];
+    const events = store.slotEventsAt(slot, "send_me", Math.min(...calls.map(from)), Math.max(...calls.map(to)) + SENT_NEAR);
+    const pairs = calls
+      .flatMap((c) => events.flatMap((e) => (filesOf(e).length === c.send!.files.length && e.at >= from(c) ? [{ c, e, far: Math.max(0, e.at - to(c)), near: Math.abs(to(c) - e.at) }] : [])))
+      .filter((p) => p.far <= SENT_NEAR);
+    const taken = new Set<unknown>();
+    for (const { c, e } of pairs.sort((a, b) => a.far - b.far || a.near - b.near)) {
+      if (taken.has(c) || taken.has(e)) continue;
+      taken.add(c).add(e);
+      sent.set(c, filesOf(e));
+    }
+  }
+  return Promise.all(
+    blocks.map(async (b): Promise<Block> => {
+      if ((b.kind === "user" || b.kind === "result") && b.media) return { ...b, media: await shown(b.media) };
+      if (b.kind !== "tool") return b;
+      const files = sent.get(b);
+      const result = b.result?.media && { ...b.result, media: await shown(b.result.media) };
+      return { ...b, ...(files && { send: { ...b.send!, media: await shown(files) } }), ...(result && { result }) };
+    }),
+  );
+}
+
 /** GET /api/messages. */
 export type MessagesData = { conversation: string | null; blocks: Block[]; start: number; end: number };
 
@@ -438,9 +507,10 @@ async function messages(store: Store, cfg: Config, q: URLSearchParams): Promise<
   if (Number.isNaN(after) || Number.isNaN(before)) return new Response("before 或 after 不对。\n", { status: 400 });
   const found = await current(store, q.get("slot") ?? "", q.get("conversation") ?? undefined);
   if (!found) return new Response(q.has("conversation") ? "没有这段对话。\n" : "没有这个槽位。\n", { status: 404 });
-  const { conversation, file, dir } = found;
-  const page = !file ? { blocks: [], start: 0, end: 0 } : after !== null ? await messagePage(file, after, "forward", dir) : await messagePage(file, before, "backward", dir);
-  const data: MessagesData = { conversation, ...page, blocks: await withFrom(store, cfg, conversation, page.blocks) };
+  const { slot, conversation, file, dir } = found;
+  const media = join(cfg.stateDir, "media");
+  const page = !file ? { blocks: [], start: 0, end: 0 } : after !== null ? await messagePage(file, after, "forward", dir, media) : await messagePage(file, before, "backward", dir, media);
+  const data: MessagesData = { conversation, ...page, blocks: await withMedia(store, cfg, slot, await withFrom(store, cfg, conversation, page.blocks)) };
   return Response.json(data, { headers: { "cache-control": "no-store" } });
 }
 
@@ -581,7 +651,8 @@ function queueOf(tx: Tx, s: Slot): SlotData["queue"] {
   return tx.find("agentInput", { conversation: s.conversation, status: "queued", source: "human" }).flatMap((i) => {
     const reason = i.queueReason === null ? (stopping ? "stopping" : undefined) : WAITS[i.queueReason];
     if (!i.trace || !reason || tx.get("inbound", i.trace)) return [];
-    return [{ id: i.trace, ...withoutMedia(withoutSource(i.body ?? "")), reason }];
+    const { text, files } = withoutMedia(withoutSource(i.body ?? ""));
+    return [{ id: i.trace, text, files, reason }];
   });
 }
 
@@ -732,6 +803,48 @@ async function avatar(store: Store, cfg: Config, id: string): Promise<Response> 
   return new Response(bytes, { headers: { "content-type": type, "cache-control": "private, max-age=31536000, immutable" } });
 }
 
+/** What GET /api/media's v makes of a picture (spec web-images "媒体接口"): its long side at most, its
+ *  type, and whether it is worth making, by the picture's long side and bytes; else the picture will do. */
+const MADE = {
+  preview: { side: 800, type: "image/webp", worth: (side: number) => side > 800 },
+  view: { side: 2576, type: "image/jpeg", worth: (side: number, bytes: number) => side > 2576 || bytes > 2 << 20 },
+};
+
+/** The kept copy v of the picture hash in dir, under dir/v by the same hash, made now if it is not
+ *  there yet; null where the picture itself will do: small enough, or one that cannot be decoded, as
+ *  one with too many pixels. */
+async function made(dir: string, hash: string, v: keyof typeof MADE): Promise<string | null> {
+  const [from, to] = [join(dir, hash), join(dir, v, hash)];
+  if (await Bun.file(to).exists()) return to;
+  const sides = await new Bun.Image(from, { maxPixels: MAX_PIXELS }).metadata().catch(() => null);
+  const { side, worth } = MADE[v];
+  if (!sides || !worth(Math.max(sides.width, sides.height), Bun.file(from).size)) return null;
+  return makeCopy(to, () => {
+    const image = new Bun.Image(from, { maxPixels: MAX_PIXELS }).resize(side, side, { fit: "inside", withoutEnlargement: true });
+    return (v === "preview" ? image.webp() : image.jpeg()).bytes();
+  });
+}
+
+/** GET /api/media?h=<hash>[&v=preview|view] (spec web-images "媒体接口", "安全"): a kept file by its
+ *  content's SHA-256 alone, never by a path or name, from the board's own page alone. Only a picture,
+ *  PNG, JPEG, GIF or WebP by its first bytes, comes as one; anything else, HTML or SVG say, as a
+ *  download with no name, the page's link giving it. v: a picture's preview or viewing copy (made()).
+ *  Kept for good, as its address is its content; 404 for one gone, as pruned. The browser guesses no
+ *  type of any answer, so none opens as a page of the board's, which could write. */
+async function media(req: Request, dir: string, q: URLSearchParams): Promise<Response> {
+  const answer = (body: string | Blob, status: number, headers: Record<string, string> = {}) =>
+    new Response(body, { status, headers: { "x-content-type-options": "nosniff", ...(status === 200 && { "cache-control": "private, max-age=31536000, immutable" }), ...headers } });
+  if (!ownPage(req)) return answer("只认看板自己的页面发来的请求。\n", 403);
+  const [hash, v] = [q.get("h") ?? "", q.get("v")];
+  if (!/^[0-9a-f]{64}$/.test(hash) || (v !== null && !Object.hasOwn(MADE, v))) return answer("h 或 v 不对。\n", 400);
+  const head = await Bun.file(join(dir, hash)).slice(0, 12).bytes().catch(() => null);
+  if (!head) return answer("没有这个文件，可能已经清理了。\n", 404);
+  const type = pictureType(head);
+  if (!type) return answer(Bun.file(join(dir, hash)), 200, { "content-type": "application/octet-stream", "content-disposition": "attachment" });
+  const copy = v === null ? null : await made(dir, hash, v as keyof typeof MADE);
+  return answer(Bun.file(copy ?? join(dir, hash)), 200, { "content-type": copy ? MADE[v as keyof typeof MADE].type : type });
+}
+
 /** A file of the page, by its path; / is the page itself. Vite names the files under
  *  assets/ by their content, so the browser keeps those for good, and asks again for the rest. To a
  *  browser that takes br, one with a brotli built beside it (web/vite.config.ts) comes as that. The
@@ -805,8 +918,10 @@ function transcripts(store: Store) {
 
 /** The event table from after seq on, as server-sent events: id is the seq, so a browser that
  *  reconnects sends Last-Event-ID and misses nothing. With slot, also what transcripts tells of its
- *  transcript and what its agent writes: with no id, as it is not in the event table. */
-async function events(store: Store, req: Request, server: Server<Term>, follow: ReturnType<typeof transcripts>["follow"], web: string): Promise<Response> {
+ *  transcript and what its agent writes: with no id, as it is not in the event table. Each stream is
+ *  a page open, in fronts by an id of its own, which its first event gives the page to say whether it
+ *  is in front (POST /api/front); not in front till it says so, gone once it closes. */
+async function events(store: Store, req: Request, server: Server<Term>, follow: ReturnType<typeof transcripts>["follow"], web: string, fronts: Fronts): Promise<Response> {
   server.timeout(req, 0); // Bun drops a connection quiet for durations.boardIdle
   const entry = await entryOf(web);
   const last = Number(req.headers.get("Last-Event-ID") ?? NaN);
@@ -816,12 +931,14 @@ async function events(store: Store, req: Request, server: Server<Term>, follow: 
     start(c) {
       // First the page served now, which a page loaded from another build reloads for (architecture
       // §2); Bun sends the headers with the first bytes.
-      c.enqueue(`event: page\ndata: ${JSON.stringify({ entry })}\n\n`);
+      const stream = crypto.randomUUID();
+      fronts.set(stream, 0);
+      c.enqueue(`event: page\ndata: ${JSON.stringify({ entry, stream })}\n\n`);
       const unsubscribe = store.subscribe(after, ({ machine, ...e }) => c.enqueue(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`));
       const slot = new URL(req.url).searchParams.get("slot");
       const unfollow = slot ? follow(slot, (event) => c.enqueue(event)) : () => {};
       const ping = setInterval(() => c.enqueue(": ping\n\n"), 25_000); // and proxies keep it open
-      stop = () => (unsubscribe(), unfollow(), clearInterval(ping));
+      stop = () => (unsubscribe(), unfollow(), clearInterval(ping), fronts.delete(stream));
       req.signal.addEventListener("abort", stop);
     },
     cancel: () => stop(),
@@ -849,6 +966,25 @@ async function gzipped(req: Request, res: Response): Promise<Response> {
 
 /** Does what the page asks, as the main loop answers it: by the page's id for it. */
 export type Act = (id: string, act: BoardAct) => Promise<RhReply>;
+
+/** Each page open, by its event stream's id: when it last said it is in front, seen on its device
+ *  (product §5.9), or 0 since it said it is not. */
+export type Fronts = Map<string, number>;
+
+/** Whether some page is in front: said so in the last 70 s. One in front says so every 30 s, so a page
+ *  that dropped off without a word, its device asleep say, is not taken for in front till TCP gives up. */
+export const inFront = (fronts: Fronts): boolean => [...fronts.values()].some((at) => Date.now() - at < 70_000);
+
+/** POST /api/front: fields stream, an open event stream's id, and front, "1" while its page is in front,
+ *  else empty, from the board's own page alone. Where rh send me goes asks it (Ctx's front). */
+async function front(req: Request, fronts: Fronts): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  if (req.method !== "POST") return new Response("只收 POST。\n", { status: 405, headers: { allow: "POST" } });
+  const form = await req.formData().catch(() => null);
+  const stream = form?.get("stream");
+  if (typeof stream === "string" && fronts.has(stream)) fronts.set(stream, form!.get("front") === "1" ? Date.now() : 0);
+  return new Response(null, { status: 204 });
+}
 
 /** Whether the request comes from the board's own page (spec web-write "只认看板自己的页面"): every
  *  host and port on the tailnet, or under your domain, is one site, agents' pages among them, so the
@@ -939,7 +1075,9 @@ async function sendWith(req: Request, act: Act, media: string): Promise<Response
   } catch (err) {
     return Response.json({ ok: false, error: `附件没存下来：${err}` } satisfies RhReply);
   }
-  return Response.json(await act(id, { kind: "say", slot, text, attachments }), { headers: { "cache-control": "no-store" } });
+  // A browser sends each line break of a multipart field as CRLF; what you typed had LF, as the page's
+  // faint bubble has it, which the transcript's must start with (#581).
+  return Response.json(await act(id, { kind: "say", slot, text: text.replaceAll("\r\n", "\n"), attachments }), { headers: { "cache-control": "no-store" } });
 }
 
 /** A page's web terminal (spec web-terminal): the slot, the size its address gives, the page it is on
@@ -1097,8 +1235,8 @@ function ownHost(req: Request, b: Config["board"]): boolean {
 
 /** Starts the board on <board.bind>:<board.port>; throws if it cannot listen there. It joins hearing,
  *  told what the agents write. web: the page's files. act: does what the page writes; with none, the
- *  board only shows. */
-export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(), web = WEB, act: Act = async () => ({ ok: false, error: "这个看板只能看。" })): Server<Term> {
+ *  board only shows. fronts: the pages open, kept here. */
+export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(), web = WEB, act: Act = async () => ({ ok: false, error: "这个看板只能看。" }), fronts: Fronts = new Map()): Server<Term> {
   const startedAt = Date.now();
   const { follow, hear } = transcripts(store);
   hearing.add(hear);
@@ -1165,7 +1303,7 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
       case "/api/avatar":
         return avatar(store, cfg, url.searchParams.get("id") ?? "");
       case "/api/events":
-        return events(store, req, server, follow, web);
+        return events(store, req, server, follow, web, fronts);
       case "/api/messages":
         return messages(store, cfg, url.searchParams);
       case "/api/full":
@@ -1185,8 +1323,12 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
         return rhodium(store, cfg, startedAt).then((r) => Response.json(r, { headers: { "cache-control": "no-store" } }));
       case "/api/act":
         return write(req, act);
+      case "/api/front":
+        return front(req, fronts);
       case "/api/send":
         return sendWith(req, act, join(cfg.stateDir, "media"));
+      case "/api/media":
+        return media(req, join(cfg.stateDir, "media"), url.searchParams);
       case "/api/terminal":
         return terminalUpgrade(req, server);
     }

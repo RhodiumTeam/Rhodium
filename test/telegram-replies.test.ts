@@ -9,7 +9,7 @@ import { REPORT_LINE } from "../src/prompt";
 import { TELEGRAM_CAPABILITIES } from "../src/telegram";
 import type { Script, Step } from "./fake-agent/fake-agent";
 import { askingCall, askOnce, builtins, endTurn, joinBetweenTools, on, PROGRESS_PIECES, startTurn, textDelta, toolCall, toolResult, toolUse, type FakeAsk } from "./fake-agent/scripts";
-import { newInstance, until, type Daemon, type Instance, type InstanceOptions } from "./instance";
+import { newInstance, recorded, until, type Daemon, type Instance, type InstanceOptions } from "./instance";
 
 const ME = "you-tg-id";
 let rhodium: Instance;
@@ -91,8 +91,12 @@ test("requests to one chat, sends and edits alike, go out about a second apart, 
   }, 15_000);
   const posts = await rhodium.im.log("t", ME);
   expect(posts.filter((p) => p.kind === "edit").length).toBeGreaterThanOrEqual(2);
+  // A request the fake IM takes in late makes the gap before it long and the one after it short;
+  // the span shows they went out a second apart all the same (#575). Each is paced from the one
+  // before's scheduled time, so a late first request shortens the span: allow it the same 300 ms.
   const gaps = posts.slice(1).map((p, i) => p.at - posts[i]!.at);
-  expect(gaps.filter((ms) => ms < 900)).toEqual([]);
+  expect(gaps.filter((ms) => ms < 700)).toEqual([]);
+  expect(posts.at(-1)!.at - posts[0]!.at).toBeGreaterThanOrEqual(gaps.length * 900);
 }, 30_000);
 
 test("a send the platform took but never answered is unknown, not failed, and rhodium does not send it again", async () => {
@@ -259,11 +263,13 @@ test("#234: your message joining a turn rh send me took over lifts it: under rh 
   await telegram({ claude: { script: { on, steps } } });
   await say("go");
   await until(async () => (await rhodium.im.log("t", ME)).some((p) => p.text === "测试接管"), 15_000);
-  await Bun.sleep(300); // the words after rh send me reached rhodium
+  await recorded(rhodium, "SELECT 1 FROM conversation WHERE progress LIKE '%接管后说的话%'"); // the words after rh send me reached rhodium
   await say("再说一句");
-  await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
+  // The turn may end while its edits still wait their turn at the chat's pace.
+  const last = "回答插话。\n\n[🔧 Bash] ls\n\n最终回复。";
+  await until(async () => (await rhodium.state("w/a")) === "空闲" && messages(await rhodium.im.log("t", ME)).at(-1) === last, 15_000);
   await Bun.sleep(400); // past an edit's wait, so one more would be there by now
-  expect(messages(await rhodium.im.log("t", ME))).toEqual(["[🔧 Bash] rh send me 测试接管", "测试接管", "回答插话。\n\n[🔧 Bash] ls\n\n最终回复。"]);
+  expect(messages(await rhodium.im.log("t", ME))).toEqual(["[🔧 Bash] rh send me 测试接管", "测试接管", last]);
 }, 30_000);
 
 test.each([

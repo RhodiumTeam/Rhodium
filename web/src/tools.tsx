@@ -4,17 +4,18 @@
 import { cjk } from "@streamdown/cjk";
 import { cn } from "cn";
 import { Bot, Brain, Check, ChevronRight, CircleX, Copy, FilePen, FileText, Globe, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
-import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type UIEvent } from "react";
+import { Fragment, useEffect, useState, useSyncExternalStore, type ComponentProps, type CSSProperties } from "react";
 import { defaultComponents, Streamdown, type ExtraProps, type StreamdownProps } from "streamdown";
 import type { FullData } from "../../src/board";
 import type { AgentKind } from "../../src/contracts";
 import { span } from "../../src/panels";
 import { named, NOT_TOOLS, shortParts, type ShortParts } from "../../src/tool-line";
 import { Box } from "./common";
+import { Carried } from "./media";
 import { Button } from "./components/ui/button";
 import { json, type Block } from "./data";
 import { toast } from "./toast";
-import { keep, kept } from "./write";
+import { keep, kept, useEdges } from "./write";
 
 type Tool = Extract<Block, { kind: "tool" }>;
 type Step = Tool | Extract<Block, { kind: "thinking" }>;
@@ -58,27 +59,10 @@ const wrapping = new Set<() => void>();
 const useWraps = () => useSyncExternalStore((f) => (wrapping.add(f), () => void wrapping.delete(f)), () => wraps, () => wraps);
 const wrap = (on: boolean) => ((wraps = on), keep(() => localStorage, WRAP, on ? null : "off"), wrapping.forEach((f) => f()));
 
-const KEY = "hover-round -my-2 grid size-11 [--round-inset:--spacing(2.5)] shrink-0 place-items-center hover:text-foreground";
+// A small key in a slim row: its 44px tap reaches past the row, a 24px round round its icon.
+export const KEY = "hover-round -my-2 grid size-11 [--round-inset:--spacing(2.5)] shrink-0 place-items-center hover:text-foreground";
 // Tailwind's preflight's tab-size, which a code block keeps.
 const TAB = 4;
-/** Writes how far a scroller can still go left and right, for its edge-fade (index.css). */
-const edges = (el: HTMLElement) => {
-  el.style.setProperty("--os", `${el.scrollLeft}px`);
-  el.style.setProperty("--oe", `${el.scrollWidth - el.clientWidth - el.scrollLeft}px`);
-};
-/** A scroller's ref and onScroll that keep its edge-fade up to date: on a scroll, and as the scroller or
- *  what it holds changes size, a line or a row still being written included. */
-function useEdges<T extends HTMLElement>() {
-  const ref = useRef<T>(null);
-  useEffect(() => {
-    const el = ref.current!;
-    const sized = new ResizeObserver(() => edges(el));
-    sized.observe(el);
-    sized.observe(el.firstElementChild!);
-    return () => sized.disconnect();
-  }, []);
-  return { ref, onScroll: (e: UIEvent<T>) => edges(e.currentTarget) };
-}
 /** A table in one box, as a code block's (#502): Streamdown's put a second around it. No height limit
  *  either. Wide, it scrolls inside, its edges faded as an unwrapped code block's are. A cell's words
  *  keep whole, a link's too (Streamdown's wrap-anywhere on it), a long one widening the table (#559):
@@ -111,16 +95,10 @@ function Cell({ node, ...p }: ComponentProps<"td"> & ExtraProps) {
  *  no highlighter. */
 function CodeBlock({ className, children }: ComponentProps<"code"> & ExtraProps) {
   const on = useWraps();
-  const [copied, setCopied] = useState(false);
   // Unwrapped, the edges fade as T3 Code's do (#507).
   const scroller = useEdges<HTMLPreElement>();
   // The fence's text ends in the newline before its closing fence, which is not the code's.
   const code = String(children ?? "").replace(/\n$/, "");
-  const copy = () =>
-    navigator.clipboard.writeText(code).then(
-      () => (setCopied(true), setTimeout(() => setCopied(false), 2000)),
-      () => toast("没能复制。", true),
-    );
   return (
     <div className="my-4 rounded-lg border bg-card">
       <div className="flex h-7 items-center pl-3 text-xs text-muted-foreground">
@@ -128,15 +106,28 @@ function CodeBlock({ className, children }: ComponentProps<"code"> & ExtraProps)
         <button aria-label="自动换行" aria-pressed={on} onClick={() => wrap(!on)} className={cn(KEY, "ml-auto aria-pressed:text-foreground")}>
           <TextWrap className="size-3.5" />
         </button>
-        <button aria-label="复制" onClick={copy} className={KEY}>
-          {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-        </button>
+        <CopyKey text={code} className={KEY} icon="size-3.5" />
       </div>
       <pre {...scroller} className={cn("card-scroll overflow-x-auto pb-2.5 font-mono text-sm", on ? "@container whitespace-pre-wrap wrap-anywhere" : "edge-fade whitespace-pre")}>
         {/* The padding on the code, not the scroller: scrolled to its end, a long line keeps it. */}
         <code className={cn("block px-3", !on && "w-max min-w-full")}>{on ? code.split("\n").map(hanging) : code}</code>
       </pre>
     </div>
+  );
+}
+
+/** 复制: copies text as written, a check for 2 s once it did; one it could not says so (story 572). */
+export function CopyKey({ text, className, icon }: { text: string; className: string; icon: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () =>
+    navigator.clipboard.writeText(text).then(
+      () => (setCopied(true), setTimeout(() => setCopied(false), 2000)),
+      () => toast("没能复制。", true),
+    );
+  return (
+    <button aria-label="复制" onClick={copy} className={className}>
+      {copied ? <Check className={icon} /> : <Copy className={icon} />}
+    </button>
   );
 }
 
@@ -290,58 +281,75 @@ function part(text: string, n: number, bad: number, whole = false) {
  *  failed, open to a line a step, each open to its arguments and result, or the thought. */
 export function Fold({ f, conversation }: { f: Extract<Shown, { kind: "fold" }>; conversation: string }) {
   const bad = new Set(f.steps.filter(failed).map(kindOfStep));
+  // What its rh sends to you said, shown under it, folded or not (spec web-images): each that went, as
+  // the board found its send_me event, whatever its command's exit.
+  const sent = f.steps.flatMap((s) => (s.kind === "tool" && s.send?.media ? [{ at: s.at, ...s.send }] : []));
   return (
-    <details className="group/fold text-sm text-muted-foreground">
-      {/* Its icons and chevron at the top, by the first line of a line that wraps; with the padding, a row of one
-          line is as high as before, its icons and line where they were. */}
-      <summary className={cn(ROW, "items-start py-1.5 lg:py-1")}>
-        <span className="flex shrink-0 -space-x-1">
-          {f.kinds.slice(0, 3).map((k) => (
-            <Icon key={k} kind={k} failed={bad.has(k)} className="ring-2 ring-background" />
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-2">
+      <details className="group/fold text-sm text-muted-foreground">
+        {/* Its icons and chevron at the top, by the first line of a line that wraps; with the padding, a row of one
+            line is as high as before, its icons and line where they were. */}
+        <summary className={cn(ROW, "items-start py-1.5 lg:py-1")}>
+          <span className="flex shrink-0 -space-x-1">
+            {f.kinds.slice(0, 3).map((k) => (
+              <Icon key={k} kind={k} failed={bad.has(k)} className="ring-2 ring-background" />
+            ))}
+          </span>
+          <span className="min-w-0 flex-1">
+            {f.line.runs.map((r, i) => (
+              <Fragment key={i}>
+                {i > 0 && "、"}
+                {part(named(r), r.n, r.failed)}
+              </Fragment>
+            ))}
+            {f.line.more.n > 0 && (
+              <>
+                ，{part(`另外 ${f.line.more.n} 次`, f.line.more.n, f.line.more.failed, true)}
+              </>
+            )}
+          </span>
+          <ChevronRight className={cn(CHEVRON, "mt-[3px] group-open/fold:rotate-90")} />
+        </summary>
+        <ul className="mt-0.5 ml-2.5 border-l pl-3">
+          {f.steps.map((s) => (
+              <li key={s.at}>
+                <details className="group/step">
+                  <summary className={ROW}>
+                    <Icon kind={kindOfStep(s)} failed={failed(s)} />
+                    <span className="min-w-0 flex-1 truncate">
+                      <Name s={s} strong />
+                    </span>
+                    {failed(s) && <Failed />}
+                    <ChevronRight className={cn(CHEVRON, "group-open/step:rotate-90")} />
+                  </summary>
+                  <div className="mb-2 ml-7 grid grid-cols-1 gap-1.5">
+                    {s.kind === "thinking" ? (
+                      <Clipped {...s} conversation={conversation} thought />
+                    ) : (
+                      <>
+                        <Clipped text={s.input} length={s.length} at={s.at} conversation={conversation} />
+                        {/* Its text, if it had any: an empty box says nothing (spec web-images); then the pictures it showed the agent (story 563). */}
+                        {!s.result ? <span>没有结果。</span> : !!s.result.text && <Clipped {...s.result} conversation={conversation} />}
+                        {s.result?.media && <Carried media={s.result.media} className="justify-items-start" />}
+                      </>
+                    )}
+                  </div>
+                </details>
+              </li>
           ))}
-        </span>
-        <span className="min-w-0 flex-1">
-          {f.line.runs.map((r, i) => (
-            <Fragment key={i}>
-              {i > 0 && "、"}
-              {part(named(r), r.n, r.failed)}
-            </Fragment>
-          ))}
-          {f.line.more.n > 0 && (
-            <>
-              ，{part(`另外 ${f.line.more.n} 次`, f.line.more.n, f.line.more.failed, true)}
-            </>
+        </ul>
+      </details>
+      {sent.map((s) => (
+        <div key={s.at} className="ml-2.5 grid grid-cols-[minmax(0,1fr)] gap-2 border-l pl-3">
+          {s.text && (
+            <Streamdown mode="static" {...MARKDOWN}>
+              {s.text}
+            </Streamdown>
           )}
-        </span>
-        <ChevronRight className={cn(CHEVRON, "mt-[3px] group-open/fold:rotate-90")} />
-      </summary>
-      <ul className="mt-0.5 ml-2.5 border-l pl-3">
-        {f.steps.map((s) => (
-            <li key={s.at}>
-              <details className="group/step">
-                <summary className={ROW}>
-                  <Icon kind={kindOfStep(s)} failed={failed(s)} />
-                  <span className="min-w-0 flex-1 truncate">
-                    <Name s={s} strong />
-                  </span>
-                  {failed(s) && <Failed />}
-                  <ChevronRight className={cn(CHEVRON, "group-open/step:rotate-90")} />
-                </summary>
-                <div className="mb-2 ml-7 grid grid-cols-1 gap-1.5">
-                  {s.kind === "thinking" ? (
-                    <Clipped {...s} conversation={conversation} thought />
-                  ) : (
-                    <>
-                      <Clipped text={s.input} length={s.length} at={s.at} conversation={conversation} />
-                      {s.result ? <Clipped {...s.result} conversation={conversation} /> : <span>没有结果。</span>}
-                    </>
-                  )}
-                </div>
-              </details>
-            </li>
-        ))}
-      </ul>
-    </details>
+          {s.media && <Carried media={s.media} className="justify-items-start" />}
+        </div>
+      ))}
+    </div>
   );
 }
 

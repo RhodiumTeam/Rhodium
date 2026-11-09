@@ -4,27 +4,28 @@
 // loads this only once you open a slot. A slot in the terminal shows its pane instead (spec web-terminal).
 import { useQuery } from "@tanstack/react-query";
 import { Menu } from "@base-ui/react/menu";
-import { Popover } from "@base-ui/react/popover";
-import { AArrowDown, AArrowUp, ALargeSmall, Archive, ArchiveRestore, Ellipsis, Expand, FoldVertical, Maximize2, MessageSquareText, Minimize2, Network, PanelLeftClose, PanelLeftOpen, Pencil, Settings, Shrink, SquarePen, SquareTerminal, Trash2 } from "lucide-react";
+import { AArrowDown, AArrowUp, ALargeSmall, Archive, ArchiveRestore, Ellipsis, Expand, FoldVertical, Maximize2, MessageSquareText, Minimize2, Network, PanelLeftClose, PanelLeftOpen, Pencil, Quote, Settings, Shrink, SquarePen, SquareTerminal, Trash2 } from "lucide-react";
 import { lazy, Suspense, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { useLocation } from "wouter";
 import { cn } from "cn";
-import { AgentLogo, breakLong, clock, flagged, goHash, Max, THEME, THEME_ICON, THEMES, TopBar, useBoardKey, useTheme, WIDE } from "./common";
+import { AgentLogo, clock, flagged, goHash, Max, TopBar, useBoardKey, WIDE } from "./common";
 import { flash, openSlot, SideList } from "./board";
 import { Badge } from "./components/ui/badge";
 import { buttonVariants } from "./components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "./components/ui/sheet";
-import { FROM_BOARD, type Platform } from "../../src/contracts";
+import { fromBoard, type Platform } from "../../src/contracts";
 import { heard, json, mayPrefetch, Messages, queryClient, seen, heardCount, unsent, type Block, type BoardData, type SlotData } from "./data";
 import { Details } from "./details";
+import { Carried } from "./media";
 import { Face, Mark } from "./faces";
 import { Stick, type Place } from "./stick";
-import { Fold, folded, MARKDOWN, Running, type Shown } from "./tools";
-import { canRemind, reminding, remindBy, useUnreadBut } from "./unread";
+import { CopyKey, Fold, folded, KEY, MARKDOWN, Running, type Shown } from "./tools";
+import { SettingsMenu, useTerminalEntry } from "./settings";
+import { useUnreadBut } from "./unread";
 import { Asks } from "./asks";
 import { inTurn } from "./timeline";
-import { act, attach, Composer, Connecting, givenBack, keep, kept, Pending, Pick, Queue, Remove, Rename, TakeBack, told, Toasts, useAct, type Choice } from "./write";
+import { act, attach, Composer, Connecting, givenBack, keep, kept, Pending, Pick, Queue, quote, Remove, Rename, TakeBack, told, Toasts, useAct, Words, type Choice } from "./write";
 
 // Its code, with ghostty-web's, comes only for a slot in the terminal (story 344).
 const TerminalView = lazy(() => import("./terminal"));
@@ -184,13 +185,13 @@ export function visit(id: string) {
 const SIDE = { size: 288, min: 256, max: 448 };
 // Wider than the narrowest phone's list (20.5rem), the sidebar's rows are the phone's.
 const PHONE = 328;
-// The split's left at first and its most, in %; its least in px, the narrowest phone's, which the
-// board's header and rows are made for (story 422).
-const SPLIT = { size: 40, max: 70, min: 360 };
+// The split's left at first and its most, in %; its least in px, the narrowest phone's 360, which the
+// board's header and rows are made for (story 422), and the list's bar's room (#635).
+const SPLIT = { size: 40, max: 70, min: 370 };
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 // The sidebar's most at this window's width: the chat keeps the narrowest phone's 360px beside it,
 // though never the sidebar narrower than its least (spec web-maximize "宽度和改窗口").
-const sideMost = () => clamp(innerWidth - SPLIT.min, SIDE.min, SIDE.max);
+const sideMost = () => clamp(innerWidth - 360, SIDE.min, SIDE.max);
 const resized = (f: () => void) => (addEventListener("resize", f), () => removeEventListener("resize", f));
 
 /** The sidebar's width as this device keeps it, in px; with none kept, or storage that cannot be used, 288. */
@@ -299,8 +300,9 @@ export function Split({ from, full, board, chat }: { from: "list" | "topology"; 
           ref={side}
           style={full ? { width: collapsed ? 0 : shown } : { width: `${pct}%`, minWidth: SPLIT.min }}
           onTransitionEnd={(e) => e.target === e.currentTarget && setSlide(false)}
-          // Clipped, not hidden: a row scrolled to never scrolls it sideways.
-          className={cn("h-full flex-none", full ? "flex justify-end overflow-clip bg-sidebar motion-reduce:transition-none" : "overflow-y-auto", ease, gone)}
+          // Clipped, not hidden: a row scrolled to never scrolls it sideways. The list or the topology
+          // scrolls under its own header (#635).
+          className={cn("h-full flex-none overflow-clip", full && "flex justify-end bg-sidebar motion-reduce:transition-none", ease, gone)}
         >
           {full ? (
             <div style={{ width: shown }} className="flex h-full flex-none flex-col">
@@ -347,73 +349,14 @@ export function Split({ from, full, board, chat }: { from: "list" | "topology"; 
 }
 
 /** Maximize mode's settings (spec web-maximize "设置", #491): a gear at the sidebar's bottom left, under
- *  the list, which opens a card above it. Only here: the home's header has the theme already. */
+ *  the list, which opens the card above it. */
 function SideSettings() {
   return (
     <div className="flex-none border-t border-border/70 px-2 py-1.5">
-      <Popover.Root>
-        <Popover.Trigger aria-label="设置" title="设置" className="grid size-9 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
-          <Settings className="size-4" />
-        </Popover.Trigger>
-        <Popover.Portal>
-          <Popover.Positioner side="top" align="start" sideOffset={4} collisionPadding={8} className="z-[70]">
-            <Popover.Popup className="grid w-64 gap-3 rounded-xl border bg-popover p-3 text-sm text-popover-foreground shadow-lg outline-none transition-opacity data-ending-style:opacity-0 data-starting-style:opacity-0">
-              <SettingsCard />
-            </Popover.Popup>
-          </Popover.Positioner>
-        </Popover.Portal>
-      </Popover.Root>
+      <SettingsMenu side="top" className="grid size-9 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
+        <Settings className="size-4" />
+      </SettingsMenu>
     </div>
-  );
-}
-
-/** The settings card: the theme, the same as the home header's button picks, and, where the page can
- *  show one, whether this device reminds you as turns end. Turned on with no leave yet, it asks for it
- *  in that click; denied, it says where to allow it again, as the page cannot ask once more. */
-function SettingsCard() {
-  const theme = useTheme();
-  const [can] = useState(canRemind);
-  const [leave, setLeave] = useState(() => (can ? Notification.permission : "denied"));
-  const [on, setOn] = useState(reminding);
-  const checked = on && leave === "granted";
-  return (
-    <>
-      <div className="flex items-center justify-between">
-        主题
-        <div className="inline-flex overflow-hidden rounded-lg border">
-          {THEMES.map((t) => {
-            const [Icon, label] = THEME_ICON[t];
-            return (
-              <button key={t} aria-label={label} title={label} aria-pressed={theme === t} onClick={() => THEME.set(t)} className={cn("grid h-8 w-9 place-items-center transition-colors", theme === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-foreground/5 hover:text-foreground")}>
-                <Icon className="size-4" />
-              </button>
-            );
-          })}
-        </div>
-      </div>
-      {can && (
-        <div>
-          <div className="flex items-center justify-between">
-            通知
-            <button
-              role="switch"
-              aria-checked={checked}
-              aria-label="通知"
-              disabled={leave === "denied"}
-              onClick={async () => {
-                const now = await remindBy(!checked);
-                setOn(!checked);
-                setLeave(now);
-              }}
-              className="group mr-0.5 h-5 w-9 rounded-full bg-input p-0.5 transition-colors aria-checked:bg-running"
-            >
-              <span className="block size-4 rounded-full bg-background shadow-xs transition-transform group-aria-checked:translate-x-4" />
-            </button>
-          </div>
-          {leave === "denied" && <p className="mt-1 text-xs text-muted-foreground">要在浏览器的网站设置里重新允许</p>}
-        </div>
-      )}
-    </>
   );
 }
 
@@ -597,6 +540,8 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
   const turn = inTurn(d);
   // Something at the bottom clear of the screen's edge: where you type. Asks waiting on you take its place.
   const bottom = d.mode === "headless" && !d.asks.length;
+  // The terminal key, unless 终端入口 is off or there is no Herdr (spec web-write "终端入口").
+  const entry = useTerminalEntry();
   const changed = () => redraw((n) => n + 1);
 
   // Its transcript grew: bring the blocks written since, and only them. One not brought comes next time.
@@ -624,14 +569,6 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
     seen.add(back);
     return () => void seen.delete(back);
   }, [d.id, log]);
-
-  // The page before, if the conversation has one.
-  const older = async () => {
-    const start = log.start;
-    if (start <= 0) return false;
-    await log.older();
-    return log.start !== start;
-  };
 
   // Files dropped on the chat are attached where you type (#286); the browser opens none.
   const files = (e: DragEvent) => e.dataTransfer.types.includes("Files") && (e.preventDefault(), true);
@@ -680,7 +617,8 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
           </span>
         </Pick>
         <Sheet>
-          <SheetTrigger className="focus-child -my-0.5 grid h-11 min-w-11 shrink-0 place-items-center">
+          {/* Wider than 44px, its pill would fill its target: pl-2 keeps it as far from ⋯ as the icons are apart. */}
+          <SheetTrigger className="focus-child -my-0.5 grid h-11 min-w-11 shrink-0 place-items-center pl-2">
             <span className={cn(buttonVariants({ variant: "outline", size: "sm" }))}>详情</span>
           </SheetTrigger>
           <SheetContent className="w-[90%] gap-0">
@@ -696,26 +634,32 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
       </TopBar>
       <TakeBack slot={d.id} open={taking} onOpenChange={setTaking} onTaken={() => setReads(d.id)} />
       <Remove slot={d.id} name={d.ref} open={removing} onOpenChange={setRemoving} />
-      {(!terminal || reading) && <Stick label="对话" reset={log.conversation} tail={`${log.blocks.at(-1)?.at} ${log.begun} ${log.sent.length}`} older={older} place={place}>
-        {() => (
-          <div className="mx-auto grid max-w-3xl grid-cols-[minmax(0,1fr)] gap-4 px-4 pt-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-            {!log.blocks.length && <p className="text-sm text-muted-foreground">{log.conversation ? "对话里还没有消息。" : "还没有对话。"}</p>}
-            {folded(log.blocks).map((b) => (
-              <Said key={b.at} b={b} conversation={log.conversation ?? ""} />
-            ))}
-            {log.drafts.map((d, i) => (
-              // Streaming: Markdown half written, as **bold not yet closed, shows as it will.
-              <Streamdown key={i} {...MARKDOWN} isAnimating={!d.whole} caret="block">
-                {d.text}
-              </Streamdown>
-            ))}
-            {log.sent
-              .filter((s) => !d.queue.some((q) => q.id === s.id))
-              .map((s) => (
-                <Pending key={s.id} s={s} slot={d.id} log={log} changed={changed} />
+      {(!terminal || reading) && <Stick label="对话" reset={log.conversation} tail={`${log.blocks.at(-1)?.at} ${log.begun} ${log.sent.length}`} older={() => log.older()} place={place}>
+        {() => {
+          // Drawn here, not with the chat: Stick draws only this again as the pages before come.
+          const shown = folded(log.blocks);
+          // Its 复制 and 引用 always show (story 571).
+          const lastSaid = shown.findLast((b) => b.kind === "assistant")?.at;
+          return (
+            <div className="mx-auto grid max-w-3xl grid-cols-[minmax(0,1fr)] gap-4 px-4 pt-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+              {!log.blocks.length && <p className="text-sm text-muted-foreground">{log.conversation ? "对话里还没有消息。" : "还没有对话。"}</p>}
+              {shown.map((b) => (
+                <Said key={b.at} b={b} conversation={log.conversation ?? ""} keys={{ slot: d.id, quotes: bottom, last: b.at === lastSaid }} />
               ))}
-          </div>
-        )}
+              {log.drafts.map((d, i) => (
+                // Streaming: Markdown half written, as **bold not yet closed, shows as it will.
+                <Streamdown key={i} {...MARKDOWN} isAnimating={!d.whole} caret="block">
+                  {d.text}
+                </Streamdown>
+              ))}
+              {log.sent
+                .filter((s) => !d.queue.some((q) => q.id === s.id))
+                .map((s) => (
+                  <Pending key={s.id} s={s} slot={d.id} log={log} changed={changed} />
+                ))}
+            </div>
+          );
+        }}
       </Stick>}
       {/* Kept attached under the chat: the page is still yours (spec web-terminal "一处在操作"). */}
       {terminal && (
@@ -732,10 +676,10 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
       {/* The toasts float over what is at the bottom: the asks, where you type, or with neither, the screen's edge. */}
       <div className="relative shrink-0">
         <Toasts />
-        {d.mode === "headless" && <Queue slot={d.id} queue={d.queue} />}
+        {d.mode === "headless" && d.queue.length > 0 && <Queue slot={d.id} queue={d.queue} />}
         {/* Asks waiting on you take the place of where you type, the stop key on the top one (spec web-write "页面"). */}
         <Asks d={d} turn={turn} />
-        {bottom && <Composer key={d.id} slot={d.id} turn={turn} terminal={d.archivedAt === null} log={log} changed={changed} commands={d.commands} agent={d.agent} model={d.model} effort={d.effort} ultracode={d.ultracode} />}
+        {bottom && <Composer key={d.id} slot={d.id} turn={turn} archived={d.archivedAt !== null} switchable={d.archivedAt === null && entry} log={log} changed={changed} commands={d.commands} agent={d.agent} model={d.model} effort={d.effort} ultracode={d.ultracode} />}
         {!bottom && <div className="h-[env(safe-area-inset-bottom)]" />}
       </div>
     </div>
@@ -760,9 +704,9 @@ function FontSize({ px, set }: { px: number; set: (px: number) => void }) {
   );
 }
 
-/** A conversation's latest page in a box of its own that scrolls, for the topology's timeline (spec
- *  web-topology, story 231): as the chat shows it, opened at the newest, going on down with what comes
- *  while you are at the bottom. live: the slot's current conversation, which grows as the stream says,
+/** A conversation in a box of its own that scrolls, for the topology's timeline (spec web-topology,
+ *  stories 231, 588): as the chat shows it, opened at the newest page, going on down with what comes
+ *  while you are at the bottom, and back to the first as you scroll up. live: the slot's current conversation, which grows as the stream says,
  *  drafts and all; an old one never changes. */
 export function Preview({ slot, conversation, live }: { slot: string; conversation: string; live: boolean }) {
   const [log] = useState(() => new Messages(slot, json, conversation));
@@ -776,8 +720,8 @@ export function Preview({ slot, conversation, live }: { slot: string; conversati
     return () => void heard.delete(hear);
   }, [log, live]);
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border bg-background">
-      <Stick label="预览" reset={log.loaded} tail={`${log.blocks.at(-1)?.at} ${log.begun}`} older={async () => false}>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <Stick label="预览" fade className="*:card-scroll" reset={log.loaded} tail={`${log.blocks.at(-1)?.at} ${log.begun}`} older={() => log.older()}>
         {() => (
           <div className="grid grid-cols-[minmax(0,1fr)] gap-3 px-3 py-2.5 text-sm">
             {folded(log.blocks).map((b) => (
@@ -801,9 +745,28 @@ function Yours({ url, p }: { url: string | null; p: Platform }) {
   return url && broken !== url ? <img src={url} alt="" onError={() => setBroken(url)} className="size-7 shrink-0 rounded-full object-cover" /> : <Mark p={p} size={28} />;
 }
 
+/** Under a message of the chat (stories 571-573): 复制, which copies text, and with quotes, 引用, which
+ *  quotes it where you type to slot. Where the pointer cannot hover, as on a phone, always shown; else
+ *  only with the mouse on the message, its keys reached by a key, or last, and 28px keys pulled into the
+ *  gap under it, 8px past the chat's, so the chat is spaced about as without them. */
+function Keys({ text, slot, quotes, last, className }: { text: string; slot: string; quotes?: boolean; last?: boolean; className: string }) {
+  const key = cn(KEY, "mouse:my-0 mouse:size-7 mouse:[--round-inset:--spacing(0.5)]");
+  return (
+    <div className={cn("flex text-muted-foreground transition-opacity mouse:-mt-1.5 mouse:-mb-4.5", !last && "opacity-0 group-hover:opacity-100 has-focus-visible:opacity-100 [@media(hover:none)]:opacity-100", className)}>
+      <CopyKey text={text} className={key} icon="size-4" />
+      {quotes && (
+        <button aria-label="引用" onClick={() => quote(slot, text)} className={key}>
+          <Quote className="size-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** A block of the conversation: what you said on the right, what the agent said as Markdown, its tool
- *  calls and thoughts folded. */
-function Said({ b, conversation }: { b: Shown; conversation: string }) {
+ *  calls and thoughts folded. keys: in a slot's chat, 复制 under what was said, and 引用 under the
+ *  agent's where quotes, last its last. */
+function Said({ b, conversation, keys }: { b: Shown; conversation: string; keys?: { slot: string; quotes: boolean; last: boolean } }) {
   const time = "time" in b && b.time !== null && <span className="text-xs text-muted-foreground tabular-nums">{clock(b.time)}</span>;
   switch (b.kind) {
     case "user": {
@@ -813,7 +776,7 @@ function Said({ b, conversation }: { b: Shown; conversation: string }) {
       const f = b.from;
       return (
         // One column no wider than the room: an auto one grows to what is in it, the chat then scrolling sideways.
-        <div className={cn("grid grid-cols-[minmax(0,1fr)] justify-items-end gap-1", f ? "pl-4" : "pl-10")}>
+        <div className={cn("group grid grid-cols-[minmax(0,1fr)] justify-items-end gap-1", f ? "pl-4" : "pl-10")}>
           <div className={cn("flex items-center gap-1.5", f && "mr-9")}>
             {f ? (
               <>
@@ -823,24 +786,34 @@ function Said({ b, conversation }: { b: Shown; conversation: string }) {
             ) : (
               // A long one, as 槽位 HomeProject/homehelp，经 rh send, wraps on a phone, its last line not one
               // lone word; 10px round, a pill on one 20px line as before, a soft box on two.
-              b.source && b.source !== FROM_BOARD && <Badge variant="outline" className="h-auto shrink rounded-lg py-px text-pretty whitespace-normal wrap-anywhere">{b.source}</Badge>
+              b.source && !fromBoard(b.source) && <Badge variant="outline" className="h-auto shrink rounded-lg py-px text-pretty whitespace-normal wrap-anywhere">{b.source}</Badge>
             )}
             {time}
           </div>
           <div className="flex max-w-full items-start gap-2">
-            <p className="min-w-0 rounded-2xl rounded-tr-sm border bg-muted px-3 py-2 whitespace-pre-wrap wrap-anywhere">{breakLong(b.text)}</p>
+            {/* What it carried over its words (spec web-images): either may be all there is. */}
+            <div className="grid min-w-0 justify-items-end gap-1.5">
+              {b.media && <Carried media={b.media} className="justify-items-end" />}
+              {b.text && (
+                <div className="min-w-0 rounded-2xl rounded-tr-sm border bg-muted px-3 py-2">
+                  <Words text={b.text} />
+                </div>
+              )}
+            </div>
             {f && <Yours url={f.avatar} p={f.platform} />}
           </div>
+          {keys && b.text && <Keys text={b.text} slot={keys.slot} className={f ? "mr-5.5 mouse:mr-7.5" : "-mr-3.5 mouse:-mr-1.5"} />}
         </div>
       );
     }
     case "assistant":
       return (
-        <div className="grid gap-1">
+        <div className="group grid gap-1">
           {time}
           <Streamdown mode="static" {...MARKDOWN}>
             {b.text}
           </Streamdown>
+          {keys && <Keys text={b.text} slot={keys.slot} quotes={keys.quotes} last={keys.last} className="-ml-3.5 mouse:-ml-1.5" />}
         </div>
       );
     case "system":

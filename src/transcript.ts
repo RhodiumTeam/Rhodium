@@ -1,10 +1,13 @@
 // Transcript reader: pages through an agent's own transcript file (Claude's, pi's or
 // Codex's, one JSON object per line) by byte offset, never loading the whole file, and
 // lists the conversations a directory has. Read-only: Rhodium never writes these files.
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { open, readdir, stat, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import type { AgentKind, Used } from "./contracts";
+import { fileURLToPath } from "node:url";
+import { plain, quoteOf, type AgentKind, type Used } from "./contracts";
+import { pictureType, saveMedia, withoutMedia, type Media } from "./media";
 import { splitSource, withoutSource } from "./prompt";
 import { clip, describe as shownCall } from "./render";
 import type { Call } from "./tool-line";
@@ -139,11 +142,16 @@ function fromCodex(v: any): any {
 /** A tool item of Codex's record as a call, by the name its model calls the tool by (architecture
  *  §6.4's table): what it was given, and its output. null for one not known. Only those 0.162.1 was
  *  seen writing: no rollout here had a plan or a dynamic tool's call. */
-function codexCall(item: any): { name: string; arguments: unknown; output: { text: string; error: boolean } } | null {
+function codexCall(item: any): { name: string; arguments: unknown; output: { text: string; error: boolean }; took?: number } | null {
   const failed = item.status !== undefined && item.status !== "completed";
   switch (item.type) {
-    case "CommandExecution": // what ran, the last of `zsh -lc`'s words
-      return { name: "exec_command", arguments: { command: list(item.command).at(-1) }, output: { text: String(item.aggregated_output ?? ""), error: failed } };
+    case "CommandExecution": // what ran, the last of `zsh -lc`'s words; took: how long it ran, in ms
+      return {
+        name: "exec_command",
+        arguments: { command: list(item.command).at(-1) },
+        output: { text: String(item.aggregated_output ?? ""), error: failed },
+        took: (item.duration?.secs ?? 0) * 1000 + Math.round((item.duration?.nanos ?? 0) / 1e6),
+      };
     case "FileChange": // by path: an add's content, an update's unified_diff
       return {
         name: "apply_patch",
@@ -153,7 +161,7 @@ function codexCall(item: any): { name: string; arguments: unknown; output: { tex
     case "McpToolCall":
       return { name: `mcp__${item.server}__${item.tool}`, arguments: item.arguments ?? {}, output: { text: joined(item.result?.content) || (item.error ? JSON.stringify(item.error) : ""), error: failed || item.result?.isError === true } };
     case "ImageView":
-      return { name: "view_image", arguments: { path: String(item.path).replace(/^file:\/\//, "") }, output: { text: "", error: false } };
+      return { name: "view_image", arguments: { path: pathOf(String(item.path)) }, output: { text: "", error: false } };
     case "Extension": // its web search, in 0.162.1
       if (item.kind !== "web.search") return null;
       return { name: "web_search", arguments: { query: item.query }, output: { text: list(item.results).map((r) => [r?.title, r?.url].filter(Boolean).join(" ")).join("\n"), error: false } };
@@ -162,6 +170,16 @@ function codexCall(item: any): { name: string; arguments: unknown; output: { tex
       return { name: "spawn_agent", arguments: { agent_path: item.agent_path }, output: { text: "", error: false } };
   }
   return null;
+}
+
+/** The path a file: URL names, decoded (Codex writes a path as one, Url::from_file_path); any other
+ *  string as it is. */
+function pathOf(s: string): string {
+  try {
+    return fileURLToPath(s);
+  } catch {
+    return s;
+  }
 }
 
 // What you send while a turn runs, Claude records once it takes it in as an attachment, not a user
@@ -187,22 +205,28 @@ function toEntry(offset: number, raw: string): Entry {
 
 // ---- Message blocks: the conversation as the board's page shows it (architecture §7.7). ----
 
-/** A tool call's result. text: its text, only its start where length (the whole's) is given. */
-export type Result = { at: string; time: number | null; text: string; length?: number; error: boolean };
+/** A tool call's result. text: its text, only its start where length (the whole's) is given. media:
+ *  the pictures it carries, by address (spec web-images "消息块里的图和 rh send 的话"). */
+export type Result = { at: string; time: number | null; text: string; length?: number; error: boolean; media?: Media[] };
+/** An rh send to you in a shell call (sendOf): where to, its text and its --file paths as written; and
+ *  what it sent, by address, once the board has found its send_me event (spec web-images): none, text
+ *  alone, [] then. Without it, it may never have run. */
+export type Send = { to: string; text: string; files: string[]; media?: Media[] };
 type Body =
   /** id: what the agent's record names it by, where that is what Rhodium sent it as: Claude's uuid
-   *  (frameUuid of its input's id), Codex's client_id (its input's id). */
-  | { kind: "user"; text: string; source: string | null; id?: string }
+   *  (frameUuid of its input's id), Codex's client_id (its input's id). media: what it carried, in
+   *  place of the lines that say so at its end (architecture §8.3). */
+  | { kind: "user"; text: string; source: string | null; id?: string; media?: Media[] }
   | { kind: "assistant"; text: string }
   | { kind: "thinking"; text: string; length?: number }
   /** input: its arguments as JSON, only their start where length is given; shown: its name and argument
-   *  as a detailed tool line has them; result: if on the same page. */
-  | { kind: "tool"; id: string; name: string; input: string; length?: number; shown: Call; result: Result | null }
+   *  as a detailed tool line has them; result: if on the same page; send: the rh send to you it runs. */
+  | { kind: "tool"; id: string; name: string; input: string; length?: number; shown: Call; result: Result | null; send?: Send }
   /** The result of a call on another page, which it goes with by id. */
   | ({ kind: "result"; id: string } & Omit<Result, "at" | "time">)
   | { kind: "system"; title: string; text: string; length?: number };
 /** A block of the conversation. at: where it is, the byte offset of its line, a dot, and its place
- *  among that line's blocks; time: when the line was written. */
+ *  among that line's blocks; time: when the line was written, a Codex call's when it began. */
 export type Block = Body & { at: string; time: number | null };
 
 /** Blocks a page gives, with where to read on from: back from start, forward from end. */
@@ -221,15 +245,40 @@ function clipped(text: string, max: number): { text: string; length?: number } {
 /** The text of a message's text blocks, or the content itself if it is text. */
 const joined = (content: unknown) => texts(content).join("\n\n");
 
+/** Where a page keeps the pictures tool results carry: the media dir, and the transcript file, by
+ *  which with a block's place what was kept there is remembered. */
+type Keep = { media: string; file: string };
+
+/** The addresses of the pictures in the results read so far, by file and place (Keep): a line never
+ *  changes once written, so each is decoded or copied once. */
+// ponytail: grows by one entry, about 200 bytes, per result with pictures read since rhodium started; drop the oldest if that grows.
+const kept = new Map<string, Media[]>();
+
 /** The blocks of a transcript line, Claude's, pi's or Codex's: what you said, what the agent said and thought,
  *  its tool calls and their results, and the system lines worth a line (architecture §7.7's table).
  *  Other lines give none; one that is not a JSON object gives a system line. Tool calls' paths are
- *  shown relative to dir, the slot's. */
-function blocksOf(offset: number, raw: string, max: number, dir: string): Block[] {
+ *  shown relative to dir, the slot's. With keep, the pictures results carry are kept and given by
+ *  address; without, none are. */
+function blocksOf(offset: number, raw: string, max: number, dir: string, keep?: Keep): Block[] {
   const blocks: Block[] = [];
   const v = parseObject(raw);
   const time = typeof v?.timestamp === "string" ? Date.parse(v.timestamp) || null : null;
-  const add = (b: Body) => blocks.push({ ...b, at: `${offset}.${blocks.length}`, time });
+  const add = (b: Body, when = time) => blocks.push({ ...b, at: `${offset}.${blocks.length}`, time: when });
+  // The pictures of the result about to be added, as find keeps them in the media dir; once a place,
+  // but for one that could not be read or kept now (gone, the disk full), tried again next time.
+  const pictures = (find: (media: string) => Media[]) => {
+    if (!keep) return {};
+    const key = `${keep.file}\0${offset}.${blocks.length}`;
+    let found = kept.get(key);
+    if (!found)
+      try {
+        kept.set(key, (found = find(keep.media)));
+      } catch {
+        found = [];
+      }
+    return found.length ? { media: found } : {};
+  };
+  const inlined = (content: unknown) => (list(content).some((c) => c?.type === "image") ? pictures((media) => decoded(content, media)) : {});
   if (!v) return add({ kind: "system", title: "看不懂的一行", ...clipped(raw, max) }), blocks;
   const msg = v.message && typeof v.message === "object" ? v.message : {};
   const items: any[] = Array.isArray(msg.content) ? msg.content : [];
@@ -239,7 +288,7 @@ function blocksOf(offset: number, raw: string, max: number, dir: string): Block[
       // Not yours: what Claude adds, as a skill's text or the summary of the conversation it compacted.
       if (v.isMeta || v.isCompactSummary) break;
       for (const r of items.filter((i) => i?.type === "tool_result")) {
-        add({ kind: "result", id: String(r.tool_use_id), ...clipped(joined(r.content), max), error: r.is_error === true });
+        add({ kind: "result", id: String(r.tool_use_id), ...clipped(joined(r.content), max), error: r.is_error === true, ...inlined(r.content) });
       }
       // Nor what Claude writes in tags, as typedText skips: a task's notice, a slash command and its output,
       // IDE context. What you pasted is in tags too, and is yours.
@@ -251,7 +300,10 @@ function blocksOf(offset: number, raw: string, max: number, dir: string): Block[
         break;
       }
       const said = all.filter((t) => !/^\s*<(?!pasted_content\b)/.test(t)).join("\n\n");
-      if (said.trim()) add({ kind: "user", ...splitSource(said), ...(typeof v.uuid === "string" && { id: v.uuid }) });
+      if (!said.trim()) break;
+      const { source, text: body } = splitSource(said);
+      const { text, media } = withoutMedia(body);
+      add({ kind: "user", text, source, ...(media.length && { media }), ...(typeof v.uuid === "string" && { id: v.uuid }) });
       break;
     }
     case "assistant":
@@ -263,14 +315,16 @@ function blocksOf(offset: number, raw: string, max: number, dir: string): Block[
           const given = i.input ?? i.arguments ?? {};
           const input = clipped(JSON.stringify(given, null, 2), max);
           const shown = shownCall(String(i.name), given, dir, false);
-          add({ kind: "tool", id: String(i.id), name: String(i.name), input: input.text, ...(input.length && { length: input.length }), shown, result: null });
-          // Codex's comes with its result (fromCodex).
-          if (i.output) add({ kind: "result", id: String(i.id), ...clipped(i.output.text, max), error: i.output.error });
+          const send = SHELLS.has(String(i.name)) && typeof given.command === "string" ? sendOf(given.command) : null;
+          // Codex's is written with its result once it ends (fromCodex): when it began, by how long it ran.
+          const began = time !== null && typeof i.took === "number" ? time - i.took : time;
+          add({ kind: "tool", id: String(i.id), name: String(i.name), input: input.text, ...(input.length && { length: input.length }), shown, result: null, ...(send && { send }) }, began);
+          if (i.output) add({ kind: "result", id: String(i.id), ...clipped(i.output.text, max), error: i.output.error, ...(i.name === "view_image" && pictures((media) => viewed(String(given.path), dir, media))) });
         }
       }
       break;
     case "toolResult":
-      add({ kind: "result", id: String(msg.toolCallId), ...clipped(joined(msg.content), max), error: msg.isError === true });
+      add({ kind: "result", id: String(msg.toolCallId), ...clipped(joined(msg.content), max), error: msg.isError === true, ...inlined(msg.content) });
       break;
     case "system": // pi's system prompt has no subtype
       if (v.subtype === "compact_boundary") add({ kind: "system", title: "压缩了对话", text: "" });
@@ -286,6 +340,102 @@ function blocksOf(offset: number, raw: string, max: number, dir: string): Block[
       break;
   }
   return blocks;
+}
+
+/** The pictures in a tool result's content, Claude's image blocks with a base64 source and pi's with
+ *  data, decoded and kept in media by their hash. */
+function decoded(content: unknown, media: string): Media[] {
+  return list(content).flatMap((c) => {
+    const data = c?.type === "image" ? (c.source?.type === "base64" ? c.source.data : c.data) : undefined;
+    return typeof data === "string" ? [{ kind: "image" as const, hash: basename(saveMedia(media, Buffer.from(data, "base64"))) }] : [];
+  });
+}
+
+/** The biggest file Codex's view_image looked at that a page copies. */
+const VIEWED_MAX = 50 * 2 ** 20;
+
+/** The picture Codex's view_image looked at, copied into media by its hash (spec web-images "安全"):
+ *  only a regular file whose real path, links followed, is in the slot's dir, and that is one of the
+ *  four pictures by its first bytes. None for any other, whose path alone the page shows; throws for
+ *  one gone. */
+function viewed(path: string, dir: string, media: string): Media[] {
+  const real = realpathSync(resolve(dir, path));
+  if (!real.startsWith(join(realpathSync(dir), "/"))) return [];
+  const s = statSync(real);
+  if (!s.isFile() || s.size > VIEWED_MAX) return [];
+  const data = readFileSync(real);
+  return pictureType(data) ? [{ kind: "image", hash: basename(saveMedia(media, data)), name: basename(real) }] : [];
+}
+
+/** The tools that run a shell command: Claude's, pi's and Codex's. */
+const SHELLS = new Set(["Bash", "bash", "exec_command"]);
+/** A slot's id, which rh send takes for a slot as it does w/name. */
+const SLOT_ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+/** The first rh send to you in a shell command (spec web-images "消息块里的图和 rh send 的话"): the word
+ *  after send, me, a platform's or a bot's name, and not a slot's, with a / or its id; its --file paths
+ *  as written; and its text, its other words, read as the shell would, quoted or not, a here-document
+ *  in $(cat <<EOF …) as one. null for a command with none. */
+// ponytail: no $VAR nor $(…) but that one is expanded, and only the first rh send is read; parse the
+// shell fully if agents write them otherwise.
+export function sendOf(command: string): Omit<Send, "media"> | null {
+  const flat = command
+    .replace(/("?)\$\(cat\s*<<-?\s*(['"]?)(\w+)\2[ \t]*\n([\s\S]*?)\n[ \t]*\3[ \t]*\n?\s*\)\1/g, (...m) => `'${m[4].replaceAll("'", "'\\''")}'`)
+    // Any other here-document is what a command reads, not commands: gone, the rest of its line kept.
+    .replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, "$3");
+  const words = shellWords(flat);
+  for (let i = 0; i + 2 < words.length; i++) {
+    const [rh, send, to] = words.slice(i, i + 3);
+    if (!(rh === "rh" || rh?.endsWith("/rh")) || send !== "send") continue;
+    // A command's own words, not another's, as echo's.
+    if (i > 0 && words[i - 1] !== null && !["then", "do", "else", "!", "{"].includes(words[i - 1]!)) continue;
+    if (!to || to.includes("/") || SLOT_ID.test(to)) return null;
+    const files: string[] = [];
+    let j = i + 3;
+    for (; words[j] === "--file" && words[j + 1]; j += 2) files.push(words[j + 1]!);
+    const rest: string[] = [];
+    for (; words[j] !== undefined && words[j] !== null; j++) rest.push(words[j]!);
+    return { to, text: rest.join(" "), files };
+  }
+  return null;
+}
+
+/** A shell command's words as the shell reads them: quotes and backslashes undone, comments gone, null
+ *  where an operator or a newline ends a command. */
+function shellWords(s: string): (string | null)[] {
+  const out: (string | null)[] = [];
+  let w: string | null = null; // the word being read
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    const close = (q: string, from: number) => (s.indexOf(q, from) < 0 ? s.length : s.indexOf(q, from));
+    if (c === "\\") {
+      if (s[i + 1] !== "\n") w = (w ?? "") + (s[i + 1] ?? "");
+      i++;
+    } else if (c === "'") {
+      w = (w ?? "") + s.slice(i + 1, (i = close("'", i + 1)));
+    } else if (c === "$" && s[i + 1] === "'") {
+      // ANSI-C quoting: \n and \t, a backslash keeping the rest.
+      let t = "";
+      for (i += 2; i < s.length && s[i] !== "'"; i++) t += s[i] === "\\" ? ({ n: "\n", t: "\t" }[s[++i]!] ?? s[i] ?? "") : s[i];
+      w = (w ?? "") + t;
+    } else if (c === '"') {
+      let t = "";
+      for (i++; i < s.length && s[i] !== '"'; i++) {
+        if (s[i] !== "\\" || !'"\\$`\n'.includes(s[i + 1] ?? "x")) t += s[i];
+        else if (s[++i] !== "\n") t += s[i];
+      }
+      w = (w ?? "") + t;
+    } else if (c === "#" && w === null) {
+      i = close("\n", i) - 1; // a comment, to its line's end, which still ends a command
+    } else if (c === " " || c === "\t" || ";&|()<>\n".includes(c)) {
+      // A file descriptor's number against a redirection, as 2 in 2>&1, is no word.
+      if (w !== null && !("<>".includes(c) && /^\d+$/.test(w))) out.push(w);
+      w = null;
+      if (c !== " " && c !== "\t") out.push(null);
+    } else w = (w ?? "") + c;
+  }
+  if (w !== null) out.push(w);
+  return out;
 }
 
 /** Each result goes with its call on the page, if that is there. */
@@ -306,8 +456,9 @@ function paired(blocks: Block[]): Block[] {
  * the end of the file), or forward from it, up to MESSAGES things you or the agent said with the
  * blocks between them, BLOCKS at most. at must be 0, Infinity, or a start or end of an earlier page.
  * Pages end at lines: only one line with more than BLOCKS blocks is a page with more. dir: the slot's.
+ * media: the media dir, where the pictures tool results carry are kept; without it, none are given.
  */
-export async function messagePage(file: string, at: number, direction: "forward" | "backward", dir: string): Promise<MessagePage> {
+export async function messagePage(file: string, at: number, direction: "forward" | "backward", dir: string, media?: string): Promise<MessagePage> {
   const lines: Block[][] = [];
   let [messages, count] = [0, 0];
   let [start, end] = [at, at];
@@ -315,7 +466,7 @@ export async function messagePage(file: string, at: number, direction: "forward"
     const page = await readPage(file, pos, 50, direction);
     if (direction === "backward" && first) [start, end] = [page.end, page.end];
     for (const e of direction === "forward" ? page.entries : page.entries.toReversed()) {
-      const blocks = blocksOf(e.offset, e.raw, CLIP, dir);
+      const blocks = blocksOf(e.offset, e.raw, CLIP, dir, media ? { media, file } : undefined);
       const m = blocks.filter((b) => b.kind === "user" || b.kind === "assistant").length;
       if (count && (messages + m > MESSAGES || count + blocks.length > BLOCKS)) {
         if (direction === "forward") end = e.offset;
@@ -337,15 +488,21 @@ const LAST = 200; // characters of the last thing said that lastSaid gives
 
 /** The last thing you or the agent said in file, as a page has it, and when: on one line, without
  *  Markdown's marks for headings, bold, code and links, cut to LAST characters; a user message's
- *  source too, as its source line names it. null if neither has said anything. Reads back from the
- *  end only as far as that. */
-export async function lastSaid(file: string): Promise<(Message & { at: number | null; source?: string }) | null> {
+ *  source too, as its source line names it, and whether it quotes. null if neither has said anything.
+ *  Reads back from the end only as far as that. */
+export async function lastSaid(file: string): Promise<(Message & { at: number | null; source?: string; quoted?: true }) | null> {
   for (let at = Infinity; ; ) {
     const page = await readPage(file, at, 50, "backward");
     for (const e of page.entries.toReversed()) {
       const b = blocksOf(e.offset, e.raw, CLIP, "").findLast((b): b is Extract<Block, { kind: Message["role"] }> => b.kind === "user" || b.kind === "assistant");
-      const text = b && oneLine(b.text.replace(/^ {0,3}#{1,6}\s+/gm, "").replace(/\*\*|`/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1"));
-      if (b && text) return { role: b.kind, text: clip(text, LAST, "…"), at: b.time, ...(b.kind === "user" && b.source && { source: b.source }) };
+      // What your message carried, after its words (architecture §7.7).
+      const carried = b?.kind === "user" ? (b.media ?? []).map((m) => (m.kind === "image" ? " [图片]" : " [文件]")).join("") : "";
+      // Under a quote, your words, as the queue shows them (#607); with none, what it carried, else
+      // the quote's start, as the queue shows it.
+      const q = b?.kind === "user" ? quoteOf(b.text) : null;
+      const words = q ? q.rest.trim() || (carried ? "" : plain(q.quote)) : (b?.text ?? "");
+      const text = b && oneLine(words.replace(/^ {0,3}#{1,6}\s+/gm, "").replace(/\*\*|`/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") + carried);
+      if (b && text) return { role: b.kind, text: clip(text, LAST, "…"), at: b.time, ...(b.kind === "user" && b.source && { source: b.source }), ...(q && { quoted: true as const }) };
     }
     if (page.start === 0 || !page.entries.length) return null;
     at = page.start;

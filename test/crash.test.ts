@@ -323,15 +323,17 @@ test("story 125: the third crash within 10 minutes trips the breaker: no more re
 }, 30_000);
 
 test("story 125: only crashes within the window count: the breaker trips on crashCount of them, not on older ones", async () => {
-  await slotA({ claude: { script: crashing(null) }, toml: '[limits]\ncrashCount = 2\n[durations]\ncrashWindow = "1s"' });
+  // 3 s: a crash and its resume take more than 1 s on a busy machine (#575).
+  await slotA({ claude: { script: crashing(null) }, toml: '[limits]\ncrashCount = 2\n[durations]\ncrashWindow = "3s"' });
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: "work" });
   await until(async () => (await state()) === "崩溃", 15_000);
   expect(rhodium.claude.runs()).toHaveLength(2);
-  await Bun.sleep(1200); // both out of the window now
+  await Bun.sleep(3200); // both out of the window now
 
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: "again" });
   await until(() => rhodium.claude.runs().length === 4, 15_000); // its crash is the only one counted: resumed once more
   await until(async () => (await state()) === "崩溃", 15_000);
+  expect(rhodium.claude.runs()).toHaveLength(4);
 }, 30_000);
 
 /** At most one slot runs, and idle agents are reaped after 1 s. Bot qb goes to w/b, a pi taking

@@ -3,10 +3,11 @@
 // Telegram-like fake bot.
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Injection } from "../src/fake-im";
-import { imageType } from "../src/media";
+import { forAgent, imageType } from "../src/media";
 import type { Script } from "./fake-agent/fake-agent";
 import { endTurn, on, PROGRESS_PIECES, startTurn } from "./fake-agent/scripts";
 import { newInstance, until, withoutSource, type Daemon, type Instance, type InstanceOptions } from "./instance";
@@ -119,7 +120,7 @@ for (const like of LIKES) {
     expect(JSON.stringify(daemon.logs)).not.toContain(ME);
   }, 30_000);
 
-  test(`story 35 (${like}): quoting a reply that streamed in, by its reference alone, the agent gets the whole reply`, async () => {
+  test(`story 35 (${like}): quoting a reply that streamed in, by its reference alone, the agent gets the start of the whole reply`, async () => {
     await bot(like, { claude: { script: "progress-pause" } });
     await say({ text: "go" });
     await answered(1);
@@ -129,7 +130,19 @@ for (const like of LIKES) {
     const [first] = await rhodium.im.log("b", ME);
     await say({ text: "and this?", quote: { ref: first!.messageId } });
     await answered(2);
-    expect(textOf(frames()[1]!)).toBe(`${shown.replace(/^/gm, "> ")}\n\nand this?`);
+    // Its first 100 characters, the last of the first piece a newline, which the … takes the place of.
+    expect(textOf(frames()[1]!)).toBe(`> ${PROGRESS_PIECES[0]!.trimEnd()}…\n\nand this?`);
+  }, 30_000);
+
+  test(`story 574 (${like}): quoting a whole message of 300 characters, the agent gets only its first 100 and …`, async () => {
+    await bot(like);
+    const long = Array.from({ length: 300 }, (_, i) => "一二三四五六七八九十"[i % 10]).join("");
+    const first = await say({ text: long });
+    await answered(1);
+    // Telegram brings the whole message's text along; QQ gives only a reference, and Rhodium finds it.
+    await say({ text: "第二处呢", quote: like === "telegram" ? { ref: first.messageId, text: long } : { ref: first.messageId } });
+    await answered(2);
+    expect(textOf(frames()[1]!)).toBe(`> ${long.slice(0, 100)}…\n\n第二处呢`);
   }, 30_000);
 
   test(`story 35 (${like}): quoting your old message, or Rhodium's reply, the agent gets the quoted text`, async () => {
@@ -195,7 +208,7 @@ for (const like of LIKES) {
 }
 
 // Picture or file is the platform-neutral router's call; telegram.test.ts uploads each kind through the real adapter.
-test("story 44: the agent's rh send me --file sends a picture as a picture and anything else as a file", async () => {
+test("stories 44, 562: the agent's rh send me --file sends a picture as a picture and anything else as a file; its send_me event says what went, by hash, for the board", async () => {
   const script: Script = {
     on,
     steps: [
@@ -212,7 +225,8 @@ test("story 44: the agent's rh send me --file sends a picture as a picture and a
   writeFileSync(join(rhodium.dir, "w/chart.png"), PNG);
   writeFileSync(join(rhodium.dir, "w/notes.txt"), notes);
   await say({ text: "send me the chart and the notes" });
-  await until(async () => (await rhodium.im.log("b", ME)).length >= 3, 15_000);
+  // rh send answers once its message went, so the bot may show it before the agent hears back.
+  await until(async () => (await rhodium.im.log("b", ME)).length >= 3 && rhodium.claude.runs()[0]?.rh.length === 2, 15_000);
 
   const [run] = rhodium.claude.runs();
   expect(run!.rh.map((c) => [c.code, c.err])).toEqual([[0, ""], [0, ""]]);
@@ -222,6 +236,11 @@ test("story 44: the agent's rh send me --file sends a picture as a picture and a
     { text: "here are the notes", file: undefined },
     { text: "", file: { kind: "file", name: "notes.txt", data: notes } },
   ]);
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  const sends = (db.query("SELECT data FROM event WHERE type = 'send_me' ORDER BY seq").all() as { data: string }[]).map((e) => JSON.parse(e.data));
+  db.close();
+  const hash = (data: Uint8Array) => new Bun.CryptoHasher("sha256").update(data).digest("hex");
+  expect(sends).toEqual([{ files: [{ kind: "image", hash: hash(PNG), name: "chart.png" }] }, { files: [{ kind: "file", hash: hash(notes), name: "notes.txt" }] }]);
 }, 30_000);
 
 test("a picture with a side over 8000 pixels, which Claude's API turns down, is shown to no agent: it goes as a path", () => {
@@ -237,6 +256,31 @@ test("a picture with a side over 8000 pixels, which Claude's API turns down, is 
   expect([png(1080, 8000), png(1080, 8001), png(8001, 10)].map(imageType)).toEqual(["image/png", null, null]);
   expect([jpeg(1080, 8000), jpeg(1080, 12000)].map(imageType)).toEqual(["image/jpeg", null]);
   expect([gif(8000, 1), gif(9000, 1)].map(imageType)).toEqual(["image/gif", null]);
+});
+
+test("story 569: a picture with a side over 2576 reaches the agent shrunk to 2576 on that side; the path it is told is the picture's own", async () => {
+  await bot("qq");
+  const big = Buffer.from(await new Bun.Image(PNG).resize(4000, 3000).png().bytes());
+  await say({ text: "look", attachments: [{ kind: "image", name: "photo.png", data: big }] });
+  await answered(1);
+
+  const [content] = frames();
+  const { source } = content!.find((b) => b.type === "image")!;
+  expect(source!.media_type).toBe("image/png");
+  const shown = await new Bun.Image(Buffer.from(source!.data, "base64")).metadata();
+  expect([shown.width, shown.height]).toEqual([2576, 1932]);
+  expect(readFileSync(/\[图片\] (\/\S+)/.exec(textOf(content!))![1]!)).toEqual(big);
+}, 30_000);
+
+test("a picture with more pixels than a small server decodes for a copy goes to the agent as itself", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rhodium-test-media-"));
+  try {
+    const path = join(dir, "huge");
+    writeFileSync(path, await new Bun.Image(PNG).resize(8200, 8200).jpeg().bytes());
+    expect(await forAgent(path)).toBe(path);
+  } finally {
+    rmSync(dir, { recursive: true });
+  }
 });
 
 test("a picture captioned ! goes to the agent: it is not /stop", async () => {

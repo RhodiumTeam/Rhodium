@@ -13,11 +13,12 @@ import { locate, type Config } from "./config";
 import type { AgentDriver, AgentEmit, AgentEvent, AgentKind, AgentMessage, Capabilities, CommandResult, CommonCommand, PanelUi, SpawnSpec } from "./contracts";
 import { log, type Loop } from "./daemon";
 import { connectHolder, holderPaths, spawnHolder, unitGone, type HolderEvents, type HolderLink } from "./holder";
+import { forAgent, pictureType } from "./media";
 import { moment } from "./panels";
 import { PiDriver } from "./pi";
 import { systemPrompt, withSentAt } from "./prompt";
 import { clip } from "./render";
-import { chatOf, PASSED, type Write } from "./router";
+import { chatOf, PASSED, sendWord, type Write } from "./router";
 import { B32, modelNames, setMeta, setModelNames, untaken, type AgentInput, type Conversation, type Holder, type Slot, type Store } from "./store";
 import { hasTranscript, listConversations, type Conversation as Found } from "./transcript";
 
@@ -29,8 +30,10 @@ import { hasTranscript, listConversations, type Conversation as Found } from "./
  * is written to it; one still starting is stopped as soon as it is attached. adopt: the process was found running after a restart and its
  * session id is not on record, so take the one its output reports. seen: where out.log was
  * processed up to when the process was attached; output before it was processed already and
- * only brings the driver's state back. waiting: the start waits for the agent program (start);
- * missing: the program the last start gave up waiting for.
+ * only brings the driver's state back. behind: that output is not all fed again yet, so nothing is
+ * written (deliver): the driver may not know yet which session or turn runs (#574).
+ * waiting: the start waits for the agent program (start); missing: the program the last start gave
+ * up waiting for.
  */
 type Live = {
   driver: AgentDriver;
@@ -41,6 +44,7 @@ type Live = {
   stopping: Holder["stopRequested"];
   adopt: boolean;
   seen: number;
+  behind: boolean;
   reapply: boolean;
   waiting: boolean;
   missing: string | null;
@@ -168,7 +172,7 @@ export function createRunner(o: {
       };
       // The agent kind belongs to the conversation, so its driver never changes.
       const driver = DRIVERS[conv.agent]({ conv: conversation, boot, emit, stopGrace: cfg.durations.stopGrace });
-      live.set(conversation, (l = { driver, proc: 0, link: null, delivering: false, session: null, stopping: 0, adopt: false, seen: 0, reapply: false, waiting: false, missing: null }));
+      live.set(conversation, (l = { driver, proc: 0, link: null, delivering: false, session: null, stopping: 0, adopt: false, seen: 0, behind: false, reapply: false, waiting: false, missing: null }));
     }
     return l;
   }
@@ -190,7 +194,7 @@ export function createRunner(o: {
     const rows = store.tx((tx) => tx.find("bot", {}));
     const bots = rows.flatMap((b) => {
       const caps = capabilities(b.id);
-      return caps ? [{ chat: chatOf(rows, cfg, b, "私聊"), caps }] : []; // gone from the config
+      return caps ? [{ chat: chatOf(cfg, b, "私聊"), send: sendWord(cfg, b), caps }] : []; // gone from the config
     });
     mkdirSync(join(cfg.stateDir, "prompt"), { recursive: true });
     writeFileSync(file, systemPrompt(bots, cfg.durations.oneoffArchive, cfg.durations.sentAtAfter));
@@ -281,13 +285,15 @@ export function createRunner(o: {
       me.link = null;
       exited(conversation, proc, code, signal, from);
     };
-    // Once the output before `seen` is fed again, the driver has its state back (architecture §5).
-    let behind = from < seen;
+    // Once the output before `seen` is fed again, the driver has its state back (architecture §5),
+    // and what is queued can go.
+    me.behind = from < seen;
     const feed = (pos: number, data: Uint8Array) => {
       output(me, proc, pos, data);
-      if (behind && me.proc === proc && pos + data.length >= seen) {
-        behind = false;
+      if (me.behind && me.proc === proc && pos + data.length >= seen) {
+        me.behind = false;
         me.driver.replayed();
+        void deliver(conversation);
       }
     };
     // Output can arrive before the driver is attached; it waits for it.
@@ -307,7 +313,7 @@ export function createRunner(o: {
       me.driver.attach(link, proc);
       // After a restart, what the agent took meanwhile may be in the output fed next (architecture §4.6).
       me.driver.untaken(store.tx((tx) => untaken(tx, conversation)).map((i) => i.id));
-      if (!behind) me.driver.replayed();
+      if (!me.behind) me.driver.replayed();
       if (me.reapply) {
         // rh set approval came while it was starting, maybe after its launch read the setting.
         me.reapply = false;
@@ -433,8 +439,9 @@ export function createRunner(o: {
    *  the board's queue: your message mid-turn still joins the turn (architecture §9.3). */
   async function deliver(conversation: string): Promise<void> {
     const l = live.get(conversation);
-    // Not attached yet: start delivers once it is. Already at it: the loop below picks this up.
-    if (!l?.link || l.delivering) return;
+    // Not attached yet, or its output not all fed again: attach delivers once it is. Already at it:
+    // the loop below picks this up.
+    if (!l?.link || l.delivering || l.behind) return;
     l.delivering = true;
     const link = l.link;
     try {
@@ -463,7 +470,7 @@ export function createRunner(o: {
         // Mid-turn, Claude takes a turn's frame as is and pi's driver makes it steer. A ! message
         // comes here once the turn it interrupted has ended (the router holds it till then).
         // The ack that settles it reports it written.
-        await l.driver.send({ id: input.id, text: told(input), human: input.source === "human", images: images(input.images) }, "turn");
+        await l.driver.send({ id: input.id, text: told(input), human: input.source === "human", images: await images(input.images) }, "turn");
         // pi makes the session it was launched with once it reads this; Claude's is recorded from its output.
         const sessionId = l.driver.sessionOnWrite ? l.session : null;
         if (sessionId) {
@@ -493,17 +500,21 @@ export function createRunner(o: {
     return sent !== undefined && now - sent > cfg.durations.sentAtAfter ? withSentAt(body, sent, now) : body;
   }
 
-  /** The stored pictures of an agent input, read for the agent; one gone from disk is left out. */
-  function images(json: string | null): AgentMessage["images"] {
+  /** The stored pictures of an agent input, read for the agent, a big one shrunk (forAgent); one gone
+   *  from disk is left out. */
+  async function images(json: string | null): Promise<AgentMessage["images"]> {
     if (!json) return undefined;
-    return (JSON.parse(json) as { path: string; mimeType: string }[]).flatMap(({ path, mimeType }) => {
+    const read: NonNullable<AgentMessage["images"]> = [];
+    for (const { path, mimeType } of JSON.parse(json) as { path: string; mimeType: string }[]) {
       try {
-        return [{ mimeType, data: readFileSync(path).toString("base64") }];
+        const from = await forAgent(path);
+        const data = readFileSync(from);
+        read.push({ mimeType: from === path ? mimeType : pictureType(data)!, data: data.toString("base64") });
       } catch (err) {
         log("cannot read a picture for the agent", { path, error: String(err) });
-        return [];
       }
-    });
+    }
+    return read;
   }
 
   /** Lets the agent exit: stdin first, then TERM, then KILL (architecture §6.2). The router has

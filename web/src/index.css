@@ -143,45 +143,52 @@
 /* A screen 480px high or more: an info card's title and foot stay in place as the rest scrolls (story 520). */
 @custom-variant tall (@media (min-height: 30rem));
 
-/* An info card's scroller (story 523), and a code block's or table's sideways one (#498, #502): a thin
-   round thumb clear of the box's round corners, with no arrows. Chromium draws ::-webkit-scrollbar only
-   where scrollbar-width and -color are auto; a browser without it keeps the thin bar every scroller has. */
+/* A pointer that can hover, as a mouse: a message's keys show only then, small, in the gap under it (story 571). */
+@custom-variant mouse (@media (hover: hover));
+
+/* An info card's scroller (story 523), a code block's or table's sideways one (#498, #502), and the
+   message box's, the row of attachments', the palette's, the queue's and the jump box's (#579), and a
+   timeline's, its preview's and the topology's details card's (#636): the board's bar (below), on a
+   phone too, clear of the box's round corners. A track's margins count only along its bar: the block
+   ones an upright bar's, the inline ones, --track-x, a sideways one's. */
 @utility card-scroll {
   @supports selector(::-webkit-scrollbar) {
     scrollbar-width: auto;
     scrollbar-color: auto;
   }
-  &::-webkit-scrollbar {
-    width: 0.625rem;
-    height: 0.625rem;
-  }
   &::-webkit-scrollbar-track {
-    margin-block: 0.75rem;
-  }
-  &::-webkit-scrollbar-track:horizontal {
-    margin: 0 0.5rem;
-  }
-  &::-webkit-scrollbar-thumb {
-    border: 0.1875rem solid transparent;
-    border-radius: 9999px;
-    background: color-mix(in oklab, var(--foreground) 18%, transparent) padding-box;
+    margin: 0.75rem var(--track-x, 0.5rem);
   }
 }
 
 /* A code block's scroller, unwrapped (#507), and a table's (#502), its edges faded as T3 Code's tables
    are (Base UI ScrollArea's gradient scroll fade): the text is gone 12px inside an edge and fades in
    over 24px, each no wider than how far the scroller can still go that way (--os, --oe, from
-   tools.tsx), so it grows as a scroll starts and there is none where nothing is hidden. card-scroll's
-   10px bar stays whole. The build adds -webkit-mask, for iOS Safari. */
+   write.tsx), so it grows as a scroll starts and there is none where nothing is hidden. The bar under
+   it, card-scroll's 10px, stays whole (--under); on a phone, whose bars lie over what scrolls, the fade
+   goes all the way down, as over a row of attachments (#577). The build adds -webkit-mask, for iOS Safari. */
 @utility edge-fade {
   --cs: min(0.75rem, var(--os, 0px));
   --fs: min(1.5rem, var(--os, 0px));
   --ce: min(0.75rem, var(--oe, 0px));
   --fe: min(1.5rem, var(--oe, 0px));
   --fade:
-    linear-gradient(to right, transparent var(--cs), #000 calc(var(--cs) + var(--fs)), #000 calc(100% - var(--ce) - var(--fe)), transparent calc(100% - var(--ce))) top / 100% calc(100% - 0.625rem) no-repeat,
-    linear-gradient(#000, #000) bottom / 100% 0.625rem no-repeat;
+    linear-gradient(to right, transparent var(--cs), #000 calc(var(--cs) + var(--fs)), #000 calc(100% - var(--ce) - var(--fe)), transparent calc(100% - var(--ce))) top / 100% calc(100% - var(--under, 0px)) no-repeat,
+    linear-gradient(#000, #000) bottom / 100% var(--under, 0px) no-repeat;
   mask: var(--fade);
+}
+
+/* A plan's scroller on its ask card (#557), in no box, and the palette's (#577), the message box's,
+   the queue's and the jump box's (#579): its top and bottom fade, each over no more than how far it
+   can still go that way (--ot, --ob, from write.tsx), so its ends show where it is cut. Its upright
+   bar, --bar wide, stays whole. Its border fades too: a line over it is drawn outside it. */
+@utility edge-fade-y {
+  --ft: min(2rem, var(--ot, 0px));
+  --fb: min(2rem, var(--ob, 0px));
+  --fade-y:
+    linear-gradient(transparent, #000 var(--ft), #000 calc(100% - var(--fb)), transparent) left / calc(100% - var(--bar, 0px)) 100% no-repeat,
+    linear-gradient(#000, #000) right / var(--bar, 0px) 100% no-repeat;
+  mask: var(--fade-y);
 }
 
 /* A table's header ground (#502). Streamdown's bg-muted/80 on the thead is painted once per cell, and
@@ -292,18 +299,49 @@
   }
 }
 
-/* Scroll bars: thin and in the page's own grey, not the browser's; the sidebar's only under the
-   pointer or with the focus in it. */
+/* Every scroller's bar with a mouse (#630): a thin round thumb in the page's own grey, with no arrows,
+   on no track; the sidebar's only under the pointer or with the focus in it. Chromium's thin bar
+   (scrollbar-width) has arrows, so it and Safari draw ::-webkit-scrollbar, which they skip where
+   scrollbar-width or -color is set. Firefox, without it, keeps the thin bar, which has none; so does a
+   phone, whose bar floats over the text, where a drawn one would take its width. */
 @layer base {
+  /* Set on the scroller itself: Chromium restyles a bar only as its scroller's own style changes. */
+  [data-quiet-scroll] {
+    --quiet: transparent;
+  }
+  [data-quiet-scroll]:hover,
+  [data-quiet-scroll]:focus-within {
+    --quiet: color-mix(in oklab, var(--foreground) 22%, transparent);
+  }
   * {
     scrollbar-width: thin;
     scrollbar-color: color-mix(in oklab, var(--foreground) 18%, transparent) transparent;
   }
   [data-quiet-scroll] {
-    scrollbar-color: transparent transparent;
+    scrollbar-color: var(--quiet) transparent;
   }
-  [data-quiet-scroll]:hover,
-  [data-quiet-scroll]:focus-within {
-    scrollbar-color: color-mix(in oklab, var(--foreground) 22%, transparent) transparent;
+  @media (pointer: fine) {
+    @supports selector(::-webkit-scrollbar) {
+      *,
+      [data-quiet-scroll] {
+        scrollbar-width: auto;
+        scrollbar-color: auto;
+      }
+    }
+  }
+  ::-webkit-scrollbar {
+    width: 0.625rem;
+    height: 0.625rem;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    border: 0.1875rem solid transparent;
+    border-radius: 9999px;
+    background: color-mix(in oklab, var(--foreground) 18%, transparent) padding-box;
+  }
+  [data-quiet-scroll]::-webkit-scrollbar-thumb {
+    background-color: var(--quiet);
   }
 }

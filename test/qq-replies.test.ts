@@ -90,6 +90,16 @@ test("story 40: once the agent says something here with rh send me, the rest of 
   expect((await rhodium.im.log("q", ME)).map((p) => p.text)).toEqual(["Looking.", "found it", "[🔧 Read]", "[🔧 Bash]"]);
 }, 30_000);
 
+test("story 40: rh send me here that does not go out takes nothing over: the turn shows as ever (#615)", async () => {
+  await qq({ claude: { script: sendsMe(["found it"]) } });
+  await rhodium.im.next("q", "ok", "send");
+  await rhodium.im.next("q", "fail", "send");
+  await say("look around");
+  await afterTurn(3);
+  await Bun.sleep(300); // nothing more comes
+  expect((await rhodium.im.log("q", ME)).map((p) => p.text)).toEqual([...TALKED]);
+}, 30_000);
+
 /** After what it said, if anything: a Bash call that runs rh send me, then ls, then the final reply. */
 const takesOver = (said: Step[] = []) => ({
   on,

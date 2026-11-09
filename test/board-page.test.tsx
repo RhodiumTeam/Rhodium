@@ -7,8 +7,8 @@ import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Router } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
-import { BoardView, endRoom, facesRoom, keepOf, nextSlot, shrunk, SideList, squeeze, steady, type Row } from "../web/src/board";
-import { boardKey, chatAt, clock, dotOf, Max, nextTheme, slotHash, THEME, type KeyLike } from "../web/src/common";
+import { BoardView, cutOrNone, endRoom, facesRoom, keepOf, nextSlot, shrunk, SideList, squeeze, steady, type Row } from "../web/src/board";
+import { boardKey, chatAt, clock, dotOf, Max, slotHash, THEME, type KeyLike } from "../web/src/common";
 import { Jump, jumpList } from "../web/src/jump";
 import { moment } from "../src/panels";
 import { builds, Events, follow, heard, json, mayPrefetch, Messages, queryClient, refresh, reloadNow, unread, unsent, type Block, type BoardData, type Card, type MessagesData, type Sent, type SlotData, type SlotEvent } from "../web/src/data";
@@ -18,8 +18,9 @@ import { Details, EventRow, look } from "../web/src/details";
 import { afterClose, retryIn } from "../web/src/terminal";
 import { folded, kindOf } from "../web/src/tools";
 import { shortText } from "../src/tool-line";
+import { sendOf } from "../src/transcript";
 import { toast } from "../web/src/toast";
-import { act, byPage, draft, forAgent, frame, givenBack, keepDraft, keyMode, Toasts } from "../web/src/write";
+import { act, byPage, draft, forAgent, frame, givenBack, keepDraft, keyMode, Toasts, withQuote } from "../web/src/write";
 import { InfoCard, resetsIn, tone } from "../web/src/card";
 import type { InfoCard as Info } from "../src/router";
 import { answerText } from "../web/src/asks";
@@ -226,6 +227,34 @@ test("story 203: on a slot's page the stream tells the chat what the agent write
   stop();
 });
 
+test("story 575: the page tells the board whether it is in front by its stream's id, as the stream opens, each time that changes and every 30 s while in front; stopped, no more", async () => {
+  const was = { fetch: globalThis.fetch, document: Object.getOwnPropertyDescriptor(globalThis, "document") };
+  const told: [string, string, string | null][] = [];
+  const doc = { visibilityState: "visible" };
+  Object.defineProperty(globalThis, "document", { value: doc, configurable: true });
+  globalThis.fetch = (async (url: string, init: RequestInit) => (told.push([url, String(init.body), init.method ?? null]), new Response(null, { status: 204 }))) as unknown as typeof fetch;
+  try {
+    const { stop } = following();
+    dispatchEvent(new Event("visibilitychange")); // before the stream says its id: nothing to tell
+    streams[0]!.message("page", '{"entry":null,"stream":"s1"}');
+    jest.advanceTimersByTime(30_000);
+    doc.visibilityState = "hidden";
+    dispatchEvent(new Event("visibilitychange"));
+    jest.advanceTimersByTime(60_000);
+    stop();
+    dispatchEvent(new Event("visibilitychange"));
+    expect(told).toEqual([
+      ["api/front", "stream=s1&front=1", "POST"],
+      ["api/front", "stream=s1&front=1", "POST"],
+      ["api/front", "stream=s1&front=", "POST"],
+    ]);
+  } finally {
+    globalThis.fetch = was.fetch;
+    if (was.document) Object.defineProperty(globalThis, "document", was.document);
+    else delete (globalThis as { document?: unknown }).document;
+  }
+});
+
 test("#356: each time the stream opens, it says the page rhodium serves, which those listening are told; dropped, the build is not known till it opens again", () => {
   const told: (string | null)[] = [];
   const hear = (entry: string | null) => told.push(entry);
@@ -287,13 +316,14 @@ test("story 139: an older board answer that comes back after a newer one does no
   unsubscribe();
 });
 
-/** Slot S1's chat, whose answers from api/messages are pages[what it asks after the slot]; what it
- *  asked, in order. */
-function chatOf(pages: Record<string, MessagesData>) {
+/** Slot S1's chat, whose answers from api/messages are pages[what it asks after the slot], each once
+ *  meanwhile(what it asks) is done; what it asked, in order. */
+function chatOf(pages: Record<string, MessagesData>, meanwhile = async (_q: string) => {}) {
   const asked: string[] = [];
   const log = new Messages("S1", async (url) => {
     const q = url.replace("api/messages?slot=S1", "");
     asked.push(q);
+    await meanwhile(q);
     return pages[q]!;
   });
   return { log, asked };
@@ -317,21 +347,23 @@ test("story 200: a slot's chat opens at its newest page, and pages back above it
   await log.newer();
   expect(said(log)).toEqual(["newest"]);
 
-  // Scrolling to the top asks twice from the same place.
-  await Promise.all([log.older(), log.older()]);
+  // Scrolling to the top asks twice from the same place; a page came, so there may be more.
+  expect(await Promise.all([log.older(), log.older()])).toEqual([true, true]);
   expect(said(log)).toEqual(["older", "old", "newest"]);
   expect(log.start).toBe(40);
 
-  // The slot has moved on to another conversation: its page does not go above this one's.
+  // The slot has moved on to another conversation: its page does not go above this one's, and is not asked for again.
   pages["&before=40"] = page("C2", 0, 10, [0, "other"]);
-  await log.older();
+  expect(await log.older()).toBe(false);
   expect(said(log)).toEqual(["older", "old", "newest"]);
   expect(log.start).toBe(40);
 
   pages["&before=40"] = page("C1", 0, 40, [0, "first"]);
-  await log.older();
+  expect(await log.older()).toBe(true);
   expect(said(log)).toEqual(["first", "older", "old", "newest"]);
-  expect(log.start).toBe(0); // nothing before the conversation's first line
+  expect(log.start).toBe(0);
+  // Nothing before the conversation's first line, and nothing asked for it.
+  expect(await log.older()).toBe(false);
   expect(asked).toEqual(["", "&before=100", "&before=100", "&before=40", "&before=40"]);
 });
 
@@ -442,6 +474,56 @@ const call = (offset: number, name: string, result: string | null = "ok", time: 
   at: `${offset}.0`,
   time,
 });
+test("story 562: an rh send whose call came before it ran has its files once its result comes, in place of any it had, though you read back meanwhile", async () => {
+  const send = { to: "me", text: "图在这里", files: ["chart.png"] };
+  const media = (name: string) => [{ kind: "image" as const, hash: "a".repeat(64), name, w: 8, h: 6 }];
+  const { log, asked } = chatOf(
+    {
+      // Read before it ran, with another send's file: one sent just after its line.
+      "": { conversation: "C1", start: 40, end: 100, blocks: [{ ...call(50, "Bash", null), send: { ...send, media: media("other.png") } } as Block] },
+      "&after=100": { conversation: "C1", start: 100, end: 150, blocks: [{ kind: "result", id: "c50", text: "ok", error: false, at: "100.0", time: null }] },
+      "&after=50": { conversation: "C1", start: 50, end: 150, blocks: [{ ...call(50, "Bash"), send: { ...send, media: media("chart.png") } } as Block] },
+      "&after=150": { conversation: "C1", start: 150, end: 150, blocks: [] },
+      "&before=40": page("C1", 0, 40, [10, "earlier"]),
+    },
+    async (q) => {
+      if (q === "&after=50") await log.older();
+    },
+  );
+  await log.newer();
+  await log.newer();
+  expect(asked).toContain("&after=50");
+  const [said, shown] = folded(log.blocks);
+  expect(said).toMatchObject({ kind: "assistant", text: "earlier" });
+  expect(shown?.kind === "fold" && shown.steps.length === 1 && shown.steps[0]!.kind === "tool" && shown.steps[0]!.send?.media).toEqual(media("chart.png"));
+});
+
+test("story 562: an rh send's words show once the board found its send_me event, text alone's too, whether its command failed or not; a text alone's call read before it ran is read again once its result comes", async () => {
+  const send = (text: string, media?: []) => ({ to: "me", text, files: [], ...(media && { media }) });
+  const failed = { at: "4.0", time: null, text: "", error: true };
+  const html = render(<ChatView d={slot()} log={chat({ blocks: [{ ...call(1, "Bash"), send: send("Tests passed") } as Block, { ...call(3, "Bash"), result: failed, send: send("Delivered", []) } as Block, words(5)] })} live />);
+  expect([html.includes("Tests passed"), html.includes("Delivered")]).toEqual([false, true]);
+
+  const { log, asked } = chatOf({
+    "": { conversation: "C1", start: 40, end: 100, blocks: [{ ...call(50, "Bash", null), send: send("hi") } as Block] },
+    "&after=100": { conversation: "C1", start: 100, end: 150, blocks: [{ kind: "result", id: "c50", text: "ok", error: false, at: "100.0", time: null }] },
+    "&after=50": { conversation: "C1", start: 50, end: 150, blocks: [{ ...call(50, "Bash"), send: send("hi", []) } as Block] },
+    "&after=150": { conversation: "C1", start: 150, end: 150, blocks: [] },
+  });
+  await log.newer();
+  await log.newer();
+  expect(asked).toContain("&after=50");
+  expect(log.blocks.flatMap((b) => (b.kind === "tool" ? [b.send?.media] : []))).toEqual([[]]);
+});
+
+test("story 576: rh send web 测试过了, then another Bash, the two folded into one line: its words show with the line unopened", () => {
+  const send = { ...sendOf("rh send web 测试过了")!, media: [] };
+  expect(send).toEqual({ to: "web", text: "测试过了", files: [], media: [] });
+  const blocks = [{ ...call(1, "Bash"), send } as Block, call(3, "Bash")];
+  expect(folded(blocks).map((b) => b.kind)).toEqual(["fold"]);
+  expect(render(<ChatView d={slot()} log={chat({ blocks })} live />)).toContain("测试过了");
+});
+
 const words = (offset: number, kind: "user" | "assistant" | "thinking" = "assistant"): Block =>
   kind === "user" ? { kind, text: "go", source: null, from: null, at: `${offset}.0`, time: null } : { kind, text: "…", at: `${offset}.0`, time: null };
 /** What the chat shows for blocks: a fold as its line and what it holds, a call running by its id. */
@@ -636,6 +718,11 @@ test("#209: a message a slot or Rhodium sent the agent, as a child's report, is 
   expect(flat(<BoardView data={data} />)).toBe("wa1分钟前做完了b2分钟前看看c3分钟前你：嗯");
 });
 
+test("#607: your message under a quote has a quote sign after 你：, as the queue's row has", () => {
+  const data = boardWith({ idle: [card({ name: "a", last: { role: "user", text: "嗯", at: ago(1), quoted: true } })] });
+  expect(render(<BoardView data={data} />)).toMatch(/你：<\/b><span role="img" aria-label="引用"[^>]*><svg[^]*?<\/span>嗯/);
+});
+
 test("#209: a workspace's card folded on this device stays folded, its name and how many slots it has left; storage that cannot be used folds none", () => {
   const data = boardWith({ running: [card({ name: "main", state: "运行中" })], idle: [card({ name: "side" })] });
   const real = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -681,6 +768,20 @@ test("story 433: out of room, a full name's workspace gives way first, down to t
   expect(squeeze(100, letters(4, 3, 10, 15), 5, name, none, 0)).toEqual({ name: 55 });
   // Widths in fractions of a pixel: the workspace's box rounds up, so the "…" fits; the name's down.
   expect(squeeze(100.5, letters(6, 3, 15.5, 15.5), 5, name, none, 0)).toEqual({ ws: 62, name: 33 });
+});
+
+test("#633: the rename box's workspace prefix out of room shows whole, or cut to two letters and the \"…\" at least, else not at all", () => {
+  // Rhodium/ in 10px letters, the "…" 10px.
+  const ws = letters(8, 2);
+  expect(cutOrNone(ws, 80)).toBeUndefined();
+  expect(cutOrNone(ws, 65)).toBe(60);
+  expect(cutOrNone(ws, 30)).toBe(30);
+  // Not even two letters and the "…": none, rather than half a letter.
+  expect(cutOrNone(ws, 29)).toBe(0);
+  expect(cutOrNone(ws, 3)).toBe(0);
+  // w/: whole or none, as its two letters and the "…" are wider than it.
+  expect(cutOrNone(letters(2, 2), 20)).toBeUndefined();
+  expect(cutOrNone(letters(2, 2), 19)).toBe(0);
 });
 
 test("story 439: out of room, the name gives way before the Bots after it: its workspace to three letters, its own name to some 6 letters, then fewer faces, the +N growing, then none at all", () => {
@@ -744,9 +845,48 @@ test("#255: beside a slot's chat on a wide screen, the list marks that slot's ro
   const open = rows("/slot/w%2Fb").filter((a) => a.includes('aria-current="page"'));
   expect(open).toHaveLength(1);
   expect(open[0]).toContain('href="#/slot/w%2Fb"');
-  // Its ground the accent, not only under the pointer.
-  expect(open[0]).toMatch(/class="[^"]* \[--row:var\(--accent\)\]/);
+  // A pointed row's ground 4%; the open one's a step deeper, in the test below (#587).
+  expect(rows("/slot/w%2Fb").find((a) => a.includes('href="#/slot/w%2Fa"'))).toContain(" hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--card))]");
   expect(rows("/").filter((a) => a.includes("aria-current"))).toEqual([]);
+});
+
+test("#587: the open row's ground, a step deeper than a pointed row's, is its whole row's, so the rename box laid over the row has it too; pointed or pressed, it stays; on the board and in the sidebar", () => {
+  const data = boardWith({ idle: [card({ name: "a" }), card({ name: "b" })] });
+  const client = new QueryClient();
+  client.setQueryData(["board"], data);
+  for (const [html, ground] of [[render(<BoardView data={data} />, undefined, "/slot/w%2Fb"), "card"], [render(<SideList from="list" />, client, "/slot/w%2Fb?full"), "sidebar"]]) {
+    // The row: the tag the open link is first in, which holds the row's menu and its rename box too.
+    const [row, link] = /(<div [^>]*>)(<a [^>]*aria-current="page"[^>]*>)/.exec(html!)!.slice(1);
+    expect(row).toContain(`[--row:color-mix(in_oklab,var(--foreground)_7%,var(--${ground}))]`);
+    expect(link).not.toMatch(/(hover|active):\[--row/);
+  }
+});
+
+/** Each slot's row in html, its link's markup by the slot's name. */
+const rowsIn = (html: string) => Object.fromEntries(html.match(/<a [^>]*href="#\/slot\/[^]*?<\/a>/g)!.map((a) => [/href="#\/slot\/w%2F([^"?]+)/.exec(a)![1], a]));
+
+test("#587: a slot's tile has a ground a shade off its row's, so it shows in the open row too, its initial on it", () => {
+  const data = boardWith({ idle: [card({ name: "a", agent: null }), card({ name: "b", agent: null })] });
+  const rows = rowsIn(render(<BoardView data={data} />, undefined, "/slot/w%2Fb"));
+  for (const a of [rows.a!, rows.b!]) expect(a).toMatch(/<span class="[^"]*bg-\[color-mix\(in_oklab,var\(--foreground\)_[\d.]+%,var\(--row\)\)\][^"]*"><span aria-hidden="true">[AB]</);
+});
+
+test("#587: a slot with nothing under its name has no second line: its tile spans the one line, level with its name, on the board and in the sidebar", () => {
+  const data = boardWith({ running: [card({ name: "wait", state: "等额度", agent: null })], idle: [card({ name: "said", last: { role: "assistant", text: "好的", at: ago(1) } }), card({ name: "none", agent: null })] });
+  const client = new QueryClient();
+  client.setQueryData(["board"], data);
+  for (const rows of [rowsIn(render(<BoardView data={data} />)), rowsIn(render(<SideList from="list" />, client))]) {
+    expect(rows.said).toContain("row-span-2");
+    expect(rows.wait).toContain("row-span-2");
+    expect(rows.none).not.toContain("row-span-2");
+  }
+});
+
+test("#587: a slot's status dot is ringed in its row's ground, so the open or pointed row shows no ring of another colour round it, on the board and in the sidebar", () => {
+  const data = boardWith({ running: [card({ name: "run" })] });
+  const client = new QueryClient();
+  client.setQueryData(["board"], data);
+  for (const rows of [rowsIn(render(<BoardView data={data} />, undefined, "/slot/w%2Frun")), rowsIn(render(<SideList from="list" />, client))]) expect(rows.run).toMatch(/class="absolute -right-\[3px\] -bottom-\[3px\][^"]* border-\(--row\) bg-\(--c\)/);
 });
 
 test("stories 423, 427, 428: maximize mode's sidebar has no title nor the board's header: 新建槽位, 跳转 with its key and 导入 on top, then the board's slots in its order with no cards; a done one's time has no 结束", () => {
@@ -777,7 +917,8 @@ test("story 428: in the sidebar a workspace's slots are a little in under its ta
   const client = new QueryClient();
   client.setQueryData(["board"], boardWith({ running: [card({ name: "main", state: "运行中" }), card({ name: "kid", parent: "w/main", state: "运行中" })], idle: [card({ name: "other" }), card({ name: "grandkid", parent: "w/kid" })] }));
   const html = render(<SideList from="list" />, client);
-  const pad = (name: string) => Number(new RegExp(`<a [^>]*href="#/slot/w%2F${name}\\?full"[^>]*style="padding-left:(\\d+)px`).exec(html)?.[1]);
+  // Its row's left padding, which the link and a rename box over it take (#647).
+  const pad = (name: string) => Number(new RegExp(`style="--pl:(\\d+)px"[^>]*><a [^>]*href="#/slot/w%2F${name}\\?full"`).exec(html)?.[1]);
   expect([pad("kid") - pad("main"), pad("grandkid") - pad("kid"), pad("other") - pad("main")]).toEqual([16, 16, 0]);
 });
 
@@ -958,6 +1099,9 @@ test("story 441: a jump box's row is the logo with its state's dot, the full nam
   expect(html).not.toContain("<img");
   expect(html.split('role="option"').slice(1).map((o) => o.includes('aria-selected="true"'))).toEqual([true, false, false, false, false]);
   expect(html.match(/<svg[^>]*aria-label="Claude"/g)).toHaveLength(5);
+  // Scrolled on the board's thin round bar, clear of the box's round corners, with no arrows, faded
+  // where cut and ↑↓'s row scrolled clear of the fade, as the palette is (#579).
+  expect(html.match(/<div id="jump-list"[^>]*class="([^"]*)"/)![1]!.split(" ")).toEqual(expect.arrayContaining(["card-scroll", "edge-fade-y", "scroll-py-8"]));
 });
 
 test("stories 441, 442: a slot opens with the page as it is: maximized stays maximized from where it came, a split stays a split; the home opens it beside the list, the whole topology beside the topology; a phone, its chat", () => {
@@ -1177,7 +1321,7 @@ test("story 252: 详情's events page back to the first, each once; the newest p
 test("stories 248, 249: your message is a bubble with a thin border; through a bot, your avatar beside it and the bot's avatar and name over it; else its source line as it is; typed in the terminal, neither", () => {
   const user = (text: string, source: string | null, from: Extract<Block, { kind: "user" }>["from"]): Block => ({ kind: "user", text, source, from, at: `${text.length}.0`, time: 0 });
   const one = (b: Block) => render(<ChatView d={slot()} log={chat({ blocks: [b] })} live />);
-  const bubble = (html: string) => html.match(/<p class="([^"]*)"[^>]*>hi<\/p>/)![1]!;
+  const bubble = (html: string) => html.match(/<div class="([^"]*)"><p[^>]*>hi<\/p>/)![1]!;
 
   const through = one(user("hi", "QQ Bot main 的私聊", { platform: "qq", bot: "main", botAvatar: "api/avatar?id=B&v=1", avatar: "api/avatar?id=C&v=2" }));
   expect(bubble(through)).toContain("border");
@@ -1810,10 +1954,16 @@ test("stories 289, 290, 291: each ask waiting on you is a card in place of the b
   expect(icons).toHaveLength(4);
   expect(new Set(icons).size).toBe(4);
   for (const label of ["staging", "production", "允许", "拒绝", "批准", "不批准", "切到 TUI", "取消"]) expect(html).toMatch(new RegExp(`<button[^>]*>(<[^>]+>)*${label}`));
-  expect(html).toMatch(/<pre[^>]*>git push<\/pre>/);
+  // A command, on the board's thin bar.
+  expect(html.match(/<pre class="([^"]*)"[^>]*>git push<\/pre>/)![1]!.split(" ")).toContain("card-scroll");
   // The plan as Markdown.
   expect(html).toMatch(/<h2[^>]*>步骤<\/h2>/);
   expect(html).toMatch(/<span [^>]*data-streamdown="strong"[^>]*>先<\/span>/);
+  // In no box round the boxes of its tables and code, on the board's thin bar, its ends faded (#557); the bar
+  // in the card's padding, so the tables and code line up with the reason and the keys.
+  const plan = html.match(/<div class="([^"]*)"[^>]*><div class="[^"]*"><h2[^>]*>步骤/)![1]!.split(" ");
+  expect([plan.includes("border"), plan.includes("card-scroll"), plan.includes("edge-fade-y"), plan.includes("-mr-(--bar)")]).toEqual([false, true, true, true]);
+  expect(html.match(/<div class="([^"]*max-h-\[60dvh\][^"]*)"/)![1]!.split(" ")).toContain("card-scroll");
   // Your own words for the choice; a reason with a no where it reaches the agent.
   expect(html.match(/placeholder="自己写"/g)).toHaveLength(1);
   expect(html.match(/placeholder="理由"/g)).toHaveLength(2);
@@ -1975,13 +2125,46 @@ test("stories 264, 272, 278: the chat ends in a place to type, whose key stops a
   expect([tui.includes(box), tui.includes(stop), tui.includes(send)]).toEqual([false, false, false]);
 });
 
-test("stories 279, 282: only words for the agent show as a bubble of yours as you send them: ! before them goes; ! alone, a command and anything else the agent takes as a command show none", () => {
+test("stories 279, 282, 573: only words for the agent show as a bubble of yours as you send them: ! before them goes; ! alone, a command and anything else the agent takes as a command show none; under a quote, the quote first", () => {
   expect(forAgent("hello", 0)).toBe("hello");
   expect(forAgent("!换个做法", 0)).toBe("换个做法");
   expect(forAgent("！ 换个做法", 0)).toBe("换个做法");
   expect(forAgent("", 1)).toBe("");
   expect(forAgent("!", 1)).toBe("");
   for (const t of ["!", "！", "/stop", "/rh_use", "/btw 还在吗", "!/compact"]) expect([t, forAgent(t, 0)]).toEqual([t, null]);
+  // Under a quote (story 573), each of its lines after "> ", an empty line between; a ! stays first.
+  expect(withQuote("第一行\n第二行", "换个做法")).toBe("> 第一行\n> 第二行\n\n换个做法");
+  expect(forAgent(withQuote("好", "！ 换个做法"), 0)).toBe("> 好\n\n换个做法");
+  expect(withQuote("好", "", 1)).toBe("> 好\n");
+  // Not what the agent or Rhodium runs as a command, even queued during a turn: it goes as typed.
+  for (const t of ["/btw 还在吗", "/stop", "!"]) expect(withQuote("好", t)).toBe(t);
+});
+
+test("story 573: a message of yours under a quote shows the quote on one line, its Markdown marks gone, in its bubble, faint or not; in the queue, your words after a quote sign", () => {
+  const text = "> 是一个**拼写错误**：`[board]`\n> \n> ```toml\n> port = 7801\n> ```…\n\n那会话名呢";
+  const html = render(<ChatView d={slot({ queue: [{ id: "R1", text, files: 0, reason: "web_queue" }] })} log={chat({ blocks: [yours(text, 5)], sent: [sent(text, { id: "S" })] })} live />);
+  const queue = html.slice(html.indexOf('aria-label="待发队列"'), html.indexOf("<textarea"));
+  expect(queue.replace(/^[^>]*>/, "").replace(/<[^>]+>/g, "")).toBe("1那会话名呢");
+  expect(queue).toContain('aria-label="引用"');
+  const said = html.slice(0, html.indexOf('aria-label="待发队列"')).replace(/<[^>]+>/g, "|");
+  expect([said.match(/\|是一个拼写错误：\[board\] port = 7801 …\|/g)?.length, said.match(/\|那会话名呢\|/g)?.length]).toEqual([2, 2]);
+});
+
+test("story 573: a quote of a picture of yours sent over IM says [图片] in your bubble, not where the picture is kept", () => {
+  const html = render(<ChatView d={slot()} log={chat({ blocks: [yours(`> 这张…\n> [图片] /s/media/${"a".repeat(64)}\n\n看看`, 5, "QQ")] })} live />);
+  expect(html.replace(/<[^>]+>/g, "|")).toContain("|这张… [图片]|");
+});
+
+test("story 573: a quote with none of your words under it is as wide as it reads, up to the bubble; with words, 12rem asked for", () => {
+  const html = render(<ChatView d={slot()} log={chat({ blocks: [yours("> 收到这张照片了，接线看起来没问题。", 5, "QQ"), yours("> 好\n\n嗯", 6)] })} live />);
+  const line = [...html.matchAll(/<p class="([^"]*)"><span role="img" aria-label="引用"/g)].map((m) => m[1]!.split(" "));
+  expect(line.map((c) => c.includes("w-48"))).toEqual([false, true]);
+});
+
+test("story 572: a message of yours with only a picture or a file has no 复制, as it has no words to copy", () => {
+  const carrying = (text: string, at: number, kind: "image" | "file") => ({ ...yours(text, at), media: [{ kind, hash: "0".repeat(64), name: "a.txt" }] }) as Block;
+  const html = render(<ChatView d={slot()} log={chat({ blocks: [carrying("", 5, "image"), carrying("", 6, "file"), carrying("看看", 7, "image")] })} live />);
+  expect(html.match(/aria-label="复制"/g)).toHaveLength(1);
 });
 
 test("stories 294, 296: the palette lists every command; as you type on, those whose name starts with it, then those whose name has it, then those whose summary does, in Chinese too", () => {
@@ -2104,7 +2287,12 @@ test("story 306: 详情 has the slot's timeline, folded; each conversation but t
   expect(backs("idle")).toHaveLength(1);
   expect(backs("idle")[0]).not.toContain('disabled=""');
   expect(backs("running")[0]).toContain('disabled=""');
-  expect(render(<Details d={slot({ timeline })} />)).toMatch(/<details[^>]*><summary[^>]*>时间线<span[^>]*>2<\/span><\/summary>/);
+  // Beside 回到这段, the row's own button squares its right corners, so its hover tint meets the divider.
+  const rows = render(<Details d={slot({ timeline })} />).match(/<button[^>]*aria-expanded[^>]*>/g)!;
+  expect(rows[0]).not.toContain("rounded-r-none");
+  expect(rows[1]).toContain("rounded-r-none");
+  // Its fold turns a chevron as 设置's does, on a group of its own: an unnamed one would set off the preview's group-hover.
+  expect(render(<Details d={slot({ timeline })} />)).toMatch(/<details class="[^"]*group\/timeline[^"]*"><summary[^>]*><svg[^>]*group-open\/timeline:rotate-90[^>]*><path[^>]*><\/path><\/svg>时间线<span[^>]*>2<\/span><\/summary>/);
 });
 
 /** A message of yours sent from the board, as the page keeps it until the transcript has it. */
@@ -2113,13 +2301,14 @@ const yours = (text: string, at: number, source: string | null = "网页"): Bloc
 
 test("story 273: what you send shows at once as a faint bubble of yours, until the transcript has it; one not taken is red, why under it, with a retry", () => {
   const html = render(<ChatView d={slot()} log={chat({ sent: [sent("还有一件事"), sent("顺便看看日志", { failed: "w/c 有提问在等你，先答提问。" })] })} live />);
-  const bubble = (text: string) => html.match(new RegExp(`<div class="([^"]*)"><p[^>]*>${text}</p>`))![1]!;
+  // Faint all of it, its words' bubble red.
+  const bubble = (text: string) => html.match(new RegExp(`<div class="([^"]*)"><div class="([^"]*)"><p[^>]*>${text}</p>`))!.slice(1).join(" ");
   expect(bubble("还有一件事")).toContain("opacity-");
   expect(bubble("顺便看看日志")).toContain("border-destructive");
   expect(html.match(/aria-label="重试"/g)).toHaveLength(1);
   // Its buttons under it, on the line with why, so the bubble keeps its width on a phone; pulled
   // out by their padding, so the retry icon sits on the bubble's right edge.
-  expect(html).toMatch(/顺便看看日志<\/p><\/div><div class="-mr-3\.5 [^"]*"><p[^>]*>w\/c 有提问在等你，先答提问。<\/p><button[^>]*aria-label="不发了"/);
+  expect(html).toMatch(/顺便看看日志<\/p><\/div><\/div><\/div><div class="-mr-3\.5 [^"]*"><p[^>]*>w\/c 有提问在等你，先答提问。<\/p><button[^>]*aria-label="不发了"/);
 
   // Each finds its own, in order, among yours from the board written since it was sent.
   const a = sent("again");
@@ -2129,6 +2318,8 @@ test("story 273: what you send shows at once as a faint bubble of yours, until t
   // Not one from IM, nor one whose words differ; a picture's line follows the words.
   expect(unread([a], [yours("again", 12, "QQ 私聊"), yours("other", 13)])).toEqual([a]);
   expect(unread([sent("看看这张图")], [yours("看看这张图\n[图片] /m/1", 12)])).toEqual([]);
+  // One Rhodium held past durations.sentAtAfter (a quota wait, say): its source line says when you sent it.
+  expect(unread([a], [yours("again", 12, "网页，发送于 21:05")])).toEqual([]);
   // The block that confirmed one confirms no other on later updates: two the same, or two with no words.
   for (const text of ["again", ""]) {
     const [c, d] = [sent(text), sent(text)];
@@ -2157,9 +2348,11 @@ test("story 273: the transcript brings what you sent: its bubble goes, and the t
 });
 
 test("story 280: your message from the board is a bubble as one typed in the terminal: no avatar, no source", () => {
-  const html = render(<ChatView d={slot()} log={chat({ blocks: [yours("hi", 0)] })} live />);
+  // The second Rhodium held long enough that its source line says when you sent it.
+  const html = render(<ChatView d={slot()} log={chat({ blocks: [yours("hi", 0), yours("hey", 1, "网页，发送于 21:05")] })} live />);
   expect(html).toContain(">hi</p>");
-  expect(html).not.toMatch(/<img|网页/);
+  expect(html).toContain(">hey</p>");
+  expect(html).not.toMatch(/<img|网页|发送于/);
 });
 
 test("#512: in your bubbles, the transcript's and one still sending, a long run with no space (a path, a hash, a URL) breaks anywhere to fill each line; words, English too, break as before", () => {
@@ -2263,6 +2456,8 @@ test("stories 283, 285, 286: the queue sits above where you type, with how many 
   const count = (label: string) => box.match(new RegExp(`aria-label="${label}"`, "g"))?.length ?? 0;
   expect([count("插话"), count("编辑"), count("删除"), count("继续"), count("附件")]).toEqual([2, 1, 3, 0, 1]);
   expect(box).toContain("等打断生效");
+  // Scrolled on the board's thin round bar, clear of the box's round corners, with no arrows, faded where cut (#579).
+  expect(box.match(/<div class="([^"]*)"><ul/)![1]!.split(" ")).toEqual(expect.arrayContaining(["card-scroll", "edge-fade-y"]));
   const paused = render(<ChatView d={slot({ phase: "idle", queue: queue.slice(0, 1).map((q) => ({ ...q, reason: "web_paused" as const })) })} log={chat()} live />);
   const p = paused.slice(paused.indexOf('aria-label="待发队列"'), paused.indexOf("<textarea"));
   expect([p.includes('aria-label="继续"'), p.includes('aria-label="插话"'), p.includes('aria-label="发送"'), p.includes('aria-label="暂停了"')]).toEqual([true, false, true, true]);
@@ -2396,8 +2591,7 @@ test("story 147: Rhodium's page lists each bot as connected or not, and its log"
   for (const s of ["第 3 次启动", "q", "已连上", "t", "重连中", "ready"]) expect(text).toContain(s);
 });
 
-test("#286: the theme button goes 跟随系统, 浅色, 深色 and round again; the choice is kept on this device and set on the page, 跟随系统 keeping none; storage that cannot be used follows the system", () => {
-  expect([nextTheme("system"), nextTheme("light"), nextTheme("dark")]).toEqual(["light", "dark", "system"]);
+test("#286: the theme chosen is kept on this device and set on the page, 跟随系统 keeping none; storage that cannot be used follows the system", () => {
   const real = { localStorage: Object.getOwnPropertyDescriptor(globalThis, "localStorage"), document: Object.getOwnPropertyDescriptor(globalThis, "document") };
   const stored = new Map<string, string>();
   const root = { dataset: {} as Record<string, string> };

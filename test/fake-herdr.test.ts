@@ -8,7 +8,7 @@ import { connect, createServer } from "node:net";
 import { basename, join } from "node:path";
 import { claudeProjectDir, installFakeAgent, realHome } from "./fake-agent/fake-agent.ts";
 import { call, installFakeHerdr, startFakeHerdr, subscribe, type FakeHerdrConfig } from "./fake-herdr/fake-herdr.ts";
-import { exec } from "./instance";
+import { exec, settles } from "./instance";
 
 // Short prefix: the socket path must stay under the 108-byte unix socket limit.
 const base = mkdtempSync(join(tmpdir(), "rhodium-test-fh-"));
@@ -57,7 +57,15 @@ const environ = (pid: number) =>
       .filter(Boolean)
       .map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)]),
   );
-const alive = (pid: number) => existsSync(`/proc/${pid}`);
+/** Whether pid runs: a zombie, exited and not yet reaped by its parent, does not (#575). */
+const alive = (pid: number) => {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat[stat.lastIndexOf(")") + 2] !== "Z";
+  } catch {
+    return false;
+  }
+};
 
 /** A workspace plus a slot tab whose shell is typed the launch line, as the bridge did before #372: the
  *  fake's shell panes, which the tests below and Herdr's own resume use. */
@@ -472,7 +480,7 @@ test("Ctrl-C reaches an agent the shell exec'd while it runs a child, say rh, as
   const pids: number[] = (await fg()).map((p: any) => p.pid);
   await call(t.socket, "pane.send_keys", { pane_id: pane, keys: ["ctrl+c"] });
   await until(() => sub.events.some((e) => e.event === "pane_exited"));
-  expect(pids.filter(alive)).toEqual([]);
+  await settles(() => pids.filter(alive), []);
 });
 
 test("tab.close ends the pane's process with only tab_closed, and keeps the rest of the workspace", async () => {

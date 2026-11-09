@@ -181,15 +181,46 @@ function Keys() {
   );
 }
 
-/** The board, or Rhodium's page, under the header with the event stream's state. */
+/** The board, or Rhodium's page, under the header with the event stream's state. On a wide screen a
+ *  line under the header across the page, or the split's side, as under a chat's top bar (#617); the
+ *  header stays there, and what is under it scrolls under the line (#635), back to its top as another
+ *  page opens, as the window does (App); beside a chat the list stays where it is. Both keep room for
+ *  the bar, so they stay level as it comes. */
 function Home({ live }: { live: boolean | null }) {
+  const [at] = useLocation();
+  const head = useRef<HTMLDivElement>(null);
+  const page = useRef<HTMLDivElement>(null);
+  const split = at.startsWith("/slot/");
+  useEffect(() => void (split || page.current?.scrollTo(0, 0)), [at]);
+  // With no chat, the keys that scrolled the window, pressed with nothing focused or in the header (a
+  // button there takes Space, a link does not), scroll what is under a wide screen's header, as the
+  // window no longer scrolls there.
+  useEffect(() => {
+    if (split) return;
+    const key = (e: KeyboardEvent, f = document.activeElement) =>
+      /^(Page(Up|Down)|Arrow(Up|Down)|Home|End| )$/.test(e.key) &&
+      !(e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) &&
+      (f === document.body || ((e.key !== " " || f instanceof HTMLAnchorElement) && head.current?.contains(f))) &&
+      matchMedia(WIDE).matches &&
+      page.current?.focus({ preventScroll: true });
+    addEventListener("keydown", key);
+    return () => removeEventListener("keydown", key);
+  }, [split]);
   return (
-    <main className="mx-auto max-w-[55rem] px-4 pt-[env(safe-area-inset-top)] pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-      <BoardHeader live={live} />
-      <Switch>
-        <Route path="/rhodium" component={RhodiumPage} />
-        <Route component={BoardPage} />
-      </Switch>
+    <main className="pt-[env(safe-area-inset-top)] lg:flex lg:h-dvh lg:flex-col">
+      <div ref={head} className="lg:shrink-0 lg:overflow-hidden lg:border-b lg:[scrollbar-gutter:stable]">
+        <div className="mx-auto max-w-[55rem] px-4">
+          <BoardHeader live={live} />
+        </div>
+      </div>
+      <div ref={page} tabIndex={-1} className="pb-[calc(1.5rem+env(safe-area-inset-bottom))] outline-none lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:[scrollbar-gutter:stable]">
+        <div className="mx-auto max-w-[55rem] px-4">
+          <Switch>
+            <Route path="/rhodium" component={RhodiumPage} />
+            <Route component={BoardPage} />
+          </Switch>
+        </div>
+      </div>
     </main>
   );
 }

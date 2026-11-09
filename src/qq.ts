@@ -370,10 +370,12 @@ export class QQAdapter implements ImAdapter {
           return post(body, seq, true);
         }
         // ponytail: any business code on a passive reply means its msg_id is spent, as qq-cli has it,
-        // a seq clash (DEDUPED on the first try) included; on an active message, that the bot has none
-        // left. Narrow to QQ's quota codes once they show up: probe 12 met none.
-        const spent = r.status === "failed" && e instanceof ApiError && e.bizCode !== undefined;
-        return spent ? { ...r, quota: true } : r;
+        // a seq clash (DEDUPED on the first try) included. Narrow to QQ's quota codes once they show up:
+        // probe 12 met none. On an active message every code turns down this one alone (product §5.5):
+        // QQ's docs name none for the quota alone, its limit code 40034100 covering the per-minute
+        // limit too, so the bot's own count (limits.qqActive) keeps the period.
+        if (r.status !== "failed" || !(e instanceof ApiError) || e.bizCode === undefined) return r;
+        return message.replyTo ? { ...r, quota: true } : { ...r, refused: true };
       }
     };
     if (media) return post({ msgType: MsgType.MEDIA, media, ...(message.text && { content: message.text }) }, message.seq);

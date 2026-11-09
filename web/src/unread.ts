@@ -63,7 +63,8 @@ const leave = () => stored(() => localStorage.getItem(FRONT) === me && localStor
 
 /** Follows the event stream for turns that end with their reply on the web alone: a slot going from
  *  running to idle, as the stream said, or the board for one it said nothing of yet, with no
- *  final_reply, send_me or compacted since its turn began: an IM turn's final_reply, or your
+ *  final_reply, send_me or compacted since its turn began, or with an rh send kept on the board
+ *  (send_me's web) all the same: an IM turn's final_reply, or your
  *  /compact's compacted, comes in the same transaction just before it, and rh send me mid-turn, a
  *  question or a quota wait maybe after it.
  *  Each is unread unless its chat is in front of you. With the page hidden or not focused, one your
@@ -74,6 +75,8 @@ const leave = () => stored(() => localStorage.getItem(FRONT) === me && localStor
 export function watch(here: () => Here = page, open: (slot: string) => void = openChat): () => void {
   const states = new Map<string, string>();
   const replied = new Set<string>();
+  // Slots whose turn kept an rh send on the board alone (web, product §5.9): unread, whatever went to IM.
+  const kept = new Set<string>();
   // Slots in a turn of yours from the board, or one running on from it unseen, as a report that waited for its end.
   const mine = new Set<string>();
   const away = () => {
@@ -90,6 +93,7 @@ export function watch(here: () => Here = page, open: (slot: string) => void = op
   };
   const take = (e: { type: string; slot: string | null; data: unknown }) => {
     if (!e.slot) return;
+    if (e.type === "send_me" && (e.data as { web?: boolean } | null)?.web) return void kept.add(e.slot);
     if (e.type === "final_reply" || e.type === "send_me" || e.type === "compacted") return void replied.add(e.slot);
     if (e.type === "ask") return void (away() && remind(e.slot, open, true));
     if (e.type === "ask_answered") return void close(e.slot);
@@ -104,11 +108,13 @@ export function watch(here: () => Here = page, open: (slot: string) => void = op
     // board, on any page, says you saw its chat.
     if (state === "running" && was !== "running" && was !== "waiting" && was !== "rate_limited") {
       replied.delete(e.slot);
+      kept.delete(e.slot);
       if (web) close(e.slot);
     }
     if (state === "running" || state === "waiting" || state === "rate_limited") return;
     const yours = mine.delete(e.slot);
-    if (replied.delete(e.slot) || was !== "running" || state !== "idle") return;
+    const onWeb = kept.delete(e.slot);
+    if ((replied.delete(e.slot) && !onWeb) || was !== "running" || state !== "idle") return;
     const h = here();
     if (!(h.visible && h.chat === e.slot) && !unread.has(e.slot)) (unread.add(e.slot), changed());
     if (yours && (!h.visible || !h.focused)) void remind(e.slot, open);

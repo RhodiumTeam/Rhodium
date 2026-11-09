@@ -322,6 +322,7 @@ stream-json 是 `claude -p` 的一种通信方式：标准输入输出上每行�
 - QQ：群里默认只收 @Bot 的消息，收全部要群主开“接收全量消息”。[QQ 机器人 FAQ](https://bot.q.qq.com/wiki/bot_FAQ/)
 - QQ：被动回复官方写的是私聊每条最多 4 次、60 分钟内有效，群里每条最多 5 次、5 分钟内有效。2026-10-21 私聊实测，连回 20 次、隔 61 分钟再回都成功，官方写的私聊限制没生效。[消息概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)
 - QQ：主动消息官方写的是每个好友每天最多 1000 条、每分钟最多 20 条，用户可以设成不接收。没实测。[消息概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)
+- QQ：发送单聊消息接口的错误码表里，讲主动消息条数的只有 40034100（主动消息发送超过频控限制，排查建议“请降低发送频率或等待配额恢复”）。同一页的主动消息频控规则把每秒、每分钟 20 条和每天 1000 条都算作频控，这个码没分是哪一种。别的主动消息被拒：40034105（无权限）、40054013（用户拒收消息）。旧文档单聊常见错误码里的 22009（`msg limit exceed`）现在的表里没有。没实测碰到过。[发送单聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages.post.html)（2026-10-28 更新）
 - 微信 iLink：一个微信号只有一个 Bot，不能进群。[OpenClaw 微信文档](https://docs.openclaw.ai/channels/wechat)
 - Telegram：命令名只允许小写字母、数字、下划线，1–32 个字符。[BotCommand](https://core.telegram.org/bots/api#botcommand)
 - Telegram：同一聊天约每秒 1 条，群里每分钟 20 条。[Bot FAQ](https://core.telegram.org/bots/faq)

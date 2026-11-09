@@ -27,6 +27,7 @@ flowchart TD
   SM["docs/spec/web-maximize.md<br/>网页放大模式规格"]:::doc
   SF["docs/spec/feishu.md<br/>飞书连接器规格"]:::doc
   SC["docs/spec/codex.md<br/>Codex 驱动规格"]:::doc
+  SG["docs/spec/web-images.md<br/>网页图片、复制和引用规格"]:::doc
   I["docs/im-style.md<br/>IM 文字与交互规范"]:::doc
   G --> P
   G --> R
@@ -47,6 +48,7 @@ flowchart TD
   SQ --> SM
   SI --> SF
   SQ --> SC
+  SR --> SG
 ```
 
 | 文档 | 回答什么问题 |
@@ -68,6 +70,7 @@ flowchart TD
 | [docs/spec/web-maximize.md](spec/web-maximize.md) | 电脑宽屏上的放大模式和侧栏、列表里的 Bot 头像、跳转框、真全屏做什么、怎么测试、怎么验收、怎么拆工单 |
 | [docs/spec/feishu.md](spec/feishu.md) | 接飞书私聊做什么、和飞书之间怎么说话、怎么测试、怎么验收、怎么拆工单 |
 | [docs/spec/codex.md](spec/codex.md) | 接 Codex 做什么、怎么测试、怎么验收、明确不做什么、怎么拆工单 |
+| [docs/spec/web-images.md](spec/web-images.md) | 网页上怎么看图、交给 agent 的图怎么缩、收发的图留多久，整条消息怎么复制和引用，怎么测试、怎么验收、怎么拆工单 |
 
 [AGENTS.md](../AGENTS.md) 和 [docs/agents/](agents/) 是给 AI agent 看的工作约定，不在阅读路径上。`CLAUDE.md` 只引用 `AGENTS.md`。
 

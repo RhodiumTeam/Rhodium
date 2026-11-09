@@ -116,12 +116,12 @@ export class TelegramAdapter implements ImAdapter {
     };
   }
 
-  /** Telegram brings the quoted text along: the part you picked, else the whole message. A picture's
+  /** Telegram brings the quoted text along: the part you picked, so marked, else the whole message. A picture's
    *  or a file's caption leaves out where it is kept, so the store's text comes first then, the
    *  caption only if the store has none (architecture §8.3). */
   private quote(r: Message, picked?: string): NonNullable<InboundMessage["quote"]> {
     const ref = String(r.message_id);
-    if (picked !== undefined) return { ref, text: picked };
+    if (picked !== undefined) return { ref, text: picked, picked: true };
     return r.photo || r.document ? { ref, ...(r.caption !== undefined && { fallback: r.caption }) } : { ref, text: r.text ?? r.caption };
   }
 

@@ -66,16 +66,36 @@ function endedHoldDirs(cfg: Config, store: Store): { path: string; at: number; b
   });
 }
 
+/** Removes the files in the media dir (architecture §7.8) last stored before `before`, and what was made
+ *  of each, which lies under a dir of the media dir's by the same name; so goes one made of a file gone
+ *  otherwise. Adds what went to gone. */
+function pruneMedia(dir: string, before: number, gone: { media: number; bytes: number }): void {
+  if (!existsSync(dir)) return;
+  const remove = (path: string) => {
+    gone.bytes += statSync(path).size;
+    rmSync(path);
+  };
+  const made: string[] = [];
+  for (const f of readdirSync(dir, { withFileTypes: true })) {
+    if (f.isDirectory()) made.push(f.name);
+    else if (statSync(join(dir, f.name)).mtimeMs < before) {
+      remove(join(dir, f.name));
+      gone.media++;
+    }
+  }
+  for (const sub of made) for (const f of readdirSync(join(dir, sub))) if (!existsSync(join(dir, f))) remove(join(dir, sub, f));
+}
+
 /**
  * The retention cleanup (architecture §7.8). First what is past its keep time: inbound messages and
  * outbound records with the quoted text they hold, the QQ passive quota each inbound message brought,
- * events, and ended hold dirs. Then, while those records and ended hold dirs still come to more than
- * limits.stateMaxMB, the oldest of them, but never a record of what is still in use: a message not sent
- * yet, and the one a turn under way began. One event says what went.
+ * events, ended hold dirs, and the media dir's files. Then, while those records and ended hold dirs
+ * still come to more than limits.stateMaxMB, the oldest of them, but never a record of what is still in
+ * use: a message not sent yet, and the one a turn under way began. One event says what went.
  */
 function prune(cfg: Config, store: Store): void {
   const now = Date.now();
-  const gone = { inbound: 0, outbound: 0, events: 0, holdDirs: 0, bytes: 0 };
+  const gone = { inbound: 0, outbound: 0, events: 0, holdDirs: 0, media: 0, bytes: 0 };
   const recordBytes = () => store.recordBytes().reduce((n, r) => n + r.bytes, 0);
   const had = recordBytes();
   const drop = (before: number, eventsBefore: number) =>
@@ -95,6 +115,7 @@ function prune(cfg: Config, store: Store): void {
   const dirs = endedHoldDirs(cfg, store);
   const old = (d: { at: number }) => d.at < now - cfg.durations.holdDirKeep;
   for (const d of dirs.filter(old)) remove(d);
+  pruneMedia(join(cfg.stateDir, "media"), now - cfg.durations.inboundKeep, gone);
 
   const keepFrom = store.tx((tx) =>
     Math.min(
@@ -115,7 +136,8 @@ function prune(cfg: Config, store: Store): void {
   }
   if (cut) drop(cut, cut);
   gone.bytes += had - recordBytes();
-  if (gone.inbound || gone.outbound || gone.events || gone.holdDirs) {
+  // bytes alone when only copies whose picture was gone went.
+  if (gone.inbound || gone.outbound || gone.events || gone.holdDirs || gone.media || gone.bytes) {
     store.tx((tx) => tx.append({ source: "clock", type: "state_pruned", data: gone }));
     log("retention cleanup", gone);
   }

@@ -84,7 +84,7 @@ test("#276: a slot on the old ultracode level reopens on xhigh with ultracode on
   db.run("ALTER TABLE bot DROP COLUMN rowHash"); // #300's, after it
   db.run("ALTER TABLE slot DROP COLUMN turnStartedAt"); // #329's, after that
   beforeOwners(db); // #449's, after that
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 6}`);
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 8}`);
   db.close();
 
   const again = openStore(path);
@@ -101,7 +101,7 @@ test("#300: a bot from the release before keeps the hash of its / menu and has n
   db.run("ALTER TABLE bot DROP COLUMN rowHash");
   db.run("ALTER TABLE slot DROP COLUMN turnStartedAt"); // #329's, after it
   beforeOwners(db); // #449's, after that
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 5}`);
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 7}`);
   db.close();
 
   const again = openStore(path);
@@ -109,11 +109,11 @@ test("#300: a bot from the release before keeps the hash of its / menu and has n
   again.close();
 });
 
-/** Takes #449's migration back: a bot's one ownerId, no list of owners. And #489's and #506's, after it. */
+/** Takes #449's migration back: a bot's one ownerId, no list of owners. And #489's, #506's, #593's and #601's, after it. */
 function beforeOwners(db: Database): void {
   db.run("ALTER TABLE bot ADD COLUMN ownerId TEXT");
   for (const col of ["owners", "pairAdd"]) db.run(`ALTER TABLE bot DROP COLUMN ${col}`);
-  for (const col of ["startedIdleAt", "activeAt", "pinnedAt"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
+  for (const col of ["startedIdleAt", "activeAt", "pinnedAt", "webAt", "turnToldYou", "turnPlanTimedOut"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
 }
 
 test("#506: a slot from the release before was last active as its turn began, running, else as its last turn ended; one that never ran, never; none is pinned", () => {
@@ -126,8 +126,8 @@ test("#506: a slot from the release before was last active as its turn began, ru
   });
   first.close();
   const db = new Database(path);
-  for (const col of ["activeAt", "pinnedAt"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 1}`);
+  for (const col of ["activeAt", "pinnedAt", "webAt", "turnToldYou", "turnPlanTimedOut"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 3}`);
   db.close();
 
   const again = openStore(path);
@@ -147,7 +147,7 @@ test("#449: a bot's one owner from the release before is its one paired owner; T
   const db = new Database(path);
   beforeOwners(db);
   db.run("UPDATE bot SET ownerId = 'you' WHERE id IN ('T', 'Q')");
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 3}`);
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 5}`);
   db.close();
 
   const again = openStore(path);

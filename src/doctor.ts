@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { headlessEnv } from "./agents";
 import { ClaudeDriver, refuseBare } from "./claude";
 import { CodexDriver, codexModelNames } from "./codex";
-import { formatGB, formatMB, locate, type Config } from "./config";
+import { formatGB, formatMB, hasHerdr, locate, type Config } from "./config";
 import { log } from "./daemon";
 import { request, sessionSocket } from "./herdr";
 import { daily, freeDisk } from "./ops";
@@ -369,7 +369,7 @@ export async function boardFindings(b: Config["board"], probe = asStranger): Pro
   return [...found, ...hosts.filter((f) => f !== null)];
 }
 
-// ponytail: a guess at "too big"; add truncation (architecture §4.3) if out.log ever gets near it.
+// ponytail: a guess at "too big", well past limits.outRestartMB, past which an agent process goes between turns (architecture §4.3).
 const BIG_OUT_LOG = 512 * 2 ** 20;
 
 /** Runs every check. notify: something you should hear about even without asking. */
@@ -468,7 +468,7 @@ async function check(cfg: Config, store: Store): Promise<{ text: string; notify:
   if (free < min) warn(`磁盘剩余不到 ${formatGB(min)}`);
   notify ||= free < min;
 
-  // out.log is never cut while its agent runs (§4.3), so its size is watched here.
+  // out.log is never cut while its agent runs, only once the next one starts (§4.3), so its size is watched here.
   const hold = join(cfg.stateDir, "hold");
   const logs = (existsSync(hold) ? readdirSync(hold) : [])
     .map((c) => ({ conversation: c, size: statSync(join(hold, c, "out.log"), { throwIfNoEntry: false })?.size ?? -1 }))
@@ -504,21 +504,24 @@ async function check(cfg: Config, store: Store): Promise<{ text: string; notify:
   const codex = locate(cfg.programs.codex, cfg.agentPath);
   if (codex && existsSync(codex)) await checkCodex(cfg, store, codex, info, error, warn);
 
-  // Herdr (§10.2, §10.3): the protocol the Herdr bridge was written for, and auto-resume. Probe 18:
-  // Rhodium closes the tab before Herdr resumes the agent, but not while rhodium itself is down.
-  try {
-    const herdr = locate(cfg.programs.herdr, cfg.agentPath) ?? cfg.programs.herdr;
-    const { version, protocol } = await request(await sessionSocket(herdr, cfg.herdr.session), "ping");
-    info.push(`Herdr ${version}（protocol ${protocol}）`);
-    if (protocol !== HERDR_PROTOCOL) warn(`Herdr 的协议版本是 ${protocol}，Herdr 桥是照 ${HERDR_PROTOCOL} 写的，切 TUI 可能出错`);
-  } catch (err) {
-    warn(`连不上 Herdr，没核对它的协议版本：${(err as Error).message}`);
+  // Herdr (§10.2, §10.3), only when installed (product §4.2): the protocol the Herdr bridge was
+  // written for, and auto-resume. Probe 18: Rhodium closes the tab before Herdr resumes the agent,
+  // but not while rhodium itself is down.
+  if (hasHerdr(cfg)) {
+    try {
+      const herdr = locate(cfg.programs.herdr, cfg.agentPath)!;
+      const { version, protocol } = await request(await sessionSocket(herdr, cfg.herdr.session), "ping");
+      info.push(`Herdr ${version}（protocol ${protocol}）`);
+      if (protocol !== HERDR_PROTOCOL) warn(`Herdr 的协议版本是 ${protocol}，Herdr 桥是照 ${HERDR_PROTOCOL} 写的，切 TUI 可能出错`);
+    } catch (err) {
+      warn(`连不上 Herdr，没核对它的协议版本：${(err as Error).message}`);
+    }
+    if (herdrResumes())
+      warn(
+        "Herdr 的 resume_agents_on_restore 开着：Herdr 重启回来时 Rhodium 若不在线，它会把已切回无头的对话再开一份。" +
+          "Rhodium 不改你的 Herdr 配置，请在它的 config.toml 里写上 [session] resume_agents_on_restore = false",
+      );
   }
-  if (herdrResumes())
-    warn(
-      "Herdr 的 resume_agents_on_restore 开着：Herdr 重启回来时 Rhodium 若不在线，它会把已切回无头的对话再开一份。" +
-        "Rhodium 不改你的 Herdr 配置，请在它的 config.toml 里写上 [session] resume_agents_on_restore = false",
-    );
 
   found.push(...(await boardFindings(cfg.board)));
 

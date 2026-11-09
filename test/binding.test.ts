@@ -6,7 +6,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { QQ_ROW, TELEGRAM_ROW } from "../src/commands";
-import { newInstance, until, withoutSource, type Instance } from "./instance";
+import { newInstance, recorded, until, withoutSource, type Instance } from "./instance";
 
 const ME = "you";
 
@@ -393,6 +393,7 @@ test("story 327: a row push the platform failed is tried again alone, with an in
   await Bun.sleep(1_500);
   await rhodium.ok("ls");
   await until(async () => (await pushes("q")).rows === 1);
+  await recorded(rhodium, "SELECT 1 FROM bot WHERE rowHash IS NOT NULL");
   await rhodium.stop();
   await rhodium.start();
   await rhodium.ok("ls");

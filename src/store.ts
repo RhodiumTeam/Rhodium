@@ -104,6 +104,15 @@ export type Slot = Row & {
   activeAt: number | null;
   // When you pinned it on the board, null for not (product §7); kept while it is archived.
   pinnedAt: number | null;
+  // When it last took a message of yours from the board: rh send me goes there if that is later than
+  // the chat it would go to was written in (product §5.9).
+  webAt: number | null;
+  // It sent to you this turn with rh send to a destination named, so its report need not say it told
+  // you nothing (architecture §9.3); a new turn clears it.
+  turnToldYou: Flag | null;
+  // Its plan ask timed out this turn, unapproved, and it stops to wait for you: as a child, its turn's
+  // end reports it stuck, not done (product §6.1); a new turn clears it.
+  turnPlanTimedOut: Flag | null;
 };
 
 export type Conversation = Row & {
@@ -307,6 +316,8 @@ export interface Store {
   traced(trace: string): Event[];
   /** The slot's last limit events before seq before, newest first. */
   slotEvents(slot: string, limit: number, before?: number): Event[];
+  /** The slot's events of this type from from to to (ms since the epoch), oldest first. */
+  slotEventsAt(slot: string, type: string, from: number, to: number): Event[];
   /** The newest event's seq; 0 when there is none. */
   lastSeq(): number;
   /** Calls fn for every event after seq, then for each new one as it commits. Not inside a tx. */
@@ -504,6 +515,15 @@ ALTER TABLE slot ADD COLUMN startedIdleAt INTEGER;
 ALTER TABLE slot ADD COLUMN activeAt INTEGER;
 ALTER TABLE slot ADD COLUMN pinnedAt INTEGER;
 UPDATE slot SET activeAt = COALESCE(turnStartedAt, turnEndedAt);
+`,
+  // Where rh send to you goes (#593): when you last wrote to the slot on the board, and whether it sent you something itself this turn.
+  `
+ALTER TABLE slot ADD COLUMN webAt INTEGER;
+ALTER TABLE slot ADD COLUMN turnToldYou INTEGER;
+`,
+  // A child whose plan ask timed out reports stuck as its turn ends (#601).
+  `
+ALTER TABLE slot ADD COLUMN turnPlanTimedOut INTEGER;
 `,
 ];
 
@@ -725,6 +745,7 @@ export function openStore(path: string, opts: { machine?: string } = {}): Store 
     traced: (trace) => (db.query("SELECT * FROM event WHERE trace = ? ORDER BY seq").all(trace) as EventRow[]).map(toEvent),
     slotEvents: (slot, limit, before = Number.MAX_SAFE_INTEGER) =>
       (db.query("SELECT * FROM event WHERE slot = ? AND seq < ? ORDER BY seq DESC LIMIT ?").all(slot, before, limit) as EventRow[]).map(toEvent),
+    slotEventsAt: (slot, type, from, to) => (db.query("SELECT * FROM event WHERE slot = ? AND type = ? AND at BETWEEN ? AND ? ORDER BY seq").all(slot, type, from, to) as EventRow[]).map(toEvent),
     lastSeq: () => (db.query("SELECT COALESCE(MAX(seq), 0) AS n FROM event").get() as { n: number }).n,
     subscribe(after, fn) {
       // Inside a tx it would read events that may still roll back, and their seqs be reused.

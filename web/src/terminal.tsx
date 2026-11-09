@@ -389,7 +389,7 @@ export default function TerminalView({ slot, font, shown }: { slot: string; font
             </button>
           ))}
         </div>
-        <div className="mx-auto flex max-w-3xl items-end rounded-3xl border bg-card shadow-xs transition-colors focus-within:border-ring hover:not-focus-within:border-ring/50">
+        <div className="mx-auto flex max-w-3xl items-end rounded-3xl border bg-card shadow-xs">
           <textarea
             aria-label="发给终端"
             placeholder="发给终端"

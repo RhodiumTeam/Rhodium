@@ -8,6 +8,7 @@ import { useLocation } from "wouter";
 import { COLOR, Name, order, word, type Row } from "./board";
 import { AgentLogo, chatAt, openFrom, recent, ROOM } from "./common";
 import { json, type BoardData } from "./data";
+import { useEdges } from "./write";
 
 /** The slots the jump box lists for what was typed (story 441). Nothing: those opened lately in this tab
  *  (recent, the latest first) but the open one (current), then the rest as the list has them; no
@@ -42,6 +43,7 @@ export function Jump({ close }: { close: (picked?: boolean) => void }) {
   const list = data ? jumpList(data, typed, current, recent.get()) : [];
   const sel = Math.min(pick, list.length - 1);
   const go = (id: string) => (id === current ? close() : (openFrom(id, at), close(true)));
+  const scroller = useEdges<HTMLDivElement>();
   return (
     // A tap off it closes it, leaving the keyboard where it was.
     <div className="fixed inset-0 z-[80] bg-black/10 dark:bg-black/30" onMouseDown={(e) => e.target === e.currentTarget && (e.preventDefault(), close())}>
@@ -80,11 +82,14 @@ export function Jump({ close }: { close: (picked?: boolean) => void }) {
             className="h-12 min-w-0 flex-1 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground"
           />
         </label>
-        <div id="jump-list" role="listbox" aria-label="槽位" className="max-h-[22rem] overflow-y-auto p-1">
-          {list.map((r, i) => (
-            <JumpRow key={r.c.id} r={r} picked={i === sel} onPick={() => setPick(i)} onOpen={() => go(r.c.id)} />
-          ))}
-          {!list.length && typed.trim() && <p className="px-3 py-2.5 text-sm text-muted-foreground">没有这个槽位。</p>}
+        {/* Faded where cut, ↑↓'s row scrolled clear of the fade, as the palette is (#579). */}
+        <div {...scroller} id="jump-list" role="listbox" aria-label="槽位" className="card-scroll edge-fade-y max-h-[22rem] scroll-py-8 overflow-y-auto">
+          <div className="p-1">
+            {list.map((r, i) => (
+              <JumpRow key={r.c.id} r={r} picked={i === sel} onPick={() => setPick(i)} onOpen={() => go(r.c.id)} />
+            ))}
+            {!list.length && typed.trim() && <p className="px-3 py-2.5 text-sm text-muted-foreground">没有这个槽位。</p>}
+          </div>
         </div>
       </div>
     </div>

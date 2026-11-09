@@ -54,12 +54,17 @@ export async function launchHolder(o: {
   }
   // The conversation's last holder may still be on its way out, its ExecStopPost running. systemd
   // takes no new unit of the same name until it is gone, which is quick.
-  await unitGone(p.unit, cfg.durations.holderGone);
+  const gone = await unitGone(p.unit, cfg.durations.holderGone);
   // The last agent's exit, gone before this holder is on record: from then on, after a restart, an
   // exit file with no unit always means this holder ran and ended (architecture §4.2).
   rmSync(join(p.dir, "exit"), { force: true });
-  // An out.log shorter than the stored offset was deleted with its directory (§4.5): start over.
-  const size = statSync(join(p.dir, "out.log"), { throwIfNoEntry: false })?.size ?? 0;
+  // The last agent's output all read, the logs start afresh (§4.5). An out.log shorter than the stored
+  // offset was deleted with its directory: start over too.
+  let size = statSync(join(p.dir, "out.log"), { throwIfNoEntry: false })?.size ?? 0;
+  if (gone && store.tx((tx) => tx.find("holder", { conversation })[0]?.outOffset ?? 0) >= size) {
+    for (const log of ["out.log", "in.log"]) rmSync(join(p.dir, log), { force: true });
+    size = 0;
+  }
   const errStart = statSync(join(p.dir, "err.log"), { throwIfNoEntry: false })?.size ?? 0;
   // Recorded before it starts, so there is never a holder rhodium does not know about.
   store.tx((tx) => {

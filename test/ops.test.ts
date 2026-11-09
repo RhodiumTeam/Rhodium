@@ -243,6 +243,63 @@ test("the hold dir of a conversation no slot is on any more stays while its agen
   expect(() => process.kill(rhodium.claude.runs()[0]!.pid, 0)).not.toThrow(); // the agent is still there
 }, 45_000);
 
+test("story 570: a kept picture or file goes, with what was made of it, 90 days after it was last stored; one younger, or stored again since, stays; the cleanup says how many went", async () => {
+  rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" } }, toml: '[durations]\nbackupEvery = "1d"' });
+  const media = join(rhodium.dir, "state/media");
+  /** data kept in the media dir, last stored ago ms ago, with a copy made of it under each of made; its name. */
+  const kept = (data: string, ago: number, made: string[] = []) => {
+    const name = new Bun.CryptoHasher("sha256").update(data).digest("hex");
+    for (const sub of ["", ...made]) {
+      mkdirSync(join(media, sub), { recursive: true });
+      writeFileSync(join(media, sub, name), data);
+    }
+    const t = new Date(Date.now() - ago);
+    utimesSync(join(media, name), t, t);
+    return name;
+  };
+  const old = kept("old", 91 * DAY, ["preview", "view", "agent"]);
+  const young = kept("young", 89 * DAY, ["preview"]);
+  const again = kept("again", 91 * DAY);
+  await rhodium.start();
+  await rhodium.slots("a");
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "this again", attachments: [{ kind: "file", name: "a.txt", data: Buffer.from("again") }] });
+  await until(async () => (await rhodium.im.log("q", ME)).length === 1, 15_000);
+  // Each second from now on: the cleanup a day after the first start comes as soon as rhodium is back.
+  await rhodium.kill9();
+  writeFileSync(rhodium.config, readFileSync(rhodium.config, "utf8").replace('backupEvery = "1d"', 'backupEvery = "1s"'));
+  await rhodium.start();
+
+  // The event is the cleanup's last step: once it is there, all that goes has gone.
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  const said = () => db.query("SELECT data FROM event WHERE type = 'state_pruned'").all() as { data: string }[];
+  try {
+    await until(() => said().length > 0, 5_000);
+    expect(said().map((e) => JSON.parse(e.data).media)).toEqual([1]);
+  } finally {
+    db.close();
+  }
+  expect(["", "preview", "view", "agent"].map((sub) => readdirSync(join(media, sub)).filter((f) => !["preview", "view", "agent"].includes(f)).sort())).toEqual([[again, young].sort(), [young], [], []]);
+}, 45_000);
+
+test("a copy whose picture is gone goes, and the cleanup says so, though no record or kept file went", async () => {
+  rhodium = newInstance({ toml: '[durations]\nbackupEvery = "1s"' });
+  // Left by a crash while it was being written.
+  const preview = join(rhodium.dir, "state/media/preview");
+  mkdirSync(preview, { recursive: true });
+  writeFileSync(join(preview, "f00d.123.tmp"), "half");
+  await rhodium.start();
+
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  const said = () => db.query("SELECT data FROM event WHERE type = 'state_pruned'").all() as { data: string }[];
+  try {
+    await until(() => said().length > 0, 5_000);
+    expect(JSON.parse(said()[0]!.data)).toMatchObject({ media: 0, bytes: 4 });
+  } finally {
+    db.close();
+  }
+  expect(readdirSync(preview)).toEqual([]);
+}, 45_000);
+
 const FULL = "[limits]\nminFreeMB = 1024000000\n";
 /** Restarts rhodium wanting more free disk than any disk has, 1,000,000GB; or, full false, the default again. */
 async function diskFull(full = true): Promise<void> {

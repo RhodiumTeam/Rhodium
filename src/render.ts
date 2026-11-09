@@ -143,15 +143,20 @@ export function describe(name: string, input: unknown, dir: string, hide = true)
 }
 
 /** A path relative to the slot's directory, else with ~ for home; over ARG, its head and last two
- *  parts with … between (im-style §2.4). */
+ *  parts with … between, else its head and file name, else …/ and its file name (im-style §2.4). */
 function shortPath(path: string, dir: string): string {
   const home = homedir();
   const p = path.startsWith(`${dir}/`) ? path.slice(dir.length + 1) : path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
   if (width(p) <= ARG) return p;
-  const parts = p.split("/");
+  const parts = p.replace(/\/+$/, "").split("/"); // a directory's trailing / would leave an empty name
   const head = parts[0] === "~" || parts[0] === "" ? 2 : 1;
-  const cut = [...parts.slice(0, head), "…", ...parts.slice(-2)].join("/");
-  return parts.length > head + 2 && width(cut) <= ARG ? cut : clip(p, ARG, "…");
+  const cuts = [
+    parts.length > head + 2 && [...parts.slice(0, head), "…", ...parts.slice(-2)],
+    parts.length > head + 1 && [...parts.slice(0, head), "…", ...parts.slice(-1)],
+    parts.length > 1 && ["…", ...parts.slice(-1)],
+  ];
+  for (const cut of cuts) if (cut && width(cut.join("/")) <= ARG) return cut.join("/");
+  return clip(p, ARG, "…");
 }
 
 /** Text set as inline code, whatever backticks it has. */

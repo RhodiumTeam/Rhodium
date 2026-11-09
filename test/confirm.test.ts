@@ -64,7 +64,7 @@ const WANTS: Record<string, string> = {
 const asks = (cmd: string) => `w/a 想${WANTS[cmd]}\n\n命令：${cmd}\n回别的话算拒绝，并转告 w/a。`;
 const CONFIRM = asks("rh stop w/b");
 /** Agreed, you hear 已回答：同意 alone: the agent tells you what came of it (product §5.8). */
-const TELL = "用户在 IM 里只看到“已回答：同意”。请用 rh send me 把结果告诉用户。";
+const TELL = "用户在 IM 里只看到“已回答：同意”。请用 rh send me 把结果告诉用户；你有父槽位时，见 rh send me 的说明。";
 /** Agreed on the board, which shows the turn the decision begins: the reply will do (story 478). */
 const TELL_WEB = "用户是在网页上同意的，网页上看得到你这一回合的回复。请把结果写在回复里，不用 rh send me。";
 

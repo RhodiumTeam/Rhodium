@@ -11,7 +11,7 @@ import type { SlotData } from "./data";
 import { KIND } from "./details";
 import { MARKDOWN } from "./tools";
 import { toast } from "./toast";
-import { act, StopKey } from "./write";
+import { act, StopKey, useEdges } from "./write";
 
 type Ask = SlotData["asks"][number];
 type Questions = Extract<AskCard, { questions: unknown }>["questions"];
@@ -63,7 +63,7 @@ export function Asks({ d, turn }: { d: SlotData; turn: boolean }) {
   const asks = d.asks.filter((a) => !lines.some((l) => l.id === a.id));
   if (!asks.length && !lines.length) return null;
   return (
-    <div className="max-h-[60dvh] overflow-y-auto border-t px-4 pt-3 pb-2">
+    <div className="card-scroll max-h-[60dvh] overflow-y-auto border-t px-4 pt-3 pb-2">
       <div className="mx-auto grid max-w-3xl gap-2">
         {lines.map((l) => (
           <p key={l.id} className="rounded-lg border border-dashed px-3 py-2 text-sm text-muted-foreground">
@@ -175,14 +175,9 @@ function Decide({ c, busy, send }: { c: YesNo; busy: boolean; send: (text: strin
     <div className="grid gap-2 pt-2">
       {c.body &&
         (c.markdown ? (
-          // Its headings no bigger than the card's words.
-          <div className="max-h-[35dvh] overflow-y-auto rounded-md border px-3 py-2 [&_:is(h1,h2,h3,h4)]:mt-3 [&_:is(h1,h2,h3,h4)]:text-base">
-            <Streamdown mode="static" {...MARKDOWN}>
-              {c.body}
-            </Streamdown>
-          </div>
+          <Plan body={c.body} />
         ) : (
-          <pre className="max-h-40 overflow-auto rounded-md bg-muted px-2.5 py-1.5 font-mono text-xs whitespace-pre-wrap wrap-anywhere">{c.body}</pre>
+          <pre className="card-scroll max-h-40 overflow-auto rounded-md bg-muted px-2.5 py-1.5 font-mono text-xs whitespace-pre-wrap wrap-anywhere">{c.body}</pre>
         ))}
       {c.told && <input value={why} onChange={(e) => setWhy(e.target.value)} placeholder="理由" aria-label="理由" disabled={busy} className={field} />}
       <div className="flex gap-2">
@@ -194,6 +189,21 @@ function Decide({ c, busy, send }: { c: YesNo; busy: boolean; send: (text: strin
           {c.yes}
         </button>
       </div>
+    </div>
+  );
+}
+
+/** A plan, in Markdown: in no box round the boxes of its tables and code, on the board's thin bar, its
+ *  ends faded while there is more that way (#557). The bar, where it takes room, sits in the card's
+ *  right padding, so the tables and code line up with the reason and the keys below. Its headings no
+ *  bigger than the card's words. */
+function Plan({ body }: { body: string }) {
+  const scroller = useEdges<HTMLDivElement>();
+  return (
+    <div {...scroller} className="card-scroll edge-fade-y -mr-(--bar) max-h-[35dvh] overflow-y-auto [&_:is(h1,h2,h3,h4)]:mt-3 [&_:is(h1,h2,h3,h4)]:text-base">
+      <Streamdown mode="static" {...MARKDOWN}>
+        {body}
+      </Streamdown>
     </div>
   );
 }

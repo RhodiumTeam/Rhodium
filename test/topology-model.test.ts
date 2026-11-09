@@ -1,8 +1,11 @@
 // The topology view's layout and the rest of its logic that is not drawing (spec web-topology, 测试决定):
 // on a graph of the real size, a large one, and one with a child spawned into another workspace, at
 // every focus, phone and wide, archived slots shown or not, every workspace unfolded or not.
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { addStep, below, bring, clamp, drafted, comers, drop, dropAt, editLit, editTap, endOf, ends, grab, grabbed, pressed, fitTo, hidden, into, keep, key, known, least, MARGIN, NONE, pick, put, readRoute, replaces, routeHash, seen, SHEET, span, stale, starts, swap, toward, trail, undoOf, undoStep, union, view, type Data, type Edit, type Focus, type Graph, type Line, type Rect, type Slot } from "../web/src/topology/model";
+
+// The tests that go through every combination take about 4 s alone, more on a busy machine (#566).
+setDefaultTimeout(60_000);
 
 type SlotIn = Partial<Slot> & { ref: string };
 /** A graph from bots (name: [chat, kind, slot ref it goes to, by /rh_use][]) and slots by ref; ids

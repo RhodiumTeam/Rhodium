@@ -17,7 +17,8 @@ import { json, refresh, type Episode, type SlotData, type TopologyData } from ".
 import { connText, Face, Mark } from "../faces";
 import { addStep, below, clamp, drafted, drop, dropAt, editLit, editTap, endOf, grab, grabbed, LONG_PRESS, pressed, type Grab, type Step, fitTo, H, hidden, into, keep, key, known, least, MARGIN, NONE, pick, put, reachOf, readRoute, replaces, routeHash, seen, SHEET, stale, status, swap, toward, trail, undoOf, undoStep, union, view, type Bot, type Change, type Chat, type Data, type Edit, type Focus, type Graph, type Line, type Rect, type Route, type Slot, type Status, type View, type Viewport } from "./model";
 import "./topology.css";
-import { act, MenuAt, Pick, Spin, TakeBack, Toasts, ToTerminal, useAct, type Choice } from "../write";
+import { act, MenuAt, Pick, Spin, TakeBack, Toasts, ToTerminal, useAct, useEdges, type Choice } from "../write";
+import { useTerminalEntry } from "../settings";
 import { inTurn, Timeline } from "../timeline";
 import { toast } from "../toast";
 import { NewSlot } from "../create";
@@ -810,7 +811,7 @@ function editSheet(g: Graph, s: Edit, set: (s: Edit) => void): Sheet {
 type Asking = { slot: string; back: boolean };
 
 /** What can be done to a slot (story 271), as its chat has it: stop its turn, stop its process, switch
- *  it to the terminal or take it back, archive it or bring it back. A button that opens them, or with
+ *  it to the terminal, as 终端入口 has it, or take it back, archive it or bring it back. A button that opens them, or with
  *  close, them where at says, as a right click opens them. ask: asks whether to take the slot's
  *  terminal back, or to switch it there (story 476), in a dialog that outlives the menu. */
 function SlotMenu({ s, at, close, ask, className }: { s: Slot; at?: { x: number; y: number } | null; close?: () => void; ask: (a: Asking) => void; className?: string }) {
@@ -818,10 +819,11 @@ function SlotMenu({ s, at, close, ask, className }: { s: Slot; at?: { x: number;
   const go = (a: Parameters<typeof run>[0]) => () => void run(a);
   const turn = inTurn(s);
   const runs = s.mode === "headless" && s.phase !== "off" && s.phase !== "crashed";
+  const entry = useTerminalEntry();
   const terminal: Choice[] =
     s.mode === "tui"
       ? [{ icon: SquareTerminal, label: "收回终端", run: () => ask({ slot: s.id, back: true }) }]
-      : s.archived
+      : s.archived || !entry
         ? []
         : [{ icon: SquareTerminal, label: "切到终端", run: () => ask({ slot: s.id, back: false }) }];
   const choices: Choice[] = [
@@ -837,8 +839,11 @@ function SlotMenu({ s, at, close, ask, className }: { s: Slot; at?: { x: number;
   return close ? (
     <MenuAt at={at ?? null} close={close} choices={choices} />
   ) : (
-    <Pick label="操作" choices={choices} disabled={busy} className={cn("size-11 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground active:bg-muted", className)}>
-      <Ellipsis className="size-5" />
+    <Pick label="操作" choices={choices} disabled={busy} className={cn("group focus-child size-11 shrink-0 place-items-center text-muted-foreground", className)}>
+      {/* A key rings the three dots alone, and a mouse grounds them alone (#560). */}
+      <span className="grid h-6 w-8 place-items-center rounded-lg transition-colors group-hover:bg-foreground/5 group-hover:text-foreground group-active:bg-muted">
+        <Ellipsis className="size-5" />
+      </span>
     </Pick>
   );
 }
@@ -1076,6 +1081,7 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
   // It is never taller than what it holds, and with nothing to hold it is its bar alone.
   const [sheetH, setSheetH] = useSheet();
   const aside = useRef<HTMLElement>(null);
+  const scroller = useEdges<HTMLDivElement>(); // the details' body, cut ends fading (#638)
   const drag = useRef<{ y: number; h: number; to: number; moved: boolean } | null>(null);
   const moved = useRef(false); // the last press on the bar was a drag: its click is not a tap
   const [dragging, setDragging] = useState(false); // the body shows while the bar is dragged
@@ -1171,7 +1177,7 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
             <Fragment key={i}>
               <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
               <button onClick={() => crumb(c.focus)} className={cn("inline-flex h-11 max-w-[11rem] shrink-0 items-center truncate rounded-lg px-2 text-sm transition-colors hover:bg-foreground/5 active:bg-muted focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-ring", i === crumbs.length - 2 ? "font-semibold" : "text-muted-foreground hover:text-foreground")}>
-                {c.focus?.kind === "line" ? <LineName g={g} of={c.focus.id} size={18} name={c.label} ring="ring-background" /> : c.label}
+                {c.focus?.kind === "line" ? <LineName g={g} of={c.focus.id} size={18} name={c.label} ring="ring-background" /> : <span className="truncate">{c.label}</span>}
               </button>
             </Fragment>
           ))}
@@ -1270,14 +1276,14 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
             )}
           </div>
         </div>
-        {/* A wide screen has the details as a card at the canvas's right, as tall as what it holds; with
-            a slot's chat beside the graph, none. */}
+        {/* A wide screen has the details as a card at the canvas's right, as tall as what it holds, its
+            right edge on the header's as the settings' card's is; with a slot's chat beside the graph, none. */}
         <aside
           hidden={wide && route.chat}
           ref={aside}
           aria-label="详情"
           style={wide || !sheetH || !body ? undefined : { maxHeight: Math.min(sheetH, SHEET.max(innerHeight)) }}
-          className="flex shrink-0 flex-col overflow-hidden border-t bg-card pb-[env(safe-area-inset-bottom)] lg:m-3 lg:max-h-[calc(100%-1.5rem)] lg:w-80 lg:self-start lg:rounded-xl lg:border lg:pb-0 lg:shadow-sm xl:w-96"
+          className="flex shrink-0 flex-col overflow-hidden border-t bg-card pb-[env(safe-area-inset-bottom)] lg:my-3 lg:mr-4 lg:ml-3 lg:max-h-[calc(100%-1.5rem)] lg:w-80 lg:self-start lg:rounded-xl lg:border lg:pb-0 lg:shadow-sm xl:w-96"
         >
           <div {...bar} className={cn("relative flex min-h-[66px] shrink-0 items-center gap-2.5 pt-2.5 pr-1 pb-3 pl-4 select-none lg:min-h-0 lg:pt-3 lg:pr-4 lg:pb-3", body && "cursor-grab touch-none lg:cursor-auto lg:touch-auto")}>
             {body && <span aria-hidden className="absolute top-1 left-1/2 h-1 w-9 -translate-x-1/2 rounded-full bg-border lg:hidden" />}
@@ -1285,23 +1291,24 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
             <div className="min-w-0 flex-1">
               <h2 className="truncate font-semibold lg:whitespace-normal lg:wrap-anywhere">{sheet.title}</h2>
               {/* A slot's 操作 at the end of this line: its title keeps the row's width. Its 44px reach
-                  the row's bottom edge, which is why a phone's row is 66px (#503), and its focus rings
-                  2px inside it, clear of that edge. */}
+                  the row's bottom edge, which is why a phone's row is 66px (#503). */}
               {(sheet.sub || sheet.slot) && (
                 <div className="flex items-center text-xs text-muted-foreground">
                   {sheet.sub}
-                  {sheet.slot && <SlotMenu key={sheet.slot.id} s={sheet.slot} ask={setAsking} className="-my-3 ml-auto grid focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-ring" />}
+                  {sheet.slot && <SlotMenu key={sheet.slot.id} s={sheet.slot} ask={setAsking} className="-my-3 ml-auto grid" />}
                 </div>
               )}
             </div>
+            {/* A phone's row ends in pr-1, sized for a 44px icon key's own blank: last, these keep the
+                title's 16px from the edge (#560). */}
             {sheet.open && (
-              <button onClick={() => openSlot(sheet.open!)} className="inline-flex h-9 shrink-0 items-center gap-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/80">
+              <button onClick={() => openSlot(sheet.open!)} className="inline-flex h-9 shrink-0 items-center gap-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors last:mr-3 hover:bg-primary/80 lg:last:mr-0">
                 打开槽位
                 <ChevronRight className="size-4" />
               </button>
             )}
             {sheet.ws && (
-              <button onClick={() => setMaking(sheet.ws!)} className="inline-flex h-9 shrink-0 items-center gap-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/80">
+              <button onClick={() => setMaking(sheet.ws!)} className="inline-flex h-9 shrink-0 items-center gap-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors last:mr-3 hover:bg-primary/80 lg:last:mr-0">
                 <Plus className="size-4" />
                 新槽位
               </button>
@@ -1318,7 +1325,7 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
             )}
           </div>
           {body && (
-            <div data-body className={cn("min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4", !sheetH && !dragging && "hidden lg:block")}>
+            <div {...scroller} data-body className={cn("card-scroll edge-fade-y min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4", !sheetH && !dragging && "hidden lg:block")}>
               {sheet.body}
             </div>
           )}

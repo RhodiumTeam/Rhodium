@@ -2,7 +2,7 @@
 // what only a browser shows, against rhodium's board serving a store the tests write to. They run on
 // the Chromium playwright-core finds in its cache (~/.cache/ms-playwright), and are skipped without it.
 import { afterAll, beforeAll, expect, onTestFinished, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, devices, type Locator, type Page, type Route } from "playwright-core";
@@ -11,7 +11,7 @@ import type { RhReply } from "../src/router";
 import { loadConfig } from "../src/config";
 import { openStore, type Slot } from "../src/store";
 import { call, installFakeHerdr, startFakeHerdr } from "./fake-herdr/fake-herdr";
-import { BOARD_LOGIN, run, until } from "./instance";
+import { BOARD_LOGIN, run, settles, until } from "./instance";
 
 // Without playwright's own SIGTERM handler, which only closes the browsers: timeout's SIGTERM ends a
 // run that is stuck (#277).
@@ -103,9 +103,15 @@ afterAll(async () => {
   rmSync(base, { recursive: true, force: true });
 });
 
-/** The page at hash on an Android phone, or on device, with your login as tailscale serve adds it. */
+/** The page at hash on an Android phone, or on device, with your login as tailscale serve adds it.
+ *  It closes when the test ends: pages left open pile up until the file outgrows its memory cap. */
 async function open(hash = "", before?: (page: Page) => Promise<void>, device = devices["Pixel 7"]) {
   const context = await browser!.newContext({ ...device, extraHTTPHeaders: { "Tailscale-User-Login": BOARD_LOGIN } });
+  // A /api/topology route may be fetching as the context closes; unrouting first keeps that from failing the file.
+  onTestFinished(async () => {
+    for (const p of context.pages()) await p.unrouteAll({ behavior: "ignoreErrors" });
+    await context.close();
+  });
   const page = await context.newPage();
   page.setDefaultTimeout(5_000);
   await before?.(page);
@@ -163,7 +169,96 @@ smoke("#255: on a phone the chat's top bar buttons take a 44px tap: back, 拓扑
   await big(page, "返回");
 });
 
-smoke("story 252: 详情 opens at the newest event; scrolled to the top it brings the ones before without moving, back to the first", async () => {
+smoke("#616: on a phone 详情 ends as far from the screen's right edge as your bubbles do", async () => {
+  const page = await open(`/slot/${talks}`);
+  const said = page.getByRole("log", { name: "对话" }).getByText("q59", { exact: true });
+  await said.waitFor();
+  const bubble = await said.evaluate((n) => n.closest(".rounded-2xl")!.getBoundingClientRect().right);
+  const pill = (await page.getByRole("button", { name: "详情", exact: true }).locator("span").boundingBox())!;
+  expect(pill.x + pill.width).toBe(bubble);
+  // And it stands as far from ⋯ as the icons do from each other.
+  const [graph, more] = await Promise.all(["拓扑图", "更多"].map(async (name) => (await page.getByRole("button", { name, exact: true }).locator("span").first().boundingBox())!));
+  expect(pill.x - (more!.x + more!.width)).toBe(more!.x - (graph!.x + graph!.width));
+});
+
+smoke("#616: renaming a slot in the terminal on the narrowest phone keeps its agent's logo and the whole box in the title; a long workspace name gives way to the box", async () => {
+  // A terminal slot's bar holds one button more, 对话记录: its title is the narrowest.
+  const [slot, other, far] = store.tx((tx) => {
+    const id = tx.insert("slot", { workspace: ws, name: "renamed-in-the-terminal", dir: "/w", mode: "tui", state: "idle", lifetime: "longterm", herdrPane: "nowhere", tuiPid: 1 }).id;
+    tx.update("slot", { id }, { conversation: tx.insert("conversation", { slot: id, agent: "claude", sessionId: "t616", startedAt: Date.now() }).id });
+    const other = tx.insert("workspace", { name: "orchardvalley", dir: "/o" }).id;
+    return [id, other, tx.insert("slot", { workspace: other, name: "pebble", dir: "/o", mode: "headless", state: "idle", lifetime: "longterm" }).id];
+  });
+  const rename = async (page: Page) => {
+    await page.getByRole("button", { name: "更多", exact: true }).click();
+    await page.getByRole("menuitem", { name: "改名" }).click();
+    const box = page.getByRole("textbox", { name: "槽位名" });
+    await box.waitFor();
+    return box;
+  };
+  try {
+    // The workspace shrinks well before the box does: the box keeps its 96px, give or take a fraction, a short name whole in it.
+    const wide = (await (await rename(await open(`/slot/${far}`))).boundingBox())!;
+    expect(Math.round(wide.width)).toBeGreaterThanOrEqual(96);
+    const box = await rename(await open(`/slot/${slot}`, undefined, { ...devices["Pixel 7"], viewport: { width: 360, height: 780 } }));
+    // Scrolled to show the box, the title would hide the logo, and keep it hidden after.
+    const { scrolled, past, ring } = await box.evaluate((n) => {
+      const h2 = n.closest("h2")!;
+      const cs = getComputedStyle(n);
+      return { scrolled: h2.scrollLeft, past: n.getBoundingClientRect().right - h2.getBoundingClientRect().right, ring: parseFloat(cs.outlineOffset) + parseFloat(cs.outlineWidth) };
+    });
+    expect(scrolled).toBe(0);
+    expect(past).toBeLessThanOrEqual(0);
+    // As tall as the title, the box has its focus ring drawn inside it, where the title clips none of it.
+    expect(ring).toBeLessThanOrEqual(0);
+  } finally {
+    store.tx((tx) => (tx.delete("slot", { id: slot }), tx.delete("slot", { id: far }), tx.delete("workspace", { id: other })));
+  }
+});
+
+smoke("#644: 改名 opens with the name all picked, shown from its start, the focus ring whole around it; still all picked, a box resized shows the start again; once you move in it, where you are stays", async () => {
+  const slot = store.tx((tx) => tx.insert("slot", { workspace: ws, name: "quill-and-a-much-longer-name", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id);
+  try {
+    const page = await open(`/slot/${slot}`, undefined, { ...devices["Pixel 7"], viewport: { width: 360, height: 780 } });
+    await page.getByRole("button", { name: "更多", exact: true }).click();
+    await page.getByRole("menuitem", { name: "改名" }).click();
+    const box = page.getByRole("textbox", { name: "槽位名" });
+    await box.waitFor();
+    // All picked, and how far it is scrolled.
+    const where = () => box.evaluate((n: HTMLInputElement): [boolean, number] => [n.selectionStart === 0 && n.selectionEnd === n.value.length, n.scrollLeft]);
+    await settles(where, [true, 0], 1_000);
+    // The ring as drawn: its top, over the picked name, the colour of its left side, clear of the name.
+    const png = await page.screenshot();
+    const [top, left] = await box.evaluate(async (el, src) => {
+      const img = Object.assign(new Image(), { src });
+      await img.decode();
+      const g = Object.assign(document.createElement("canvas"), { width: img.width, height: img.height }).getContext("2d")!;
+      g.drawImage(img, 0, 0);
+      const [r, d] = [el.getBoundingClientRect(), devicePixelRatio];
+      const at = (x: number, y: number) => [...g.getImageData(Math.round(x * d), Math.round(y * d), 1, 1).data.slice(0, 3)];
+      return [at(r.left + r.width / 2, r.top + 2), at(r.left + 2, r.top + r.height / 2)];
+    }, `data:image/png;base64,${png.toString("base64")}`);
+    expect(top!.map((c, i) => Math.abs(c - left![i]!) <= 2)).toEqual([true, true, true]);
+
+    // Picked all again, the browser shows its end; a wider box, its start.
+    await box.press("Home");
+    await box.press("Shift+End");
+    expect((await where())[1]).toBeGreaterThan(0);
+    await page.setViewportSize({ width: 412, height: 780 });
+    await settles(where, [true, 0], 1_000);
+    // Moved to its end, you are editing: a narrower box leaves it where it is.
+    await box.press("End");
+    const end = (await where())[1];
+    expect(end).toBeGreaterThan(0);
+    await page.setViewportSize({ width: 360, height: 780 });
+    await page.evaluate(() => new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok))));
+    expect(await where()).toEqual([false, end]);
+  } finally {
+    store.tx((tx) => tx.delete("slot", { id: slot }));
+  }
+});
+
+smoke("story 252: 详情 opens at the newest event, its top fading under the board's thin bar; scrolled to the top it brings the ones before without moving, back to the first", async () => {
   // 60 events, more than a page: the first ten come only once you scroll up.
   store.tx((tx) => {
     for (let i = 0; i < 60; i++) tx.append({ source: "rh", type: "slot_renamed", slot: talks, data: { n: i } });
@@ -181,10 +276,163 @@ smoke("story 252: 详情 opens at the newest event; scrolled to the top it bring
   await nth(59).waitFor({ state: "attached" });
   await until(async () => (await toEnd()) < 1);
   expect(await nth(0).count()).toBe(0);
+  // As the timeline's above it: no arrows on its bar, and its top fades while there is more above.
+  expect(await log.evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("auto");
+  await until(async () => (await fadesY(log)).join() === "32,0");
   // In one go: the page before may come in as soon as the scroll is told.
   const [top, first] = await log.evaluate((el) => ((el.scrollTop = 0), [el.querySelectorAll("li")[0]!.getBoundingClientRect().top, el.querySelectorAll("li")[0]!.textContent] as const));
   await nth(0).waitFor({ state: "attached" });
   expect(await log.evaluate((el, text) => [...el.querySelectorAll("li")].find((li) => li.textContent === text)!.getBoundingClientRect().top, first)).toBeCloseTo(top, 0);
+});
+
+smoke("story 588: a conversation previewed in the timeline brings the pages before as you scroll to its top, back to the first thing said", async () => {
+  const page = await open(`/slot/${talks}`);
+  // A phone's chat keeps the browser's thin bar, which floats over the text (#630).
+  expect(await page.getByRole("log", { name: "对话" }).evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("thin");
+  await page.getByRole("button", { name: "详情" }).click();
+  await page.getByText("时间线").click();
+  await page.getByRole("dialog").getByRole("button", { name: /q0/ }).click();
+  const log = page.getByRole("dialog").getByRole("log", { name: "预览" });
+  // 120 things said: the newest page has the last of them, not the first.
+  await log.getByText("a59", { exact: true }).waitFor();
+  const first = log.getByText("q0", { exact: true });
+  expect(await first.count()).toBe(0);
+  // In the chat's 详情 too, the timeline's scroller has the board's round bar with no arrows.
+  expect(await log.locator("xpath=ancestor::details").evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("auto");
+  await until(async () => (await log.evaluate((el) => void (el.scrollTop = 0)), (await first.count()) > 0));
+});
+
+/** Whether what l finds is whole inside the box of the scroller in, the fades at its ends left clear. */
+const shownIn = async (l: Locator, scroller: Locator) => {
+  const [r, s, [top, bottom]] = [(await l.boundingBox())!, (await scroller.boundingBox())!, await fadesY(scroller)];
+  return r.y >= s.y + top! && r.y + r.height <= s.y + s.height - bottom!;
+};
+
+smoke("story 231, #637: on a phone, a preview opened in the half-height sheet is scrolled into view, down to its newest lines, its row with it", async () => {
+  // The height Chrome leaves a Pixel 7 under its address bar: the sheet's half has no room below the row.
+  const page = await open(`/topology/slot/${talks}`, undefined, { ...devices["Pixel 7"], viewport: { width: 412, height: 740 } });
+  const sheet = sheetOf(page);
+  await sheet.getByRole("button", { name: "展开详情" }).click();
+  await page.waitForTimeout(400);
+  await sheet.getByRole("button", { name: /q0/ }).click();
+  const log = sheet.getByRole("log", { name: "预览" });
+  await log.getByText("a59", { exact: true }).waitFor();
+  const box = (await log.boundingBox())!;
+  expect(box.y + box.height).toBeLessThanOrEqual(page.viewportSize()!.height);
+  // Its row whole above it, in the sheet (#637).
+  expect(await shownIn(sheet.getByRole("button", { name: /q0/ }), page.locator("[data-body]"))).toBe(true);
+});
+
+smoke("#637: a preview with room in the details but not with its row above it is made shorter, the two whole in view, in the topology's details and in the chat's", async () => {
+  // Heights where a full-height preview fits with the gap under it, its row with it does not.
+  const page = await open(`/topology/slot/${talks}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 565 } });
+  const row = sheetOf(page).getByRole("button", { name: /q0/ });
+  await row.click();
+  const log = sheetOf(page).getByRole("log", { name: "预览" });
+  await log.getByText("a59", { exact: true }).waitFor();
+  const body = page.locator("[data-body]");
+  expect([await shownIn(row, body), await shownIn(log, body)]).toEqual([true, true]);
+  const chat = await open(`/slot/${talks}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 600 } });
+  await chat.getByRole("button", { name: "详情" }).click();
+  await chat.getByText("时间线").click();
+  const crow = chat.getByRole("dialog").getByRole("button", { name: /q0/ });
+  await crow.click();
+  const clog = chat.getByRole("dialog").getByRole("log", { name: "预览" });
+  await clog.getByText("a59", { exact: true }).waitFor();
+  const timeline = chat.getByRole("dialog").locator("details", { hasText: "时间线" });
+  expect([await shownIn(crow, timeline), await shownIn(clog, timeline)]).toEqual([true, true]);
+});
+
+smoke("#637: an open preview follows the details as they change size, scrolled back in should it grow out of them or they shrink from under it, its row to their top should it not fit", async () => {
+  // Its row low in the details, little under it: the slot has one above and two under it.
+  const [deep, low, conversation] = store.tx((tx) => {
+    const deep = tx.insert("workspace", { name: "deep", dir: "/w" }).id;
+    const slot = (name: string, parent?: string) => tx.insert("slot", { workspace: deep, name, dir: "/w", mode: "headless", state: "idle", lifetime: "longterm", parent }).id;
+    const low = slot("low", slot("high"));
+    for (const name of ["under1", "under2"]) slot(name, low);
+    const conversation = tx.insert("conversation", { slot: low, agent: "pi", sessionId: "t-low", startedAt: Date.now() }).id;
+    tx.update("slot", { id: low }, { conversation });
+    return [deep, low, conversation];
+  });
+  onTestFinished(() => store.tx((tx) => (tx.delete("slot", { workspace: deep }), tx.delete("workspace", { id: deep }), tx.delete("conversation", { id: conversation }))));
+  writeFileSync(join(talked, "../2026-10-23_t-low.jsonl"), said("user", "d0") + said("assistant", "d1"));
+  const page = await open(`/topology/slot/${low}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 555 } });
+  const row = sheetOf(page).getByRole("button", { name: /d0/ });
+  await row.click();
+  const log = sheetOf(page).getByRole("log", { name: "预览" });
+  await log.getByText("d1", { exact: true }).waitFor();
+  // Taller, the details hold all of it with the preview as short as it was, and go back to their top;
+  // the preview grown would end below them.
+  await page.setViewportSize({ width: 1280, height: 760 });
+  const body = page.locator("[data-body]");
+  await until(async () => (await shownIn(log, body)) && (await shownIn(row, body)));
+  // Shorter at once, its row high enough: the preview shortened to fit and scrolled back in whole.
+  await page.setViewportSize({ width: 1280, height: 555 });
+  await until(async () => (await shownIn(log, body)) && (await shownIn(row, body)));
+  // Back to the top, then too short for the preview: its row, left in the bottom fade, goes to the top.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await until(() => body.evaluate((el) => el.scrollTop === 0));
+  await page.setViewportSize({ width: 1280, height: 470 });
+  await until(() => shownIn(row, body));
+});
+
+smoke("#637: a preview scrolled away from by hand is left there as the details change size", async () => {
+  const page = await open(`/slot/${talks}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 600 } });
+  await page.getByRole("button", { name: "详情" }).click();
+  await page.getByText("时间线").click();
+  await page.getByRole("dialog").getByRole("button", { name: /q0/ }).click();
+  const log = page.getByRole("dialog").getByRole("log", { name: "预览" });
+  await log.getByText("a59", { exact: true }).waitFor();
+  const timeline = page.getByRole("dialog").locator("details", { hasText: "时间线" });
+  const preview = log.locator("xpath=ancestor::div[contains(@class, 'lg:h-80')]");
+  const was = (await preview.boundingBox())!.height;
+  // Back to the top, its scroll told; then a taller window, the preview growing below them.
+  await timeline.evaluate((el) => new Promise((ok) => ((el.scrollTop = 0), requestAnimationFrame(() => requestAnimationFrame(ok)))));
+  await page.setViewportSize({ width: 1280, height: 620 });
+  await until(async () => (await preview.boundingBox())!.height > was);
+  expect(await timeline.evaluate((el) => el.scrollTop)).toBe(0);
+});
+
+smoke("#637: a preview the details can grow to hold is not shortened", async () => {
+  // Only its row in the details, the card as tall as what it holds and room under it.
+  const [lone, alone, conversation] = store.tx((tx) => {
+    const lone = tx.insert("workspace", { name: "lone", dir: "/w" }).id;
+    const alone = tx.insert("slot", { workspace: lone, name: "alone", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
+    const conversation = tx.insert("conversation", { slot: alone, agent: "pi", sessionId: "t-alone", startedAt: Date.now() }).id;
+    tx.update("slot", { id: alone }, { conversation });
+    return [lone, alone, conversation];
+  });
+  onTestFinished(() => store.tx((tx) => (tx.delete("slot", { workspace: lone }), tx.delete("workspace", { id: lone }), tx.delete("conversation", { id: conversation }))));
+  writeFileSync(join(talked, "../2026-10-23_t-alone.jsonl"), said("user", "e0") + said("assistant", "e1"));
+  const page = await open(`/topology/slot/${alone}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } });
+  await sheetOf(page).getByRole("button", { name: /e0/ }).click();
+  const log = sheetOf(page).getByRole("log", { name: "预览" });
+  await log.getByText("e1", { exact: true }).waitFor();
+  expect((await log.locator("xpath=ancestor::div[contains(@class, 'lg:h-80')]").boundingBox())!.height).toBe(320);
+});
+
+smoke("#611: in a wide window too short for a preview, the row opened goes to the top of the details, under its fade, to fold it from, the preview under it, not shortened", async () => {
+  const page = await open(`/topology/slot/${talks}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 530 } });
+  const row = sheetOf(page).getByRole("button", { name: /q0/ });
+  await row.click();
+  const log = sheetOf(page).getByRole("log", { name: "预览" });
+  await log.getByText("a59", { exact: true }).waitFor();
+  const body = page.locator("[data-body]");
+  expect([await shownIn(row, body), await shownIn(log, body)]).toEqual([true, false]);
+  // Both bars, side by side here, are the board's thin round ones with no arrows (card-scroll), not the browser's.
+  const bars = [sheetOf(page).getByRole("log", { name: "预览" }), page.locator("[data-body]")].map((l) => l.evaluate((el) => getComputedStyle(el).scrollbarWidth));
+  expect(await Promise.all(bars)).toEqual(["auto", "auto"]);
+});
+
+smoke("story 231: a preview closed again leaves the timeline as it was", async () => {
+  const page = await open(`/slot/${talks}`);
+  await page.getByRole("button", { name: "详情" }).click();
+  await page.getByText("时间线").click();
+  const row = page.getByRole("dialog").getByRole("button", { name: /q0/ });
+  await row.click();
+  await page.getByRole("dialog").getByRole("log", { name: "预览" }).getByText("a59", { exact: true }).waitFor();
+  await row.click();
+  expect(await row.getAttribute("aria-expanded")).toBe("false");
 });
 
 smoke("story 209: on a wide screen a slot's chat is to the right of the board, the line between them dragged to move it; on a phone the chat has the screen to itself", async () => {
@@ -1062,7 +1310,7 @@ smoke("stories 342, 355: the top bar's switch shows the chat and back, Herdr att
   await page.context().close();
 });
 
-smoke("story 355: on a phone, the chat shown in place of the terminal has the box under it and no keys; what it sends goes to the pane still attached, one paste, then Enter on its own", async () => {
+smoke("story 355, #576: on a phone, the chat shown in place of the terminal has the box under it and no keys, the box keeping its edge focused; what it sends goes to the pane still attached, one paste, then Enter on its own", async () => {
   const page = await open(`/slot/${term}`);
   const { terminal, got, texts } = await typing(page);
   await page.getByRole("button", { name: "对话记录", exact: true }).click();
@@ -1074,6 +1322,11 @@ smoke("story 355: on a phone, the chat shown in place of the terminal has the bo
   // Under the chat, clear of the screen's edge.
   const [under, at] = [(await chat.boundingBox())!, (await box.boundingBox())!];
   expect(at.y).toBeGreaterThanOrEqual(under.y + under.height - 1);
+  const edge = () => box.locator("xpath=..").evaluate((e) => getComputedStyle(e).borderTopColor);
+  const rest = await edge();
+  await box.focus();
+  await page.waitForTimeout(250);
+  expect(await edge()).toBe(rest);
   await box.fill("读完了");
   await page.getByRole("button", { name: "发送" }).click();
   await until(async () => (await texts()).length === 2);
@@ -1320,7 +1573,7 @@ smoke("story 376: on a phone a tap beside a Bot's thin line focuses it, one on i
   // Bot q, its private chat 我 following its default, w/finished: over what the store has, which has no bots.
   const page = await open("/topology", async (p) => {
     await p.route("**/api/topology", async (route) => {
-      const g = await (await route.fetch()).json();
+      const g = await (await route.fetch({ maxRetries: 1 })).json();
       const bots = [{ id: "q", name: "q", platform: "qq", main: true, conn: "online", target: finished, avatar: `data:image/png;base64,${PIXEL}` }];
       await route.fulfill({ json: { ...g, bots, chats: [{ id: "c1", bot: "q", kind: "private", yours: true, name: "我", main: true, avatar: `data:image/png;base64,${PIXEL}`, verbose: false }], bindings: [{ chat: "c1", slot: finished, use: false }] } });
     });
@@ -1564,7 +1817,8 @@ smoke("#498: a code block is one box, its language, if the fence has one, in a s
   expect(await log.locator('[data-streamdown="code-block-header"]').count()).toBe(0);
   await log.getByText("ts", { exact: true }).waitFor();
   expect([await over(first), await over(second)]).toEqual([0, 0]);
-  await log.getByRole("button", { name: "复制" }).first().click();
+  // The block's own, not the message's under it (story 571).
+  await first.locator("..").getByRole("button", { name: "复制" }).click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(ts);
   const wraps = log.getByRole("button", { name: "自动换行" });
   expect(await wraps.count()).toBe(2);
@@ -1590,6 +1844,92 @@ const saying = (name: string, text: string) => {
   writeFileSync(join(talked, `../2026-10-23_t-${name}.jsonl`), said("user", "how") + said("assistant", text));
   return slot;
 };
+
+smoke("stories 561, 562, 565: an rh send to you shows its words and picture under its fold, folded; a picture gone keeps its box; a picture you send shows as big while it waits as once sent, then as its preview, which opens the viewer, its download the picture itself; back closes it, the chat still there", async () => {
+  const one = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
+  const [chart, shot] = await Promise.all([new Bun.Image(one).resize(800, 450).png().bytes(), new Bun.Image(one).resize(600, 1300).jpeg().bytes()]);
+  const hash = (data: Uint8Array) => new Bun.CryptoHasher("sha256").update(data).digest("hex");
+  const media = join(base, "state/media");
+  mkdirSync(media, { recursive: true });
+  writeFileSync(join(media, hash(chart)), chart);
+  const slot = saying("pics", "看看");
+  const transcript = join(talked, "../2026-10-23_t-pics.jsonl");
+  const line = (message: unknown) => JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message }) + "\n";
+  const bash = (id: string, command: string) => line({ role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: { command } }] }) + line({ role: "toolResult", toolCallId: id, content: [{ type: "text", text: "ok" }], isError: false });
+  const lost = line({ role: "user", content: [{ type: "text", text: `[来自 网页]\n[图片] ${join(media, "0".repeat(64))}` }] });
+  appendFileSync(transcript, lost + bash("c1", "rh send me --file chart.png 测试过了") + bash("c2", "ls"));
+  store.tx((tx) => tx.append({ source: "rh", type: "send_me", slot, data: { files: [{ kind: "image", hash: hash(chart), name: "chart.png" }] } }));
+  const page = await open(`/slot/${slot}`);
+  const log = page.getByRole("log", { name: "对话" });
+  // One gone from the media dir: a box as big as the one it showed in first, bordered as the others.
+  const gone = log.getByText("图片已清理");
+  await gone.waitFor();
+  expect(await gone.evaluate((e: HTMLElement) => [e.offsetWidth, e.offsetHeight, getComputedStyle(e).borderTopWidth])).toEqual([160, 160, "1px"]);
+  await log.getByText("测试过了", { exact: true }).waitFor();
+  await log.getByRole("button", { name: "图片" }).waitFor();
+
+  await page.locator('input[type="file"]').setInputFiles({ name: "shot.jpg", mimeType: "image/jpeg", buffer: Buffer.from(shot) });
+  await page.getByRole("button", { name: "发送" }).click();
+  // Waiting for the record, it shows as big as once it is there: the page does not jump.
+  const waiting = log.getByRole("img", { name: "shot.jpg" });
+  await until(async () => ((await waiting.boundingBox())?.height ?? 0) > 100);
+  const before = (await waiting.boundingBox())!;
+  // The board kept it by its content; the agent's record has your message with its line, as Rhodium wrote it.
+  await until(() => existsSync(join(media, hash(shot))));
+  appendFileSync(transcript, line({ role: "user", content: [{ type: "text", text: `[来自 网页]\n[图片] ${join(media, hash(shot))}` }] }));
+  const pictures = log.getByRole("button", { name: "图片" });
+  await until(async () => (await pictures.count()) === 2);
+  const after = (await pictures.last().boundingBox())!;
+  expect([Math.abs(after.width - before.width), Math.abs(after.height - before.height)].every((d) => d < 2)).toBe(true);
+  await pictures.last().click();
+  const viewer = page.getByRole("dialog", { name: "图片" });
+  await viewer.waitFor();
+  const download = viewer.getByRole("link", { name: "下载原图" });
+  expect([await download.getAttribute("href"), await download.getAttribute("download")]).toEqual([`api/media?h=${hash(shot)}`, `${hash(shot)}.jpeg`]);
+  await page.goBack();
+  await viewer.waitFor({ state: "detached" });
+  expect(new URL(page.url()).hash).toBe(`#/slot/${slot}`);
+  await log.getByText("测试过了", { exact: true }).waitFor();
+});
+
+smoke("story 563: a picture the agent read shows in its call's result, with no empty box for the text it had none of, nor for a command that printed nothing; tapped, the viewer", async () => {
+  const one = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
+  const shot = await new Bun.Image(one).resize(600, 400).png().bytes();
+  const slot = saying("looked", "看看");
+  const line = (message: unknown) => JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message }) + "\n";
+  const read = line({ role: "assistant", content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "/w/shot.png" } }] });
+  const result = line({ role: "toolResult", toolCallId: "r1", content: [{ type: "image", data: Buffer.from(shot).toString("base64"), mimeType: "image/png" }], isError: false });
+  const touch = line({ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "touch seen" } }] }) + line({ role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "" }], isError: false });
+  appendFileSync(join(talked, "../2026-10-23_t-looked.jsonl"), read + result + touch + said("assistant", "是一张图"));
+  const page = await open(`/slot/${slot}`);
+  const log = page.getByRole("log", { name: "对话" });
+  await log.locator("summary").first().click();
+  for (const step of await log.locator("details details > summary").all()) await step.click();
+  await log.locator("details details").first().getByRole("button", { name: "图片" }).click();
+  expect(await log.locator("details details pre").count()).toBe(2); // their arguments' alone
+  await page.getByRole("dialog", { name: "图片" }).waitFor();
+});
+
+smoke("#588: a picture and a file sent alone that failed are both red; a picture the chat will show as a file shows as one while it waits", async () => {
+  answer = async () => ({ ok: false, error: "" });
+  try {
+    const page = await open(`/slot/${rests}`);
+    await page.locator('input[type="file"]').setInputFiles([
+      { name: "a.png", mimeType: "image/png", buffer: Buffer.from(PIXEL, "base64") },
+      { name: "b.heic", mimeType: "image/heic", buffer: Buffer.from("x") },
+    ]);
+    await page.getByRole("button", { name: "发送" }).click();
+    const retry = page.getByRole("button", { name: "重试" });
+    await retry.waitFor();
+    const log = page.getByRole("log", { name: "对话" });
+    expect(await log.getByRole("img", { name: "b.heic" }).count()).toBe(0);
+    const red = await retry.evaluate((e) => getComputedStyle(e).color);
+    const borders = [log.getByRole("img", { name: "a.png" }), log.getByText("b.heic").locator("..")].map((l) => l.evaluate((e) => getComputedStyle(e).borderTopColor));
+    expect(await Promise.all(borders)).toEqual([red, red]);
+  } finally {
+    answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+  }
+});
 
 smoke("#507: a code block whose fence names no language says text over it", async () => {
   const page = await open(`/slot/${saying("plain", "```\nhello\n```")}`);
@@ -1654,8 +1994,96 @@ smoke("#507: wrapped, a line keeps its indent as far as the box goes, and its co
   const ch = await pre.evaluate((el) => Object.assign(document.createElement("canvas").getContext("2d")!, { font: getComputedStyle(el).font }).measureText("0").width);
   expect(Math.abs(two[0]! - one[0]! - 16 * ch)).toBeLessThanOrEqual(1);
   expect(await over(pre)).toBe(0);
-  await log.getByRole("button", { name: "复制" }).click();
+  await pre.locator("..").getByRole("button", { name: "复制" }).click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(ts);
+});
+
+/** A chat of two things you said and two the agent said, the first in Markdown, your first with a picture's line. */
+const twice = (name: string) => {
+  const slot = saying(name, "**第一段**");
+  const hash = "0".repeat(64);
+  writeFileSync(join(talked, `../2026-10-23_t-${name}.jsonl`), said("user", `看看这张图\n[图片] /w/state/media/${hash}`) + said("assistant", "**第一段**") + said("user", "再说") + said("assistant", "第二段"));
+  return slot;
+};
+/** How opaque the row l, a key, is in, once it stopped fading. */
+const opacity = (l: Locator) => l.evaluate(async (el) => (await Promise.all(el.parentElement!.getAnimations().map((a) => a.finished)), getComputedStyle(el.parentElement!).opacity));
+
+smoke("stories 571-573: on a phone each thing the agent said has 复制 and 引用 under it, yours 复制 alone; 复制 copies it as written, yours without its picture's line; 引用 puts it over where you type, another 引用 in its place, × takes it off; sent, it goes first and is gone", async () => {
+  const slot = twice("quoting");
+  const page = await open(`/slot/${slot}`, (page) => page.context().grantPermissions(["clipboard-read", "clipboard-write"]));
+  const log = page.getByRole("log", { name: "对话" });
+  await log.getByText("第二段", { exact: true }).waitFor();
+  const [copies, quotes] = [log.getByRole("button", { name: "复制", exact: true }), log.getByRole("button", { name: "引用", exact: true })];
+  expect([await copies.count(), await quotes.count()]).toEqual([4, 2]);
+  expect([await opacity(copies.first()), await opacity(quotes.first())]).toEqual(["1", "1"]);
+  await copies.nth(1).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("**第一段**");
+  await copies.first().click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("看看这张图");
+
+  const bar = page.getByText(/^引用：/);
+  await quotes.first().click();
+  // Its Markdown marks gone, as you read it; the agent still gets them (below).
+  expect(await bar.textContent()).toBe("引用：第一段");
+  await quotes.nth(1).click();
+  expect([await bar.count(), await bar.textContent()]).toEqual([1, "引用：第二段"]);
+  await page.getByRole("button", { name: "取消引用" }).click();
+  await bar.waitFor({ state: "detached" });
+
+  await quotes.nth(1).click();
+  await page.getByRole("textbox", { name: "消息" }).fill("那第二处呢");
+  // Not sent, it stays with the slot, as its words do.
+  const go = async (id: string, name: string) => (await page.evaluate((id) => (location.hash = `#/slot/${id}`), id), await page.getByRole("heading", { name }).waitFor());
+  await go(finished, "w/finished");
+  await go(slot, "w/quoting");
+  expect(await bar.textContent()).toBe("引用：第二段");
+  const n = acted.length;
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await until(() => acted.length === n + 1);
+  expect(acted.at(-1)!.act).toEqual({ kind: "say", slot, text: "> 第二段\n\n那第二处呢" });
+  await bar.waitFor({ state: "detached" });
+});
+
+smoke("story 571: on a computer, with the mouse on no message only the agent's last has 复制 and 引用 showing; on one, its own show too, and so do those a key reaches; hidden or not, they sit in the gap under it, not a row of their own", async () => {
+  const page = await open(`/slot/${twice("hovering")}`, undefined, { viewport: { width: 1440, height: 900 } } as (typeof devices)[string]);
+  const log = page.getByRole("log", { name: "对话" });
+  await log.getByText("第二段", { exact: true }).waitFor();
+  const [copies, quotes] = [log.getByRole("button", { name: "复制", exact: true }), log.getByRole("button", { name: "引用", exact: true })];
+  await page.mouse.move(1, 1);
+  expect([await opacity(copies.first()), await opacity(quotes.first()), await opacity(quotes.last())]).toEqual(["0", "0", "1"]);
+  await log.getByText("第一段", { exact: true }).hover();
+  expect([await opacity(copies.first()), await opacity(quotes.first())]).toEqual(["0", "1"]);
+  // From its words' bottom to the next block, at most 8px over the chat's 16px gap, its icons clear of both.
+  const gap = await quotes.first().evaluate((key) => {
+    const said = key.closest(".group")!, words = said.querySelector("p")!.getBoundingClientRect(), next = said.nextElementSibling!.getBoundingClientRect(), icon = key.querySelector("svg")!.getBoundingClientRect();
+    return { space: next.top - words.bottom, above: icon.top - words.bottom, below: next.top - icon.bottom };
+  });
+  expect(gap.space).toBeLessThanOrEqual(24);
+  expect([gap.above, gap.below].every((x) => x >= 2)).toBe(true);
+  await page.mouse.move(1, 1);
+  await page.keyboard.press("Shift");
+  await copies.first().focus();
+  expect(await opacity(copies.first())).toBe("1");
+});
+
+smoke("story 573: on a computer, a long quote does not stretch a short reply's bubble; cut to it, it still shows how it starts; on a screen too narrow for that, it stays inside the bubble", async () => {
+  const slot = saying("short", "好");
+  writeFileSync(join(talked, `../2026-10-23_t-short.jsonl`), said("user", `> ${"一段很长的回复，".repeat(30)}\n\n嗯`) + said("assistant", "好"));
+  /** On a screen width wide, the quote's bubble, how much of the quote shows, and how far its line passes the bubble's inner right edge. */
+  const measure = async (width: number) => {
+    const page = await open(`/slot/${slot}`, undefined, { viewport: { width, height: 900 } } as (typeof devices)[string]);
+    const quote = page.getByRole("log", { name: "对话" }).getByText(/^一段很长的回复/);
+    await quote.waitFor();
+    return quote.evaluate((el) => {
+      const [line, bubble] = [el.parentElement!, el.parentElement!.parentElement!];
+      const [b, s] = [bubble.getBoundingClientRect(), getComputedStyle(bubble)];
+      return [b.width, el.clientWidth, line.getBoundingClientRect().right - (b.right - parseFloat(s.paddingRight) - parseFloat(s.borderRightWidth))];
+    });
+  };
+  const [bubble, shown] = await measure(1440);
+  expect(bubble).toBeLessThan(300);
+  expect(shown).toBeGreaterThan(120);
+  expect((await measure(280))[2]).toBeLessThanOrEqual(0);
 });
 
 /** How wide the focus ring l draws is, outer edge to outer edge, once still, and the round in it: what its padding leaves. */
@@ -1674,12 +2102,12 @@ const rung = (l: Locator) =>
     return { style: s.outlineStyle, inset: -parseFloat(s.outlineOffset) - parseFloat(s.outlineWidth) };
   });
 
-smoke("#503: a small control reached by Tab rings what you see along its edge, not its 44px tap: 全部槽位's and a code block's 复制's hover round, so inside the block's 28px top row, the send key's round and 更多's and 详情's button, so in their box, 模型和思考强度 and the topology path's 总览, as tall as their row, a little inside them, and 新建槽位's agents a round apart from their group's edge; the topology sheet's 操作 is in the sheet, rung a little inside its edge", async () => {
+smoke("#503: a small control reached by Tab rings what you see along its edge, not its 44px tap: 全部槽位's and a code block's 复制's hover round, so inside the block's 28px top row, the send key's round and 更多's and 详情's button, so in their box, 模型和思考强度 and the topology path's 总览, as tall as their row, a little inside them, 模型和思考强度's words and arrow as far from its ring (#560), and 新建槽位's agents a round apart from their group's edge; the topology sheet's 操作 is in the sheet, rung on its three dots alone (#560)", async () => {
   const page = await open(`/slot/${saying("ring", "```\nhi\n```")}`);
   const log = page.getByRole("log", { name: "对话" });
   await log.getByRole("button", { name: "自动换行" }).focus();
   await page.keyboard.press("Tab");
-  expect(await ringed(log.getByRole("button", { name: "复制" }))).toEqual({ ring: 24, round: 24 });
+  expect(await ringed(log.locator("pre").locator("..").getByRole("button", { name: "复制" }))).toEqual({ ring: 24, round: 24 });
   // Moved there by a script after a key, it shows as reached by a key.
   await page.getByRole("link", { name: "全部槽位" }).focus();
   expect(await ringed(page.getByRole("link", { name: "全部槽位" }))).toEqual({ ring: 36, round: 36 });
@@ -1695,6 +2123,12 @@ smoke("#503: a small control reached by Tab rings what you see along its edge, n
   await claude.keyboard.press("Tab");
   await model.focus();
   expect(await rung(model)).toEqual({ style: "solid", inset: 4 });
+  // Its words' left edge and its arrow's drawn right one, each from the key's edge: the ring is as far in on both sides.
+  const [left, right] = await model.evaluate((el) => {
+    const [r, arrow] = [el.getBoundingClientRect(), el.querySelector(":scope > svg:last-child path")!.getBoundingClientRect()];
+    return [el.firstElementChild!.getBoundingClientRect().left - r.left, r.right - arrow.right];
+  });
+  expect(Math.abs(left - right)).toBeLessThanOrEqual(1);
   // In a box that clips what sticks out: 新建槽位's agents, rung on the round in them, clear of the box's edge.
   await page.getByRole("link", { name: "全部槽位" }).click();
   await page.getByRole("button", { name: "新建", exact: true }).click();
@@ -1707,9 +2141,9 @@ smoke("#503: a small control reached by Tab rings what you see along its edge, n
   await page.keyboard.press("Tab");
   expect(await ringed(agents.nth(1).locator(":scope > span"))).toEqual({ ring: 36, round: 36 });
   expect(await agents.nth(1).evaluate(async (el) => (await Promise.all(el.getAnimations().map((a) => a.finished)), getComputedStyle(el).opacity))).toBe("1");
-  // 操作, its ground the whole 44px, hung on the collapsed sheet's status line: in the sheet, so a key on
-  // it scrolls nothing, and rung a little inside its edge, which is the screen's; so is the path's 总览,
-  // as tall as its row.
+  // 操作, its 44px tap hung on the collapsed sheet's status line: in the sheet, so a key on it scrolls
+  // nothing, and rung on its three dots alone, not as a key beside 打开槽位 lower than it; the path's
+  // 总览, as tall as its row, a little inside its edge.
   const top = await open(`/topology/slot/${finished}`);
   const ops = sheetOf(top).getByRole("button", { name: "操作" });
   await top.keyboard.press("Tab");
@@ -1717,10 +2151,63 @@ smoke("#503: a small control reached by Tab rings what you see along its edge, n
   expect(await sheetOf(top).evaluate((el) => el.scrollTop)).toBe(0);
   const [s, o] = [(await sheetOf(top).boundingBox())!, (await ops.boundingBox())!];
   expect(o.y + o.height).toBeLessThanOrEqual(s.y + s.height);
-  expect(await rung(ops)).toEqual({ style: "solid", inset: 2 });
+  expect(await ops.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe("none");
+  const dots = ops.locator(":scope > span");
+  expect(await rung(dots)).toEqual({ style: "solid", inset: 0 });
+  expect(await dots.evaluate((el) => [el.getBoundingClientRect().width, el.getBoundingClientRect().height])).toEqual([32, 24]);
   const home = top.getByRole("button", { name: "总览" });
   await home.focus();
   expect(await rung(home)).toEqual({ style: "solid", inset: 2 });
+});
+
+smoke("#503: a workspace's name reached by Tab rings its name and arrow, as far from them above as below, clear of its card under it", async () => {
+  const page = await open("", undefined, wide());
+  const w = page.getByRole("button", { name: "w", exact: true });
+  await page.keyboard.press("Tab");
+  await w.focus();
+  expect(await rung(w)).toEqual({ style: "solid", inset: 0 });
+  const [above, below, clear] = await w.evaluate((el) => {
+    const what = document.createRange();
+    what.selectNodeContents(el);
+    const [r, inner] = [el.getBoundingClientRect(), what.getBoundingClientRect()];
+    const card = el.parentElement!.querySelector('a[href^="#/slot/"]')!.parentElement!.parentElement!.getBoundingClientRect();
+    return [inner.top - r.top, r.bottom - inner.bottom, card.top - r.bottom];
+  });
+  expect(Math.abs(above - below)).toBeLessThanOrEqual(1);
+  expect(clear).toBeGreaterThanOrEqual(2);
+});
+
+smoke("#560, #595: on a wide screen the topology sheet's 操作 under a mouse grounds its three dots, as a key rings them, not its 44px; a long name in the path ends in an ellipsis; the card's right edge is the header's, as the settings' card's", async () => {
+  const long = "averyveryverylongslotnamethatgoesonandon";
+  const page = await open(`/topology/slot/${finished}`, async (p) => {
+    await p.route("**/api/topology", async (route) => {
+      const g = await (await route.fetch({ maxRetries: 1 })).json();
+      await route.fulfill({ json: { ...g, slots: g.slots.map((s: { id: string }) => (s.id === finished ? { ...s, name: long } : s)) } });
+    });
+  }, wide());
+  const ops = sheetOf(page).getByRole("button", { name: "操作" });
+  await ops.hover();
+  expect(await ops.evaluate(async (el) => {
+    const dots = el.firstElementChild!;
+    await Promise.all(dots.getAnimations().map((a) => a.finished));
+    return [getComputedStyle(el).backgroundColor, getComputedStyle(dots).backgroundColor !== "rgba(0, 0, 0, 0)"];
+  })).toEqual(["rgba(0, 0, 0, 0)", true]);
+  // What holds the name is a box text-overflow works in, not the flex button, which only clips it.
+  const name = page.getByRole("navigation", { name: "路径" }).getByText(long);
+  expect(await name.evaluate((el) => [getComputedStyle(el).display, getComputedStyle(el).textOverflow, el.scrollWidth > el.clientWidth])).toEqual(["block", "ellipsis", true]);
+  const right = async (l: Locator) => ((b) => Math.round(b.x + b.width))((await l.boundingBox())!);
+  expect(await right(sheetOf(page))).toBe(await right(page.locator("header", { has: page.getByRole("button", { name: "设置" }) })));
+});
+
+smoke("#560: on a phone, 打开槽位 and 新槽位 last in the details' top row, with no key to fold them after, stand as far in from its right edge as the title from its left", async () => {
+  for (const [at, label] of [[`slot/${finished}`, "打开槽位"], [`ws/${ws}`, "新槽位"]]) {
+    const page = await open(`/topology/${at}`);
+    const [right, left] = await sheetOf(page).getByRole("button", { name: label }).evaluate((el) => {
+      const bar = el.parentElement!;
+      return [bar.getBoundingClientRect().right - el.getBoundingClientRect().right, parseFloat(getComputedStyle(bar).paddingLeft)];
+    });
+    expect(right).toBe(left);
+  }
 });
 
 smoke("#502: a table in the agent's message is one box, none around it, narrow or wide; a wide one scrolls inside it with the board's thin round bar, the chat no wider", async () => {
@@ -2197,13 +2684,13 @@ smoke("stories 425, 429: scrolled past a little, the sidebar's buttons shrink to
   /** Where each row is in the list, the scroll taken off. */
   const rows = () => side.evaluate((e) => [...e.querySelectorAll("a")].map((a) => Math.round(a.getBoundingClientRect().top + e.parentElement!.scrollTop)));
   const up = side.getByRole("button", { name: "需要你" });
-  const bar = () => side.evaluate((e) => getComputedStyle(e.parentElement!).scrollbarColor);
+  const bar = () => side.evaluate((e) => getComputedStyle(e.parentElement!, "::-webkit-scrollbar-thumb").backgroundColor);
   await page.mouse.move(1000, 450);
-  const quiet = await bar();
-  expect(quiet).toBe("rgba(0, 0, 0, 0) rgba(0, 0, 0, 0)");
+  expect(await bar()).toBe("rgba(0, 0, 0, 0)");
   await page.mouse.move(100, 450);
-  expect(await bar()).not.toBe(quiet);
-  expect(await page.getByRole("log", { name: "对话" }).evaluate((e) => getComputedStyle(e).scrollbarWidth)).toBe("thin");
+  expect(await bar()).not.toBe("rgba(0, 0, 0, 0)");
+  // The board's thin round bar with no arrows, the chat's too (#630).
+  expect(await page.getByRole("log", { name: "对话" }).evaluate((e) => getComputedStyle(e).scrollbarWidth)).toBe("auto");
 
   await settled(false);
   const was = await rows();
@@ -2741,7 +3228,23 @@ smoke("story 421: on a wide screen the chat's 拓扑图 button puts the topology
   expect(await page.getByRole("button", { name: "拓扑图", exact: true }).getAttribute("aria-pressed")).toBe("true");
 });
 
-smoke("story 422: on a wide screen the list beside a chat is 360px at its narrowest, its header whole in it", async () => {
+/** How far the settings' gear sticks out past the list's cards at the right, with a two-digit round trip; at most 0 where the header fits. */
+async function gearOut(page: Page) {
+  await page.getByRole("link", { name: "状态" }).getByText(/^\d+ms$/).evaluate((e) => (e.textContent = "99ms"));
+  const gear = (await page.getByRole("button", { name: "设置" }).locator("svg").boundingBox())!;
+  const row = (await page.locator('main a[href^="#/slot/"]').first().boundingBox())!;
+  return gear.x + gear.width - (row.x + row.width);
+}
+
+smoke("#635: the board's header fits over the list's cards beside a chat on a 1024px wide screen, the list's bar's room taken, and on a 390px phone", async () => {
+  for (const [hash, device] of [[`/slot/${finished}`, wide(1024)], ["", { ...devices["Pixel 7"], viewport: { width: 390, height: 780 } }]] as const) {
+    const page = await open(hash, undefined, device);
+    await page.locator('main a[href^="#/slot/"]').first().waitFor();
+    expect(await gearOut(page)).toBeLessThanOrEqual(0);
+  }
+});
+
+smoke("story 422: on a wide screen the list beside a chat is 370px at its narrowest, the list's bar's room past a 360px phone's, its header whole in it", async () => {
   const page = await open(`/slot/${finished}`, undefined, { viewport: { width: 1440, height: 900 } } as (typeof devices)[string]);
   await page.getByRole("heading", { name: "w/finished" }).waitFor();
   const line = page.getByRole("separator");
@@ -2751,9 +3254,79 @@ smoke("story 422: on a wide screen the list beside a chat is 360px at its narrow
   await page.mouse.move(50, at.y + at.height / 2, { steps: 5 });
   await page.mouse.up();
   const box = (await line.boundingBox())!;
-  expect(Math.abs(box.x + box.width / 2 - 360)).toBeLessThan(1);
-  // The theme button, the header's last, in the list's room.
-  expect((await page.locator("main header > :last-child").evaluate((b) => b.getBoundingClientRect().right)) - (box.x + box.width / 2)).toBeLessThanOrEqual(0);
+  expect(Math.abs(box.x + box.width / 2 - 370)).toBeLessThan(1);
+  expect(await gearOut(page)).toBeLessThanOrEqual(0);
+});
+
+smoke("#617: on a wide screen the board's header beside a chat is level with the chat's top bar: the same middle, a line under each at the same height, the board's across its side", async () => {
+  for (const hash of [`/slot/${finished}`, `/topology/slot/${finished}?chat`]) {
+    const page = await open(hash, undefined, wide());
+    await page.getByRole("heading", { name: "w/finished" }).waitFor();
+    const [board, chat] = await page.locator("header").evaluateAll((hs) =>
+      hs.map((h) => {
+        // Its line: its own bottom border, or the box's it is drawn in.
+        let lined: Element | null = h;
+        while (lined && getComputedStyle(lined).borderBottomWidth !== "1px") lined = lined.parentElement;
+        // Where it stands with nothing scrolled: the list brings the open slot's row into sight.
+        let up = 0;
+        for (let n = h.parentElement; n; n = n.parentElement) up += n.scrollTop;
+        const first = h.firstElementChild!.getBoundingClientRect();
+        const line = lined?.getBoundingClientRect();
+        return { mid: first.y + up + first.height / 2, line: line && ([line.left, line.right, line.bottom + up] as const) };
+      }),
+    );
+    const side = (await page.getByRole("separator").boundingBox())!;
+    expect(board!.mid).toBe(chat!.mid);
+    expect(board!.line).toEqual([0, side.x + side.width / 2, chat!.line![2]]);
+  }
+});
+
+smoke("#635, #630: on a wide screen the board's header stays atop the list, a chat beside it or not; the list scrolls under its line, with the board's bar with no arrows, and brings a row far down into sight clear of it; its 列表 and 拓扑图 ring inside their round control", async () => {
+  const page = await open("", undefined, wide(1024));
+  const last = page.locator('main a[href^="#/slot/"]').last();
+  await last.waitFor();
+  /** The header's line, where what scrolls the list starts and its bar, the room both keep for the bar,
+   *  so the header stays level with the list as its bar comes, and whether the last row shows whole
+   *  under the line, its card's bottom too. */
+  const at = () =>
+    last.evaluate((row) => {
+      let lined = document.querySelector("main header")!;
+      while (getComputedStyle(lined).borderBottomWidth !== "1px") lined = lined.parentElement!;
+      let list = row.parentElement!;
+      while (list.parentElement && getComputedStyle(list).overflowY !== "auto") list = list.parentElement;
+      const [line, r, card] = [lined.getBoundingClientRect().bottom, row.getBoundingClientRect(), row.parentElement!.parentElement!.getBoundingClientRect()];
+      const gutter = [lined, list].map((e) => `${getComputedStyle(e).overflowY} ${getComputedStyle(e).scrollbarGutter}`);
+      return { line, list: list.getBoundingClientRect().top, bar: getComputedStyle(list).scrollbarWidth, gutter, row: r.top >= line && card.bottom <= innerHeight };
+    });
+  const pinned = { line: 57, list: 57, bar: "auto", gutter: ["hidden stable", "auto stable"], row: true };
+  // The keys that scrolled the window scroll the list, nothing focused or a header's button or link.
+  const top = () => page.evaluate(() => document.querySelector("main")!.lastElementChild!.scrollTop);
+  await page.keyboard.press("PageDown");
+  await until(async () => (await top()) > 0);
+  await page.getByRole("button", { name: "列表" }).click();
+  await page.keyboard.press("End");
+  await settles(at, pinned);
+  // 列表 and 拓扑图 ring inside them, round as the control's corners inside its border: what is outside, it clips.
+  const tabs = page.getByRole("button", { name: /^(列表|拓扑图)$/ });
+  await tabs.first().focus();
+  expect(await rung(tabs.first())).toEqual({ style: "solid", inset: 0 });
+  expect(await tabs.evaluateAll((t) => t.map((e) => getComputedStyle(e).borderRadius))).toEqual(["9px 0px 0px 9px", "0px 9px 9px 0px"]);
+  // The list, opened from Rhodium's page scrolled down, starts at its top, as the window did.
+  const bots = Array.from({ length: 30 }, (_, i) => ({ name: `bot${i}`, platform: "qq", state: "online" }));
+  await page.route("**/api/rhodium", (r) => r.fulfill({ json: { boot: 1, pid: 1, startedAt: Date.now(), unit: null, logs: null, bots } }));
+  // Space on the header's link scrolls it too, as only a button takes Space.
+  await page.getByRole("link", { name: "状态" }).click();
+  await page.getByText("bot29").waitFor();
+  await page.keyboard.press("Space");
+  // Till it stops, as the browser's glide down would go on past 列表 putting the list at its top.
+  await until(async () => (await top()) > 0 && (await top()) === (await Bun.sleep(100), await top()));
+  await page.getByRole("button", { name: "列表" }).click();
+  await last.waitFor();
+  expect(await top()).toBe(0);
+  // Its chat opened by its address, the list beside it brings it into sight.
+  await page.evaluate((h) => (location.hash = h), (await last.getAttribute("href"))!);
+  await page.getByRole("separator").waitFor();
+  await settles(at, pinned);
 });
 
 smoke("story 433: out of room, a full name's workspace gives way first, down to three letters and a \"…\" right before the \"/\"; on a phone, the home and the list beside a chat at its narrowest", async () => {
@@ -3343,6 +3916,35 @@ smoke("#491: a running headless slot's row menu has 停止 first; 切到终端 a
   await page.context().close();
 });
 
+smoke("#647: a row's rename box starts its workspace where the row's logo is, a child's as far in as it is, and goes at most as far right as the row's text: on a phone, on a tablet's wider list and in the sidebar", async () => {
+  const [top, kid] = store.tx((tx) => {
+    const top = tx.insert("slot", { workspace: ws, name: "quill", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
+    return [top, tx.insert("slot", { workspace: ws, name: "ember", parent: top, dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id];
+  });
+  try {
+    for (const [where, hash, device, end] of [["phone", "", devices["Pixel 7"], ""], ["tablet", "", wide(768), ""], ["sidebar", `/slot/${rests}?full`, wide(), "?full"]] as const) {
+      const page = await open(hash, undefined, device);
+      for (const [which, id] of [["top", top], ["kid", kid]] as const) {
+        const row = page.locator(`a[href$="/slot/${id}${end}"]`);
+        await row.click({ button: "right" });
+        await page.getByRole("menuitem", { name: "改名" }).click();
+        const box = page.getByRole("textbox", { name: "槽位名" });
+        const prefix = await box.evaluate((n) => n.previousElementSibling!.getBoundingClientRect().left);
+        const logo = await row.locator(":scope > span").first().evaluate((n) => n.getBoundingClientRect().left);
+        // Where the text inside each ends at the right.
+        const inner = (n: Element) => n.getBoundingClientRect().right - parseFloat(getComputedStyle(n).paddingRight);
+        const ends = (await box.locator("xpath=../..").evaluate(inner)) - (await row.evaluate(inner));
+        expect([where, which, Math.round(prefix - logo), Math.round(ends)]).toEqual([where, which, 0, 0]);
+        await box.press("Escape");
+        await box.waitFor({ state: "detached" });
+        await page.getByRole("menu").waitFor({ state: "detached" });
+      }
+    }
+  } finally {
+    store.tx((tx) => (tx.delete("slot", { id: kid }), tx.delete("slot", { id: top })));
+  }
+});
+
 smoke("#506: a live headless row's menu has 置顶; pinned, the slot is under 置顶's pin by its full name, below what needs you, a line under them, and its menu has 取消置顶", async () => {
   let n = acted.length;
   const sent = async () => (await until(() => acted.length === n + 1), n++, acted.at(-1)!.act);
@@ -3586,7 +4188,7 @@ smoke("story 476: on a computer and a phone the terminal key of an idle slot ask
   }
 });
 
-smoke("story 477: on a computer a control under the mouse shows it: the bar's keys a faint round ground, where you type a darker edge; on a phone, which hovers nothing, none", async () => {
+smoke("stories 477, #576: on a computer a control under the mouse shows it, the bar's keys a faint round ground; on a phone, which hovers nothing, none; where you type keeps its edge, under the mouse or focused", async () => {
   for (const [device, hovers] of [[{ viewport: { width: 1440, height: 900 } } as (typeof devices)[string], true], [devices["Pixel 7"], false]] as const) {
     const page = await open(`/slot/${talks}`, undefined, device);
     const box = page.getByRole("textbox", { name: "消息" });
@@ -3597,7 +4199,7 @@ smoke("story 477: on a computer a control under the mouse shows it: the bar's ke
       ...(await Promise.all(["切到终端", "添加图片或文件", "换 agent"].map((name) => page.getByRole("button", { name, exact: true }).evaluate((e) => getComputedStyle(e).backgroundColor)))),
       await card.evaluate((e) => getComputedStyle(e).borderTopColor),
     ];
-    // Away from it all, and the edge back from the focus colour the page put in the box as it loaded.
+    // Away from it all.
     await page.mouse.move(1, 1);
     await page.waitForTimeout(250);
     const rest = await looks();
@@ -3609,24 +4211,32 @@ smoke("story 477: on a computer a control under the mouse shows it: the bar's ke
     }
     await box.hover();
     await page.waitForTimeout(250);
-    under.push((await looks())[3]);
-    expect([device === devices["Pixel 7"] ? "phone" : "computer", under.map((u, i) => u !== rest[i])]).toEqual([hovers ? "computer" : "phone", under.map(() => hovers)]);
+    const edges = [(await looks())[3]];
+    await box.focus();
+    await page.waitForTimeout(250);
+    edges.push((await looks())[3]);
+    expect([device === devices["Pixel 7"] ? "phone" : "computer", under.map((u, i) => u !== rest[i]), edges]).toEqual([hovers ? "computer" : "phone", under.map(() => hovers), [rest[3], rest[3]]]);
     await page.context().close();
   }
 });
 
-/** Where line id ends on the screen. */
+/** Where line id ends on the screen; null while it is not drawn. */
 const lineEnd = (page: Page, id: string) =>
   page.evaluate((id) => {
-    const p = document.querySelector<SVGPathElement>(`.react-flow__edge[data-id="${id}"] .react-flow__edge-path`)!;
-    const at = p.getPointAtLength(p.getTotalLength()).matrixTransform(p.getScreenCTM()!);
-    return { x: at.x, y: at.y };
+    const p = document.querySelector<SVGPathElement>(`.react-flow__edge[data-id="${id}"] .react-flow__edge-path`);
+    const at = p?.getPointAtLength(p.getTotalLength()).matrixTransform(p.getScreenCTM()!);
+    return at ? { x: at.x, y: at.y } : null;
   }, id);
-/** Whether line id ends at the left of node, at a height inside it. */
-const endsAt = async (page: Page, id: string, node: ReturnType<typeof page.locator>) => {
-  const [end, box] = [await lineEnd(page, id), (await node.boundingBox())!];
-  return Math.abs(end.x - box.x) < 3 && end.y > box.y && end.y < box.y + box.height;
-};
+/** Whether line id comes to end at the left of node, at a height inside it: a line is drawn a frame or
+ *  more after what moved it shows, so this waits for it, as until does (#575). */
+const endsAt = (page: Page, id: string, node: ReturnType<typeof page.locator>) =>
+  until(async () => {
+    const [end, box] = [await lineEnd(page, id), await node.boundingBox()];
+    return !!end && !!box && Math.abs(end.x - box.x) < 3 && end.y > box.y && end.y < box.y + box.height;
+  }).then(
+    () => true,
+    () => false,
+  );
 
 /** Where the topology draws dot k ("s:<start>" or "e:<end>") on the screen. */
 const dotAt = async (page: Page, k: string) => {
@@ -3644,7 +4254,7 @@ const drawn = async (page: Page, id: string) => (await page.locator(`.react-flow
 const editing = (bindings: () => { chat: string; slot: string; use: boolean }[], hash = `/topology/ws/${ws}`, device?: (typeof devices)[string]) =>
   open(hash, async (p) => {
     await p.route("**/api/topology", async (route) => {
-      const g = await (await route.fetch()).json();
+      const g = await (await route.fetch({ maxRetries: 1 })).json();
       const bots = [{ id: "q", name: "q", platform: "qq", main: true, conn: "online", target: finished, avatar: null }];
       const chats = [{ id: "c1", bot: "q", kind: "private", yours: true, name: "我", main: true, avatar: null, verbose: false }];
       if (bindings().some((b) => b.chat === "c2" && b.use)) chats.push({ id: "c2", bot: "q", kind: "private", yours: false, name: "Kai", main: false, avatar: null, verbose: false });
@@ -3673,14 +4283,14 @@ smoke("stories 307, 377, 378, 383, 384, 385, 316, 319: on a phone, editing, a ch
   await atRests.click();
   await page.getByText("改了 1 处").waitFor();
   expect(await endsAt(page, "own:c1", atRests)).toBe(true);
-  expect(await drawn(page, "was:link:c1")).toBe(true);
+  await settles(() => drawn(page, "was:link:c1"), true);
   expect(await page.getByRole("button", { name: "改绑定" }).isDisabled()).toBe(true);
   answer = async () => ((bindings = [{ chat: "c1", slot: rests, use: true }]), { ok: true, text: "已改 1 处。" });
   await page.getByRole("button", { name: "确认" }).click();
   expect(await sent()).toEqual({ kind: "bind", changes: [{ chat: "c1", from: { slot: finished, use: false }, to: rests }] });
   await page.getByText("已改 1 处。").waitFor();
   expect(await endsAt(page, "own:c1", atRests)).toBe(true);
-  expect(await drawn(page, "was:link:c1")).toBe(false);
+  await settles(() => drawn(page, "was:link:c1"), false);
   expect(await page.getByRole("button", { name: "改绑定" }).isDisabled()).toBe(false);
 
   // 撤销 sends it back, from where it went: it follows the default again.
@@ -3697,7 +4307,7 @@ smoke("stories 307, 377, 378, 383, 384, 385, 316, 319: on a phone, editing, a ch
   expect(await endsAt(page, "own:c1", atFinished)).toBe(true);
   await page.getByRole("button", { name: "全部撤销" }).click();
   await page.getByText("改了 1 处").waitFor({ state: "detached" });
-  expect([await drawn(page, "own:c1"), await drawn(page, "link:c1")]).toEqual([false, true]);
+  await settles(async () => [await drawn(page, "own:c1"), await drawn(page, "link:c1")], [false, true]);
 
   // The Bot's title selects its line; its end on a slot moves its default (story 384).
   await node(page, "bot", "q").click({ position: { x: 24, y: 12 } });
@@ -3886,7 +4496,7 @@ smoke("stories 315, 380, 386: a draft changed elsewhere since is red with a mark
   await tapDot(page, `e:${talks}`);
   await tapDot(page, "e:q");
   await page.getByText("改了 1 处").waitFor();
-  expect(await drawn(page, "link:c2")).toBe(true);
+  await settles(() => drawn(page, "link:c2"), true);
   answer = async () => ((bindings = [{ chat: "c1", slot: finished, use: false }, { chat: "c2", slot: finished, use: false }]), { ok: true, text: "已改 1 处。" });
   await page.getByRole("button", { name: "确认" }).click();
   expect(await sent()).toEqual({ kind: "bind", changes: [{ chat: "c2", from: { slot: talks, use: true }, to: null }] });
@@ -3919,7 +4529,8 @@ smoke("stories 379, 385: on a phone, editing, a chat's start picked up and anoth
   // 撤销一步 takes back both.
   await page.getByRole("button", { name: "撤销一步" }).click();
   await page.getByText("改了 2 处").waitFor({ state: "detached" });
-  expect([await drawn(page, "link:c1"), await endsAt(page, "own:c2", atRests)]).toEqual([true, true]);
+  await settles(() => drawn(page, "link:c1"), true);
+  expect(await endsAt(page, "own:c2", atRests)).toBe(true);
 
   // 我 to talks, then swapped with Kai by their dots: 撤销一步 leaves 我 on talks, Kai on rests, which 确认 sends.
   await node(page, "chat", "我").click();
@@ -5092,19 +5703,43 @@ smoke("one queued that fails to go comes back after what you typed meanwhile, wi
     await box.dispatchEvent("keydown", { key: "Escape", isComposing: true, bubbles: true });
     await Bun.sleep(300);
     expect(acted.length).toBe(before);
+
+    // #582: failed while another slot is open, its words and files are back on coming back.
+    const go = async (id: string, name: string) => (await page.evaluate((id) => (location.hash = `#/slot/${id}`), id), await page.getByRole("heading", { name }).waitFor());
+    await box.fill("再看一眼");
+    await page.locator('input[type="file"]').setInputFiles({ name: "more.txt", mimeType: "text/plain", buffer: Buffer.from("y") });
+    await page.getByRole("button", { name: "排队" }).click();
+    await until(() => acted.length === before + 1);
+    await go(finished, "w/finished");
+    fail({ ok: false, error: "还是连不上。" });
+    await page.getByRole("status").getByText("还是连不上。").waitFor();
+    await go(slot, "w/flaky");
+    await page.getByRole("list", { name: "附件" }).getByText("more.txt").waitFor();
+    expect(await box.inputValue()).toBe("再看一眼");
   } finally {
     answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
   }
 });
 
-smoke("#286: on a phone the header's button goes to 浅色 then 深色; dark stays when the page loads again, set before the page's script runs", async () => {
+smoke("#286, #595: on a phone the home's header has the settings' gear, no theme button; its card picks 深色, which stays when the page loads again, set before the page's script runs", async () => {
   const page = await open();
   const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
   // The phone's system is light.
   const light = await bg();
-  await page.getByRole("button", { name: "跟随系统" }).click();
-  await page.getByRole("button", { name: "浅色" }).click();
-  await page.getByRole("button", { name: "深色" }).waitFor();
+  const gear = page.getByRole("button", { name: "设置" });
+  const card = page.getByRole("dialog");
+  await page.getByRole("button", { name: "新建", exact: true }).waitFor();
+  expect(await page.getByRole("button", { name: "跟随系统" }).count()).toBe(0);
+  await gear.click();
+  // Under the gear, its right edge on the header's, as the list's below: once placed, a frame or more
+  // after it shows, past the gear's own right edge till then (#575).
+  const [header, under] = [(await page.locator("header", { has: gear }).boundingBox())!, (await gear.boundingBox())!.y];
+  const placed = async () => {
+    const at = (await card.boundingBox())!;
+    return [at.y > under, Math.round(at.x + at.width)];
+  };
+  await settles(placed, [true, Math.round(header.x + header.width)]);
+  await card.getByRole("button", { name: "深色" }).click();
   const dark = await bg();
   expect(dark).not.toBe(light);
   // Loaded again with none of the page's script: it is dark from the first paint.
@@ -5114,15 +5749,17 @@ smoke("#286: on a phone the header's button goes to 浅色 then 深色; dark sta
   expect(await bg()).toBe(dark);
   await page.unroute("**/assets/*.js");
   await page.reload();
-  await page.getByRole("button", { name: "深色" }).click();
-  await page.getByRole("button", { name: "跟随系统" }).waitFor();
+  await gear.click();
+  expect(await card.getByRole("button", { name: "深色" }).getAttribute("aria-pressed")).toBe("true");
+  await card.getByRole("button", { name: "跟随系统" }).click();
   expect(await bg()).toBe(light);
+  await page.context().close();
 });
 
 /** A PNG of one pixel. */
 const PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
-smoke("#286: a picture pasted where you type, or a file dropped on the chat, is attached as + attaches it; words pasted are words; sent, the chat shows the picture", async () => {
+smoke("#286, #577: a picture pasted where you type, or a file dropped on the chat, is attached as + attaches it, lined up with the words; words pasted are words; sent, the chat shows the picture", async () => {
   const slot = store.tx((tx) => tx.insert("slot", { workspace: ws, name: "pastes", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id);
   answer = async () => ({ ok: true, text: "开始新回合" });
   try {
@@ -5141,6 +5778,8 @@ smoke("#286: a picture pasted where you type, or a file dropped on the chat, is 
     expect(await attached.count()).toBe(0);
     expect(await paste("picture")).toBe(true);
     await attached.getByRole("img", { name: "shot.png" }).waitFor();
+    const [first, at, pad] = [(await attached.locator("li").first().boundingBox())!, (await box.boundingBox())!, await box.evaluate((e) => parseFloat(getComputedStyle(e).paddingLeft))];
+    expect(first.x).toBeCloseTo(at.x + pad, 0);
     await page.getByRole("log", { name: "对话" }).evaluate((el) => {
       const data = new DataTransfer();
       data.items.add(new File(["x"], "notes.txt", { type: "text/plain" }));
@@ -5148,16 +5787,133 @@ smoke("#286: a picture pasted where you type, or a file dropped on the chat, is 
       el.dispatchEvent(new DragEvent("drop", { dataTransfer: data, bubbles: true, cancelable: true }));
     });
     await attached.getByText("notes.txt").waitFor();
+    // #582: what is attached and not sent stays with the slot, as its words do, till dropped or sent.
+    const go = async (id: string, name: string) => (await page.evaluate((id) => (location.hash = `#/slot/${id}`), id), await page.getByRole("heading", { name }).waitFor());
+    const away = async () => (await go(finished, "w/finished"), await go(slot, "w/pastes"));
+    await away();
+    await attached.getByText("notes.txt").waitFor();
     await attached.getByRole("button", { name: "移除" }).last().click();
     await attached.getByText("notes.txt").waitFor({ state: "detached" });
+    await away();
+    expect(await attached.locator("li").count()).toBe(1);
     await box.fill("看图");
     await page.getByRole("button", { name: "发送" }).click();
     await until(() => (acted.at(-1)?.act as { slot?: string } | undefined)?.slot === slot);
     expect(acted.at(-1)!.act).toMatchObject({ kind: "say", slot, text: "看图", attachments: [{ kind: "image", name: "shot.png", mimeType: "image/png" }] });
     await page.getByRole("log", { name: "对话" }).getByRole("img", { name: "shot.png" }).waitFor();
+    await away();
+    expect(await attached.count()).toBe(0);
+    // A command with a picture turned away while another slot is open: both are back for it.
+    let reply!: (r: RhReply) => void;
+    answer = () => new Promise((r) => (reply = r));
+    await paste("picture");
+    await box.fill("/context");
+    const before = acted.length;
+    await page.getByRole("button", { name: "发送" }).click();
+    await until(() => acted.length === before + 1);
+    await go(finished, "w/finished");
+    reply({ ok: false, error: "看板还不能发 /context。" });
+    await page.getByRole("status").getByText("看板还不能发 /context。").waitFor();
+    await go(slot, "w/pastes");
+    await attached.getByRole("img", { name: "shot.png" }).waitFor();
+    expect(await box.inputValue()).toBe("/context");
+    // Typed in it after coming back and before the answer, the box keeps only what you typed.
+    const again = acted.length;
+    await page.getByRole("button", { name: "发送" }).click();
+    await until(() => acted.length === again + 1);
+    await away();
+    await box.fill("hi");
+    reply({ ok: false, error: "这会儿发不了。" });
+    await page.getByRole("status").getByText("这会儿发不了。").waitFor();
+    expect(await box.inputValue()).toBe("hi");
+    expect(await attached.count()).toBe(0);
   } finally {
     answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
   }
+});
+
+/** How tall the faded strip at a scroller's top and at its bottom is, as its edge-fade-y mask has it, 0 for none. */
+const fadesY = (l: Locator) =>
+  l.evaluate((el) => {
+    const mask = getComputedStyle(el).maskImage;
+    return [/^linear-gradient\(rgba\(0, 0, 0, 0\), rgb\(0, 0, 0\) ([\d.]+)px/, /rgb\(0, 0, 0\) calc\(100% - ([\d.]+)px\), rgba\(0, 0, 0, 0\)\)/].map((re) => Number(re.exec(mask)?.[1] ?? 0));
+  });
+
+smoke("#638: the topology's details, the chat's timeline and a preview fade where they are cut, only while there is more that way, as what they hold comes and opens", async () => {
+  // The details come once the slot's data does, after the page.
+  const page = await open(`/topology/slot/${talks}`, undefined, { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 400 } });
+  const body = page.locator("[data-body]");
+  await sheetOf(page).getByRole("button", { name: /q0/ }).waitFor();
+  await until(async () => (await fadesY(body)).join() === "0,32");
+  await body.evaluate((el) => (el.scrollTop = el.scrollHeight));
+  await until(async () => (await fadesY(body)).join() === "32,0");
+  // A preview opened makes the chat's timeline taller than its box, not scrolled; closed, it fits again.
+  const chat = await open(`/slot/${talks}`);
+  await chat.getByRole("button", { name: "详情" }).click();
+  await chat.getByText("时间线").click();
+  const timeline = chat.getByRole("dialog").locator("details", { hasText: "时间线" });
+  const row = timeline.getByRole("button", { name: /q0/ });
+  await row.click();
+  const log = timeline.getByRole("log", { name: "预览" });
+  await log.getByText("a59", { exact: true }).waitFor();
+  await until(async () => (await fadesY(timeline)).join() === "0,32");
+  // The preview's own list, at its newest, fades at its top.
+  await until(async () => (await fadesY(log)).join() === "32,0");
+  await row.click();
+  await until(async () => (await fadesY(timeline)).join() === "0,0");
+});
+
+smoke("#577, #579: on a phone, files attached past the box's edge, commands past the palette's height and lines past the message box's fade out where they are cut, only while there is more that way; ↑↓ scroll their command clear of the fade, the mouse scrolls nothing", async () => {
+  const slot = store.tx((tx) => tx.insert("slot", { workspace: ws, name: "cut", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id);
+  const page = await open(`/slot/${slot}`);
+  const box = page.getByRole("textbox", { name: "消息" });
+  const attach = (...names: string[]) => page.locator('input[type="file"]').setInputFiles(names.map((name) => ({ name, mimeType: "text/plain", buffer: Buffer.from("x") })));
+  const row = page.getByRole("list", { name: "附件" }).locator("..");
+  await attach("a.txt");
+  await row.waitFor();
+  expect(await fades(row)).toEqual([0, 0]);
+  await attach("b.txt", "c.txt", "d.txt");
+  await settles(() => fades(row), [0, 12]); // as the row fills (#575)
+  // Top to bottom: a phone's bar lies over the row, with none under it to keep clear.
+  expect(await row.evaluate((el) => getComputedStyle(el).maskSize)).toBe("100% 100%, 100% 0px");
+  await row.evaluate((el) => (el.scrollLeft = el.scrollWidth));
+  await until(async () => (await fades(row))[0]! > 0);
+  expect(await fades(row)).toEqual([12, 0]);
+  /** Whether a scroller has the board's thin round bar with no arrows (card-scroll), not the browser's (#579). */
+  const round = (l: Locator) => l.evaluate((el) => getComputedStyle(el).scrollbarWidth === "auto");
+  expect([await round(row), await round(box)]).toEqual([true, true]);
+  // Its thumb, inside a clear border, starts where the files and the typed text do.
+  const [track, rim, pad] = await row.evaluate((el) => [getComputedStyle(el, "::-webkit-scrollbar-track").marginLeft, getComputedStyle(el, "::-webkit-scrollbar-thumb").borderLeftWidth, getComputedStyle(el.firstElementChild!).paddingLeft].map(parseFloat));
+  expect(track! + rim!).toBe(pad!);
+  // Written past its height, the message box fades at its cut ends too (#579), and reads them again as
+  // what is written changes with the box no taller and not scrolled.
+  await box.fill(Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n"));
+  // Typed at the end, the caret's line is scrolled clear of the fade, down to the true bottom.
+  await box.press("ControlOrMeta+End");
+  await box.pressSequentially("x");
+  await until(async () => (await fadesY(box)).join() === "32,0");
+  await box.evaluate((el) => (el.scrollTop = 0));
+  await until(async () => (await fadesY(box)).join() === "0,32");
+  const left = () => box.evaluate((el) => [el.style.getPropertyValue("--ob"), `${el.scrollHeight - el.clientHeight - el.scrollTop}px`]);
+  await box.evaluate((el: HTMLTextAreaElement) => (el.focus({ preventScroll: true }), el.setSelectionRange(0, 0), document.execCommand("insertText", false, "x\n")));
+  await until(async () => new Set(await left()).size === 1);
+
+  await box.fill("/");
+  const list = page.getByRole("listbox", { name: "命令" });
+  const commands = list.locator("> div");
+  // Each fade follows the list as it fills, and its scroll a frame after it (#575).
+  await settles(() => fadesY(commands), [0, 32]);
+  expect(await round(commands)).toBe(true);
+  // Down to the 7th, cut in half at first: scrolled till it ends where the fade starts.
+  for (let i = 0; i < 6; i++) await box.press("ArrowDown");
+  await settles(() => fadesY(commands), [32, 32]);
+  const [at, view] = [(await list.getByRole("option", { selected: true }).boundingBox())!, (await commands.boundingBox())!];
+  expect(at.y + at.height).toBeCloseTo(view.y + view.height - 32, 0);
+  // The mouse on the 8th, in the fade: it is the one, where it is.
+  const top = await commands.evaluate((el) => el.scrollTop);
+  await page.mouse.move(at.x + at.width / 2, view.y + view.height - 8);
+  await list.getByRole("option").nth(7).and(page.locator('[aria-selected="true"]')).waitFor();
+  expect(await commands.evaluate((el) => el.scrollTop)).toBe(top);
 });
 
 smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, in a workspace by its button, or in a new one named after the folder picked, and imports one, each opening its chat; 详情's settings change as you change them, and go back to their default", async () => {
@@ -5243,11 +5999,11 @@ smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, 
   }
 });
 
-smoke("#280, #286: on a 360px phone the home's header fits, the + and the theme in it, the round trip at three digits, and the page does not scroll sideways; the round trip goes to Rhodium's page", async () => {
+smoke("#280, #286, #595: on a 360px phone the home's header fits, the + and the settings' gear in it, the round trip at three digits, and the page does not scroll sideways; the round trip goes to Rhodium's page", async () => {
   const page = await open("", undefined, { ...devices["Pixel 7"], viewport: { width: 360, height: 780 } });
   const status = page.getByRole("link", { name: "状态" });
   await status.getByText(/^\d+ms$/).evaluate((e) => (e.textContent = "999ms"));
-  const box = (await page.getByRole("button", { name: "跟随系统" }).boundingBox())!;
+  const box = (await page.getByRole("button", { name: "设置" }).boundingBox())!;
   expect([box.x + box.width <= 360, await page.evaluate(() => document.documentElement.scrollWidth)]).toEqual([true, 360]);
   const plus = (await page.getByRole("button", { name: "新建", exact: true }).boundingBox())!;
   expect(plus.width >= 44 && plus.height >= 44).toBe(true);
@@ -5734,7 +6490,7 @@ smoke("story 475: the first message sent from the web on this device asks for le
   await page.context().close();
 });
 
-smoke("#491: maximize mode's sidebar has a gear pinned at its bottom; its card picks the theme, as the home header's button does, and turns reminders on this device on, asking for leave in that click, or off; denied, it says where to allow them; a phone has none", async () => {
+smoke("#491: maximize mode's sidebar has a gear pinned at its bottom; its card picks the theme, as the home header's gear does, and turns reminders on this device on, asking for leave in that click, or off; denied, it says where to allow them", async () => {
   const page = await open(
     `/slot/${rests}?full`,
     async (p) =>
@@ -5778,9 +6534,53 @@ smoke("#491: maximize mode's sidebar has a gear pinned at its bottom; its card p
   await card.getByText("要在浏览器的网站设置里重新允许").waitFor();
   expect(await remind.isDisabled()).toBe(true);
   await page.context().close();
+});
 
-  const phone = await open(`/slot/${rests}`);
-  await phone.getByRole("heading", { name: "w/rests" }).waitFor();
-  expect(await phone.getByRole("button", { name: "设置" }).count()).toBe(0);
-  await phone.context().close();
+smoke("#595: with 终端入口 off in the settings, no way to switch a slot to the terminal shows: the key under where you type, 切到终端 in a row's menu and the topology's; a slot in the terminal keeps its terminal and 收回终端. With no Herdr, the same, the switch greyed, saying so", async () => {
+  const items = (p: Page) => p.getByRole("menuitem");
+  /** Whether each way to switch an idle headless slot to the terminal shows on p: a row's menu, the key under where you type, the topology's menu. */
+  const ways = async (p: Page) => {
+    await p.goto(`http://127.0.0.1:${server!.port}/#/`);
+    await p.locator(`a[href$="/slot/${rests}"]`).click({ button: "right" });
+    await items(p).first().waitFor();
+    const row = (await items(p).allInnerTexts()).includes("切到终端");
+    await p.keyboard.press("Escape");
+    await p.goto(`http://127.0.0.1:${server!.port}/#/slot/${talks}`);
+    // The agent and the model stay.
+    await p.getByRole("button", { name: "换 agent" }).waitFor();
+    const key = (await p.getByRole("button", { name: "切到终端", exact: true }).count()) > 0;
+    await p.goto(`http://127.0.0.1:${server!.port}/#/topology/slot/${talks}`);
+    await sheetOf(p).getByRole("button", { name: "操作" }).click();
+    await items(p).first().waitFor();
+    const topology = (await items(p).allInnerTexts()).includes("切到终端");
+    await p.keyboard.press("Escape");
+    return { row, key, topology };
+  };
+  const page = await open();
+  expect(await ways(page)).toEqual({ row: true, key: true, topology: true });
+  await page.goto(`http://127.0.0.1:${server!.port}/#/`);
+  await page.getByRole("button", { name: "设置" }).click();
+  const entry = page.getByRole("dialog").getByRole("switch", { name: "终端入口" });
+  expect(await entry.getAttribute("aria-checked")).toBe("true");
+  await entry.click();
+  expect(await entry.getAttribute("aria-checked")).toBe("false");
+  await page.keyboard.press("Escape");
+  expect(await ways(page)).toEqual({ row: false, key: false, topology: false });
+  // In the terminal: its terminal, the switch to its chat log, and 收回终端 in 更多.
+  await page.goto(`http://127.0.0.1:${server!.port}/#/slot/${term}`);
+  await page.getByRole("region", { name: "终端" }).waitFor();
+  await page.getByRole("button", { name: "对话记录" }).waitFor();
+  await page.getByRole("button", { name: "更多" }).click();
+  await page.getByRole("menuitem", { name: "收回终端" }).waitFor();
+  await page.context().close();
+
+  // The board says it finds no Herdr.
+  const none = await open("", async (p) => void (await p.route("**/api/board", async (r) => r.fulfill({ json: { ...(await (await r.fetch()).json()), noHerdr: true } }))));
+  await none.getByRole("button", { name: "设置" }).click();
+  const greyed = none.getByRole("dialog").getByRole("switch", { name: "终端入口" });
+  expect(await greyed.isDisabled()).toBe(true);
+  await none.getByRole("dialog").getByText("没装 Herdr", { exact: true }).waitFor();
+  await none.keyboard.press("Escape");
+  expect(await ways(none)).toEqual({ row: false, key: false, topology: false });
+  await none.context().close();
 });

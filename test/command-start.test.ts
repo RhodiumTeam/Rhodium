@@ -20,6 +20,8 @@ const at = (now: number): Ctx => ({
   capabilities: () => undefined,
   keepFile: () => null,
   diskFree: () => Infinity,
+  front: () => false,
+  herdr: () => true,
   retarget: () => null,
   inboundOf: () => [],
 });
@@ -64,4 +66,13 @@ test("#489: /usage to an archived one-off slot unarchives it, and its archive cl
   const d = route(state({ archivedAt: now - HOUR }), { kind: "board", id: "r", act: { kind: "common", slot: "a", name: "usage" } }, at(now));
   expect(slotPatch(d)).toMatchObject({ archivedAt: null, turnEndedAt: now });
   expect(timers(d)).toContainEqual(["oneoff_archive", now + config.durations.oneoffArchive]);
+});
+
+test("#578: /usage to an archived one-off slot whose last agent wrote past limits.outRestartMB: the reap clock, going off at once, leaves the new agent be", () => {
+  const d = route(state({ archivedAt: now - HOUR }), { kind: "board", id: "r", act: { kind: "common", slot: "a", name: "usage" } }, at(now));
+  expect(timers(d)).toContainEqual(["idle_reap", now]);
+  // The clock as the command left the slot, the last agent's row not yet replaced by the new one's.
+  const started = { ...state(slotPatch(d)), holders: [{ conversation: "c", exited: 1, stopRequested: 0, outStart: 0, outOffset: 65 * 2 ** 20 }] } as unknown as State;
+  const tick = route(started, { kind: "clock", timer: "idle_reap", key: "a" }, at(now));
+  expect(tick.effects.map((e) => e.kind)).not.toContain("stop");
 });

@@ -12,12 +12,14 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { claudeSettings, codexSettings, findConversations, fullText, piSettings, lastSaid, listConversations, messagePage, readPage, recentMessages, startedIn, type Block, type Page } from "../src/transcript.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures/transcripts");
@@ -697,6 +699,44 @@ describe("messagePage", () => {
     expect(await lastSaid(transcript("last-none.jsonl", PI.slice(0, 2)))).toBeNull();
   });
 
+  test("stories 561, 562, 567, 568: your message's pictures and file come by their hashes, in place of the lines naming them, with no picture's data; an rh send to you in a shell call, its text and files, a here-document's too, none in another command's words or a here-document; the list's line says [图片] [文件]", async () => {
+    const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(64));
+    const data = Buffer.from("not really a picture").toString("base64");
+    const picture = { type: "image", source: { type: "base64", media_type: "image/png", data } };
+    const words = `[来自 网页]\n看这个\n[图片] /s/media/${a}\n[图片] /s/media/${b}\n[文件] notes.txt：/s/media/${c}`;
+    const call = (id: string, command: string) => ({ type: "assistant", timestamp: T(2), message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command } }] } });
+    const file = transcript("media.jsonl", [
+      { type: "user", timestamp: T(1), message: { role: "user", content: [{ type: "text", text: words }, picture, picture] } },
+      call("c1", "rh send me --file /w/shot.png 测试过了 2>&1"),
+      call("c2", `cd /w && rh send me "$(cat <<'EOF'\n两行\nit's done\nEOF\n)"`),
+      call("c3", "rh send w/other 别的槽位"),
+      // Words of another command, and a here-document's lines, run nothing.
+      call("c4", "echo rh send me hello"),
+      call("c5", "cat > notes.md <<'EOF'\nrh send me 文档里的例子\nEOF"),
+      // A # that begins a word, unquoted, comments out the rest of its line.
+      call("c6", 'rh send me hello a#b "#" \\# # note'),
+      call("c7", "rh send me --file out.png  # the chart"),
+      call("c8", "# notify; rh send me hi"),
+    ]);
+    const { blocks } = await latest(file);
+    expect(JSON.stringify(blocks)).not.toContain(data);
+    expect(blocks[0]).toMatchObject({ kind: "user", source: "网页", text: "看这个", media: [{ kind: "image", hash: a }, { kind: "image", hash: b }, { kind: "file", hash: c, name: "notes.txt" }] });
+    expect(blocks.slice(1).map((b) => (b.kind === "tool" ? b.send : b.kind))).toEqual([{ to: "me", text: "测试过了", files: ["/w/shot.png"] }, { to: "me", text: "两行\nit's done", files: [] }, undefined, undefined, undefined, { to: "me", text: "hello a#b # #", files: [] }, { to: "me", text: "", files: ["out.png"] }, undefined]);
+    expect((await lastSaid(transcript("media-last.jsonl", [{ type: "user", timestamp: T(1), message: { role: "user", content: words } }])))?.text).toBe("看这个 [图片] [图片] [文件]");
+    expect((await lastSaid(transcript("media-alone.jsonl", [{ type: "user", timestamp: T(1), message: { role: "user", content: `[图片] /s/media/${a}` } }])))?.text).toBe("[图片]");
+  });
+
+  test("#607: of your message under a quote, the list's line says your words, the quote's start with none, and that it quotes", async () => {
+    const last = (name: string, content: string) => lastSaid(transcript(name, [{ type: "user", timestamp: T(1), message: { role: "user", content } }]));
+    expect(await last("quoted.jsonl", `> 是一个拼写错误：${"长".repeat(300)}…\n> 第二行\n\n嗯`)).toMatchObject({ text: "嗯", quoted: true });
+    expect(await last("quote-alone.jsonl", "> 好的…\n")).toMatchObject({ text: "好的…", quoted: true });
+    // Its Markdown marks gone, as the queue shows a quote.
+    expect(await last("quote-marks.jsonl", "> ```ts\n> const x = 1\n> ```\n> > 原话 *注意*…\n")).toMatchObject({ text: "const x = 1 原话 注意…" });
+    // An old picture of yours quoted over IM, a picture for an answer: that picture, not the quote's path.
+    const h = "a".repeat(64);
+    expect(await last("quote-picture.jsonl", `> [图片] /s/media/${h}\n\n[图片] /s/media/${h}`)).toMatchObject({ text: "[图片]", quoted: true });
+  });
+
   // Codex's records of the probe's two threads (codex-cli 0.162.1), both run in this directory.
   const CODEX_DIR = "/tmp/codex-probe/work/project";
   const CODEX_THREAD = join(FIXTURES, "codex/thread.jsonl");
@@ -742,7 +782,7 @@ describe("messagePage", () => {
     const file = transcript("codex-kinds.jsonl", [
       item({ type: "Reasoning", id: "rs_1", summary_text: [], raw_content: [] }),
       item({ type: "Reasoning", id: "rs_2", summary_text: ["Looking at the build.", "Then the tests."], raw_content: [] }),
-      item({ type: "CommandExecution", id: "exec-1", command: ["/usr/bin/zsh", "-lc", "bun run build"], cwd: "file:///w", status: "failed", aggregated_output: "error: no such file\n", exit_code: 1 }),
+      item({ type: "CommandExecution", id: "exec-1", command: ["/usr/bin/zsh", "-lc", "bun run build"], cwd: "file:///w", status: "failed", aggregated_output: "error: no such file\n", exit_code: 1, duration: { secs: 2, nanos: 500_000_000 } }),
       item({ type: "McpToolCall", id: "exec-2", server: "github", tool: "get_issue", arguments: { number: 1 }, status: "completed", result: { content: [{ type: "text", text: "Issue 1" }], isError: false } }),
       item({ type: "ImageView", id: "exec-3", path: "file:///w/shot.png" }),
       item({ type: "Extension", kind: "web.search", id: "exec-4", query: "bun glob", action: { type: "search", query: null, queries: ["bun glob"] }, results: [{ type: "text_result", title: "Glob", url: "https://bun.sh/docs/api/glob", snippet: "…" }] }),
@@ -770,6 +810,50 @@ describe("messagePage", () => {
       ["spawn_agent", { name: "spawn_agent", arg: null, code: false }, false],
     ]);
     expect(page.blocks.find((b) => b.kind === "tool" && b.id === "call_1")).toMatchObject({ input: JSON.stringify({ agent_path: "/root/spec_review" }, null, 2) });
+    // A command's line is written once it ends: its call is when it began, its result when it ended.
+    expect(page.blocks.find((b) => b.kind === "tool" && b.id === "exec-1")).toMatchObject({ time: Date.parse(T(1)) - 2500, result: { time: Date.parse(T(1)) } });
+  });
+
+  // No recorded transcript has a picture: these lines are as Claude, pi and codex-cli 0.162.1 write them.
+  const ONE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  const png = Buffer.from(ONE, "base64");
+  const hash = new Bun.CryptoHasher("sha256").update(png).digest("hex");
+  const media = join(tmp, "media");
+  const results = (bs: Block[]) => bs.map((b) => (b.kind === "tool" ? b.result?.media : b.kind));
+
+  test("story 563: a picture a tool's result carries, Claude's Read's and pi's, is kept in the media dir by its hash, the block having its address and never its data", async () => {
+    const claude = transcript("read-claude.jsonl", [
+      { type: "assistant", timestamp: T(1), message: { role: "assistant", content: [{ type: "tool_use", id: "r1", name: "Read", input: { file_path: "/w/shot.png" } }] } },
+      { type: "user", timestamp: T(2), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "r1", content: [{ type: "image", source: { type: "base64", data: ONE, media_type: "image/png" } }] }] } },
+    ]);
+    const pi = transcript("read-pi.jsonl", [
+      { type: "message", timestamp: T(1), message: { role: "assistant", content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "/w/shot.png" } }] } },
+      { type: "message", timestamp: T(2), message: { role: "toolResult", toolCallId: "r1", toolName: "read", content: [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data: ONE, mimeType: "image/png" }], isError: false } },
+    ]);
+    for (const file of [claude, pi]) {
+      const { blocks } = await messagePage(file, Infinity, "backward", "/w", media);
+      expect(JSON.stringify(blocks)).not.toContain(ONE);
+      expect(results(blocks)).toEqual([[{ kind: "image", hash }]]);
+    }
+    expect(readFileSync(join(media, hash)).equals(png)).toBe(true);
+  });
+
+  test("story 563: Codex's view_image shows the picture only if it is in the slot's dir, its real path too, and a picture by its first bytes; any other, its path alone", async () => {
+    const slot = join(tmp, "slot-563");
+    mkdirSync(join(slot, "shots"), { recursive: true });
+    const outside = join(tmp, "outside.png");
+    writeFileSync(outside, png);
+    mkdirSync(join(slot, "截图"));
+    for (const name of ["shots/in.png", "a b.png", "截图/x.png"]) writeFileSync(join(slot, name), png);
+    symlinkSync(outside, join(slot, "out.png"));
+    writeFileSync(join(slot, "notes.png"), "not a picture\n");
+    // Its path is a file: URL (Url::from_file_path): a space and a Chinese name come percent-encoded.
+    const viewed = (path: string, i: number) => ({ timestamp: T(1), type: "event_msg", payload: { type: "item_completed", thread_id: "t", turn_id: "u", item: { type: "ImageView", id: `v${i}`, path: pathToFileURL(path).href } } });
+    const file = transcript("codex-view.jsonl", ["shots/in.png", "a b.png", "截图/x.png", outside, "out.png", "notes.png", "gone.png"].map((p) => resolve(slot, p)).map(viewed));
+    rmSync(join(media, hash), { force: true });
+    const shown = (name: string) => [{ kind: "image" as const, hash, name }];
+    expect(results((await messagePage(file, Infinity, "backward", slot, media)).blocks)).toEqual([shown("in.png"), shown("a b.png"), shown("x.png"), undefined, undefined, undefined, undefined]);
+    expect(readFileSync(join(media, hash)).equals(png)).toBe(true);
   });
 });
 

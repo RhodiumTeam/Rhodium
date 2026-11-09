@@ -519,7 +519,7 @@ test("an error names your chat <chat>, not by the openid in QQ's API path: error
   expect(logged.join("\n")).not.toContain("U1");
 });
 
-test("a send the platform refuses is failed, with the platform's code, and counts as out of quota: the passive reply's, or the bot's active messages", async () => {
+test("story 580: a send the platform refuses is failed, with the platform's code; a passive reply's quota is out by any code, the bot's active messages by none", async () => {
   const refused = new ApiError(`API Error [${path}]: msg limit`, 400, path, 40034024, "msg limit");
   const { client } = fakeClient({ send: () => Promise.reject(refused) });
   // As qq-cli has it: the message's passive replies are gone, so it can go out as an active one.
@@ -528,8 +528,13 @@ test("a send the platform refuses is failed, with the platform's code, and count
     error: `40034024 ${shown(refused)}`,
     quota: true,
   });
-  // An active one goes through another bot instead (product §5.5).
-  expect(await adapter(client).send("U1", { text: "x", seq: 1 })).toEqual({ status: "failed", error: `40034024 ${shown(refused)}`, quota: true });
+  // An active one goes through another bot instead, the quota left alone (product §5.5), whatever
+  // the code: QQ's limit code 40034100 counts the per-minute limit too, and its old docs' 22009 is gone.
+  for (const [code, text] of [[40034024, "msg limit"], [40034100, "主动消息发送超过频控限制"], [22009, "msg limit exceed"]] as const) {
+    const e = new ApiError(`API Error [${path}]: ${text}`, 400, path, code, text);
+    const out = fakeClient({ send: () => Promise.reject(e) });
+    expect(await adapter(out.client).send("U1", { text: "x", seq: 1 })).toEqual({ status: "failed", error: `${code} ${shown(e)}`, refused: true });
+  }
   // Getting a token fails before anything is sent.
   const noToken = fakeClient({ send: () => Promise.reject(new Error("Failed to get access_token: {}")) });
   expect((await adapter(noToken.client).send("U1", { text: "x", seq: 1 })).status).toBe("failed");

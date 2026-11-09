@@ -111,6 +111,11 @@ export function parseCommand(text: string): ImCommand | null {
 
 /** What the source line of your message from the board's page names (spec web-write): [来自 网页]. */
 export const FROM_BOARD = "网页";
+/** What a source line adds after the chat it names, before when you sent it, for a message Rhodium
+ *  held past durations.sentAtAfter: [来自 网页，发送于 21:05] (prompt's withSentAt). */
+export const SENT_AT = "，发送于 ";
+/** Whether a message's source line is the board's, by the chat it names: [来自 网页], or one held as SENT_AT says. */
+export const fromBoard = (source: string | null): boolean => source?.split(SENT_AT)[0] === FROM_BOARD;
 
 /** One entry of a list to pick from, such as /model or /resume with no argument: label is what
  *  you see, id is what picking it hands back to the command; current: the one in use now; group:
@@ -256,6 +261,37 @@ export type Capabilities = {
   markdown: { extensions: ("html" | "math" | "spoiler" | "mark" | "emoji" | "heading")[]; links?: "http"; literal?: true } | null;
 };
 
+/** About how many characters of a whole message a quote brings the agent (product §5.4). */
+const QUOTE_HEAD = 100;
+
+/** A quote as the agent gets it over your words, from IM or the board's page (docs/im-style.md §2.6):
+ *  each line after "> ". A whole message brings its first 100 characters as you see them, then "…";
+ *  a part you picked, all of it (product §5.4). */
+export function quoting(text: string, picked = false): string {
+  const chars = [...new Intl.Segmenter().segment(text)];
+  const head = picked || chars.length <= QUOTE_HEAD ? text : `${chars.slice(0, QUOTE_HEAD).map((c) => c.segment).join("").trimEnd()}…`;
+  return head.replace(/^/gm, "> ");
+}
+
+/** A message's leading quote, as quoting writes it over your words ("> " lines, then an empty line),
+ *  and what follows; null with none. */
+export function quoteOf(text: string): { quote: string; rest: string } | null {
+  const m = /^((?:> .*(?:\n|$))+)\n?/.exec(text);
+  return m && { quote: m[1]!.replace(/^> /gm, ""), rest: text.slice(m[0].length) };
+}
+
+/** Markdown read as one line of plain words, for one shown cut where it does not fit (story 573): no
+ *  fence or its language, * or `, nor a line's leading # or >; a line naming a kept picture or file,
+ *  as media's mediaLine writes it into an IM quote, is [图片] or [文件] alone; the … a cut quote ends
+ *  in stays. What goes to the agent keeps them. */
+export const plain = (md: string) =>
+  md
+    .replace(/^(\[(?:图片|文件)\]) .*\/[0-9a-f]{64}$/gm, "$1")
+    .replace(/^\s*(?:```[\w+-]*|[#>]+ ?)/gm, "")
+    .replace(/[*`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
 export type InboundMessage = {
   bot: string; // bot row id
   chat: string; // the platform's chat id
@@ -265,7 +301,8 @@ export type InboundMessage = {
   at: number;
   // A quoted message. QQ gives only a reference, so the text comes from the store (§8.3);
   // Telegram gives the text too. Without text, fallback is what to show if the store has none.
-  quote?: { ref: string; text?: string; fallback?: string };
+  // picked: text is only the part of it you picked (Telegram), which the agent gets whole (product §5.4).
+  quote?: { ref: string; text?: string; fallback?: string; picked?: true };
   // What a later quote names this message by, where that is not messageId (QQ's msg_idx).
   ref?: string;
   // Images and files, not yet downloaded: rhodium fetches them only once it knows the message is
@@ -304,11 +341,13 @@ export type OutboundMessage = {
 
 /** Mirrors the outbound record's states: unknown means it may or may not have arrived.
  *  quota: the platform turned down a passive reply for its quota (QQ), so it can go out another way.
+ *  refused: it turned down an active message for another reason (QQ: you turned them off, moderation,
+ *  the per-minute limit): this one can go out another way, the quota left alone (product §5.5).
  *  flood: turned down for the chat's flood limit (Telegram's 429), still, after the adapter's waits:
  *  another message now would be turned down too. */
 // ref: what a later quote names the sent message by, where that is not messageId (QQ's ref_idx).
 // sent with no messageId: QQ's dedupe answer to a retry, the first try having got there (architecture §7.4).
-export type SendResult = { status: "sent"; messageId?: string; ref?: string } | { status: "failed" | "unknown"; error: string; quota?: boolean; flood?: true };
+export type SendResult = { status: "sent"; messageId?: string; ref?: string } | { status: "failed" | "unknown"; error: string; quota?: boolean; refused?: true; flood?: true };
 
 export type MenuItem = { command: string; description: string };
 /** A button on the row (product §5.7): one that sends its command, or a folder of such (QQ's). */
@@ -415,8 +454,11 @@ export type Input =
   // Rhodium has started: what the state tables say is owed gets done (architecture §5).
   | { kind: "recovery" }
   // The platform refused this outbound record, a passive reply to inbound in chat or an active message
-  // (null), for its quota. payload: its message, as the record keeps it.
-  | { kind: "refused"; outbound: string; chat: string; inbound: string | null; payload: string }
+  // (null): for its quota, or not (an active message only). payload: its message, as the record keeps it.
+  | { kind: "refused"; outbound: string; chat: string; inbound: string | null; payload: string; quota: boolean }
+  // An outbound record failed for good, not to go another way (refused): payload, its message, as the
+  // record keeps it. What rh send's message marked its slot's turn with goes (architecture §8.7).
+  | { kind: "send_failed"; payload: string }
   // An edit to show text did not take: the platform turned it down, or the message (this outbound
   // record, with its chat and trace) never went out. final: text is the turn's last. markdown: the
   // same in the platform's Markdown.

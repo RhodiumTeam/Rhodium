@@ -89,6 +89,7 @@ test("story 119: the same message delivered twice reaches the agent once and is 
   // The same id in another chat is another message.
   await rhodium.im.inject("q", { chat: "other-chat", sender: ME, text: "again", messageId });
   await until(() => asked().length === 2, 15_000);
+  await posts(ME, 1);
   await Bun.sleep(300); // a second reply would show up by now
   expect(asked()).toEqual(["hello", "again"]);
   expect((await rhodium.im.log("q", ME)).map((p) => ({ text: p.text, replyTo: p.replyTo }))).toEqual([{ text: "fake reply", replyTo: messageId }]);

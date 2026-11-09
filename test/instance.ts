@@ -5,6 +5,7 @@
 // (start, kill9) or as a systemd user service (installService). Tests drive it through `rh` and
 // the fake IM, and read its log.
 import { dlopen } from "bun:ffi";
+import { Database } from "bun:sqlite";
 import { expect } from "bun:test";
 import {
   chmodSync,
@@ -163,6 +164,23 @@ export async function until(check: () => boolean | Promise<boolean>, timeoutMs =
   while (!(await check())) {
     if (Date.now() > end) throw new Error(`still not true after ${timeoutMs} ms: ${check}`);
     await Bun.sleep(20);
+  }
+}
+
+/** Polls get until it gives want, as until does; else fails as expect(get()).toEqual(want) would. */
+export async function settles<T>(get: () => Promise<T> | T, want: Awaited<T>, timeoutMs?: number): Promise<void> {
+  await until(async () => Bun.deepEquals(await get(), want), timeoutMs).catch(async () => expect(await get()).toEqual(want));
+}
+
+/** Waits until the instance's rh.db, opened read-only, has a row for sql. rhodium writes its own
+ *  record a moment after what a test sees on the fake IM or agent, and has no SIGTERM handler: a
+ *  test that stops or kills it in between loses that record (#575). */
+export async function recorded(instance: Instance, sql: string, timeoutMs = 15_000): Promise<void> {
+  const db = new Database(join(instance.dir, "state/rh.db"), { readonly: true });
+  try {
+    await until(() => db.query(sql).get() !== null, timeoutMs);
+  } finally {
+    db.close();
   }
 }
 

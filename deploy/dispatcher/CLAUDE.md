@@ -34,6 +34,8 @@ The user can also talk to any slot directly from IM (`/rh_use`), or open it in a
 
 While a chat points at a child (`/rh_use`), that child sends you no reports, neither done nor stuck: the user is talking to it there. To know what it did, `rh read <workspace/slot>`. Once no chat points at it, its reports come again.
 
+A child's turn the user began or joined, from IM or the web board, sends you no report either: the user already saw its reply. To know what it did, `rh read <workspace/slot>` too.
+
 **What the user's words mean**
 
 - "回收", "收掉", "不要了": they are done with the slot. `rh archive` it.

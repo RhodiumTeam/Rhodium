@@ -1,7 +1,7 @@
 // The read-only board (seam one, product §7, architecture §11): its JSON and event stream over
 // HTTP, with and without your Tailscale login in the header tailscale serve adds.
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -158,7 +158,9 @@ test("story 140: a stream reconnecting with Last-Event-ID gets every event it mi
   await again.close();
   expect(again.seen[0]!.seq).toBe(last + 1);
   expect(again.seen.map((e) => e.seq)).toEqual(again.seen.map((_, i) => last + 1 + i));
-  expect(again.seen.map((e) => e.type)).toEqual(["slot_created", "slot_archived"]);
+  // w/run's pi, still starting from the test before, may tell of itself in between (#575).
+  const sse2 = again.seen.find((e) => e.type === "slot_created")!.slot;
+  expect(again.seen.filter((e) => e.slot === sse2).map((e) => e.type)).toEqual(["slot_created", "slot_archived"]);
 });
 
 test("story 140: a stream quiet for longer than Bun's idle timeout stays open", async () => {
@@ -216,6 +218,200 @@ async function withWeb(fn: (at: string, web: string, store: Store, dir: string) 
   }
 }
 
+/** A picture w by h, PNG or JPEG; noisy: the share of its rows that are noise, which packs badly, for a
+ *  file of some size. Drawn as a BMP, which Bun.Image reads. */
+function picture(w: number, h: number, noisy: number, as: "png" | "jpeg"): Promise<Uint8Array> {
+  const row = (w * 3 + 3) & ~3;
+  const bmp = Buffer.alloc(54 + row * h);
+  bmp.write("BM");
+  [[2, bmp.length], [10, 54], [14, 40], [18, w], [22, -h]].forEach(([at, v]) => bmp.writeInt32LE(v!, at!));
+  [[26, 1], [28, 24]].forEach(([at, v]) => bmp.writeUInt16LE(v!, at!));
+  for (let y = 0; y < h * noisy; y++) crypto.getRandomValues(bmp.subarray(54 + y * row, 54 + y * row + w * 3));
+  const image = new Bun.Image(bmp);
+  return (as === "png" ? image.png() : image.jpeg()).bytes();
+}
+const sha = (data: Uint8Array | string) => new Bun.CryptoHasher("sha256").update(data).digest("hex");
+
+test("stories 564-566, spec web-images 安全: /api/media gives a kept file by its hash alone, to the board's own page alone; only a picture, by its first bytes, as one, anything else as a download; a preview and a viewing copy, each made once, never enlarged; 404 once it is gone", async () => {
+  await withWeb(async (at, _web, _store, dir) => {
+    const media = join(dir, "state/media");
+    mkdirSync(media, { recursive: true });
+    const keep = (data: Uint8Array | string) => (writeFileSync(join(media, sha(data)), data), sha(data));
+    const answers: Response[] = [];
+    const get = async (query: string, site: string | null = "same-origin") => {
+      const r = await fetch(`${at}/api/media?${query}`, { headers: { "Tailscale-User-Login": BOARD_LOGIN, ...(site && { "Sec-Fetch-Site": site }) } });
+      answers.push(r);
+      return r;
+    };
+    /** An answer's type, and the width and height of the picture in it. */
+    const seen = async (r: Response) => {
+      const m = await new Bun.Image(await r.bytes()).metadata();
+      return [r.headers.get("content-type"), m.width, m.height];
+    };
+    writeFileSync(join(dir, "state/secret"), "not yours");
+    const small = keep(await picture(640, 480, 0, "png"));
+    for (const h of ["", "x", small.toUpperCase(), small.slice(1), `../${small.slice(3)}`, "../secret", `${small.slice(0, 32)}/${small.slice(33)}`]) expect([h, (await get(`h=${encodeURIComponent(h)}`)).status]).toEqual([h, 400]);
+    expect((await get(`h=${small}&v=thumb`)).status).toBe(400);
+    expect((await get(`h=${small}`, "cross-site")).status).toBe(403);
+    expect((await get(`h=${small}`, null)).status).toBe(403);
+
+    const png = await get(`h=${small}`);
+    expect([png.status, png.headers.get("content-type"), png.headers.get("cache-control")]).toEqual([200, "image/png", "private, max-age=31536000, immutable"]);
+    for (const data of ["<!doctype html><script>fetch('/api/act')</script>", '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>']) {
+      for (const v of ["", "&v=preview"]) {
+        const r = await get(`h=${keep(data)}${v}`);
+        expect([r.headers.get("content-type"), r.headers.get("content-disposition"), await r.text()]).toEqual(["application/octet-stream", "attachment", data]);
+      }
+    }
+
+    // A preview, its long side 800, made the first time; a small one is the picture itself.
+    const big = keep(await picture(4000, 3000, 0.25, "jpeg"));
+    expect(await seen(await get(`h=${big}&v=preview`))).toEqual(["image/webp", 800, 600]);
+    const preview = join(media, "preview", big);
+    const first = statSync(preview).mtimeMs;
+    await Bun.sleep(20);
+    expect(await seen(await get(`h=${big}&v=preview`))).toEqual(["image/webp", 800, 600]);
+    expect(statSync(preview).mtimeMs).toBe(first);
+    expect(Buffer.from(await (await get(`h=${small}&v=preview`)).bytes()).equals(readFileSync(join(media, small)))).toBe(true);
+
+    // The viewing copy: over 2576 px or 2 MB, a JPEG at most 2576 px; never enlarged; else the picture.
+    expect(statSync(join(media, big)).size).toBeGreaterThan(2 << 20);
+    expect(await seen(await get(`h=${big}&v=view`))).toEqual(["image/jpeg", 2576, 1932]);
+    const heavy = keep(await picture(2000, 1500, 0.3, "png"));
+    expect(statSync(join(media, heavy)).size).toBeGreaterThan(2 << 20);
+    expect(await seen(await get(`h=${heavy}&v=view`))).toEqual(["image/jpeg", 2000, 1500]);
+    const light = keep(await picture(1200, 900, 0.25, "png"));
+    expect(statSync(join(media, light)).size).toBeLessThan(2 << 20);
+    expect(Buffer.from(await (await get(`h=${light}&v=view`)).bytes()).equals(readFileSync(join(media, light)))).toBe(true);
+
+    rmSync(join(media, small));
+    expect((await get(`h=${small}`)).status).toBe(404);
+    expect(answers.map((r) => r.headers.get("x-content-type-options"))).toEqual(answers.map(() => "nosniff"));
+  });
+}, 30_000);
+
+test("stories 561, 562, 563, 567, 568: a page's blocks carry your pictures and file, what an rh send to you sent, and what a tool's result showed the agent, by hash with each picture's sides and a name to save it by, never a picture's data; the list's line says [图片]", async () => {
+  await withWeb(async (at, _web, store, dir) => {
+    const home = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const media = join(dir, "state/media");
+      mkdirSync(media, { recursive: true });
+      const [shot, photo, notes] = [await picture(1080, 2400, 0, "png"), await picture(400, 300, 0, "jpeg"), "12 wicks\n"];
+      for (const data of [shot, photo, notes]) writeFileSync(join(media, sha(data)), data);
+      const slot = store.tx((tx) => {
+        const ws = tx.insert("workspace", { name: "w", dir: "/w" }).id;
+        const id = tx.insert("slot", { workspace: ws, name: "pics", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
+        tx.update("slot", { id }, { conversation: tx.insert("conversation", { slot: id, agent: "pi", sessionId: "s1", startedAt: Date.now() }).id });
+        return id;
+      });
+      // The rh send's event, as rhodium wrote it while the call ran: once you approved it, minutes after
+      // the call's line (product §4.8).
+      store.tx((tx) => tx.append({ source: "rh", type: "send_me", slot, data: { files: [{ kind: "image", hash: sha(photo), name: "shot.png" }] } }));
+      const sent = Date.now();
+      const t = sent - 200_000;
+      const line = (at: number, role: string, content: unknown[], more = {}) => JSON.stringify({ type: "message", timestamp: new Date(at).toISOString(), message: { role, content, ...more } }) + "\n";
+      const bash = (at: number, id: string, command: string, took = 500, isError = false) => line(at, "assistant", [{ type: "toolCall", id, name: "bash", arguments: { command } }]) + line(at + took, "toolResult", [{ type: "text", text: "ok" }], { toolCallId: id, isError });
+      // Text alone, by its event, with no data: sent, though the command failed after it; and one in a branch never run, none.
+      setSystemTime(sent + 2200);
+      store.tx((tx) => tx.append({ source: "rh", type: "send_me", slot }));
+      setSystemTime();
+      const data = Buffer.from(shot).toString("base64");
+      const read = line(t + 100, "assistant", [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "/w/shot.png" } }]) + line(t + 200, "toolResult", [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data, mimeType: "image/png" }], { toolCallId: "r1", isError: false });
+      const words = `[来自 网页]\n看这个\n[图片] ${media}/${sha(shot)}\n[图片] ${media}/${sha(photo)}\n[文件] notes.txt：${media}/${sha(notes)}`;
+      mkdirSync(join(dir, ".pi/agent/sessions/--w--"), { recursive: true });
+      writeFileSync(join(dir, ".pi/agent/sessions/--w--/2026-11-06_s1.jsonl"), line(t, "user", [{ type: "text", text: words }, { type: "image", data, mimeType: "image/png" }]) + read + bash(t + 1000, "c1", "rh send me --file shot.png 测试过了", sent + 500 - (t + 1000)) + bash(sent + 1000, "c2", "ls") + bash(sent + 2000, "c3", 'rh send me "Delivered"; false', 500, true) + bash(sent + 5000, "c4", 'if false; then rh send me "Tests passed"; fi'));
+      const r = await fetch(`${at}/api/messages?slot=${slot}`, { headers: { "Tailscale-User-Login": BOARD_LOGIN } });
+      const text = await r.text();
+      expect(text).not.toContain(data);
+      const blocks = JSON.parse(text).blocks as { kind: string; text?: string; media?: unknown; send?: unknown }[];
+      expect(blocks[0]).toMatchObject({
+        kind: "user",
+        text: "看这个",
+        media: [
+          { kind: "image", hash: sha(shot), name: `${sha(shot)}.png`, w: 1080, h: 2400 },
+          { kind: "image", hash: sha(photo), name: `${sha(photo)}.jpeg`, w: 400, h: 300 },
+          { kind: "file", hash: sha(notes), name: "notes.txt" },
+        ],
+      });
+      expect(blocks[1]).toMatchObject({ kind: "tool", result: { text: "Read image file [image/png]", media: [{ kind: "image", hash: sha(shot), name: `${sha(shot)}.png`, w: 1080, h: 2400 }] } });
+      expect(blocks.filter((b) => b.kind === "tool").map((b) => b.send)).toEqual([undefined, { to: "me", text: "测试过了", files: ["shot.png"], media: [{ kind: "image", hash: sha(photo), name: "shot.png", w: 400, h: 300 }] }, undefined, { to: "me", text: "Delivered", files: [], media: [] }, { to: "me", text: "Tests passed", files: [] }]);
+      const board = (await (await fetch(`${at}/api/board`, { headers: { "Tailscale-User-Login": BOARD_LOGIN } })).json()) as BoardData;
+      expect(board.workspaces[0]!.groups.idle[0]!.last).toMatchObject({ role: "user", text: "看这个 [图片] [图片] [文件]" });
+    } finally {
+      process.env.HOME = home;
+    }
+  });
+});
+
+test("story 562: two rh sends close together each have their own files, and one never run takes none, on a page read from the later one's call as the page reads on", async () => {
+  await withWeb(async (at, _web, store, dir) => {
+    const home = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const media = join(dir, "state/media");
+      mkdirSync(media, { recursive: true });
+      const [one, two] = [await picture(4, 3, 0, "png"), await picture(3, 4, 0, "png")];
+      for (const data of [one, two]) writeFileSync(join(media, sha(data)), data);
+      const slot = store.tx((tx) => {
+        const ws = tx.insert("workspace", { name: "w", dir: "/w" }).id;
+        const id = tx.insert("slot", { workspace: ws, name: "pics", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
+        tx.update("slot", { id }, { conversation: tx.insert("conversation", { slot: id, agent: "pi", sessionId: "s1", startedAt: Date.now() }).id });
+        return id;
+      });
+      const t = Date.now() - 200_000;
+      // Text alone without data.
+      const sent = (when: number, data?: Uint8Array, name?: string) => {
+        setSystemTime(when);
+        store.tx((tx) => tx.append({ source: "rh", type: "send_me", slot, ...(data && { data: { files: [{ kind: "image", hash: sha(data), name }] } }) }));
+        setSystemTime();
+      };
+      const file = join(dir, ".pi/agent/sessions/--w--/2026-11-06_s1.jsonl");
+      mkdirSync(join(file, ".."), { recursive: true });
+      const line = (when: number, role: string, content: unknown[], more = {}) => JSON.stringify({ type: "message", timestamp: new Date(when).toISOString(), message: { role, content, ...more } }) + "\n";
+      // A line each, as Claude writes a message's calls.
+      const call = (when: number, id: string, command: string) => appendFileSync(file, line(when, "assistant", [{ type: "toolCall", id, name: "bash", arguments: { command } }]));
+      const done = (when: number, id: string) => appendFileSync(file, line(when, "toolResult", [{ type: "text", text: "ok" }], { toolCallId: id, isError: false }));
+      type Page = { blocks: { kind: string; id?: string; at: string; send?: { media?: { name: string }[] } }[] };
+      const read = async (after?: number) => (await (await fetch(`${at}/api/messages?slot=${slot}${after === undefined ? "" : `&after=${after}`}`, { headers: { "Tailscale-User-Login": BOARD_LOGIN } })).json()) as Page;
+      const fromCall = async (id: string) => {
+        const c = (await read()).blocks.find((b) => b.id === id)!;
+        return (await read(parseInt(c.at))).blocks.find((b) => b.id === id)!.send!.media?.map((m) => m.name);
+      };
+
+      // Half a minute apart: the page reads the second call before its rh runs, the first's on a page before.
+      call(t, "c1", "rh send me --file one.png");
+      sent(t + 1000, one, "one.png");
+      done(t + 1500, "c1");
+      call(t + 31_000, "c2", "rh send me --file two.png");
+      expect(await fromCall("c2")).toBeUndefined();
+      sent(t + 32_000, two, "two.png");
+      done(t + 32_500, "c2");
+      expect(await fromCall("c2")).toEqual(["two.png"]);
+
+      // Two calls in one message, both written before either runs; the page reads on from the second's.
+      call(t + 60_000, "c3", "rh send me --file one.png");
+      call(t + 60_000, "c4", "rh send me --file two.png");
+      sent(t + 61_000, one, "one.png");
+      done(t + 61_500, "c3");
+      sent(t + 62_000, two, "two.png");
+      done(t + 62_500, "c4");
+      expect(await fromCall("c4")).toEqual(["two.png"]);
+      expect((await read()).blocks.filter((b) => b.kind === "tool").map((b) => b.send!.media?.[0]!.name)).toEqual(["one.png", "two.png", "one.png", "two.png"]);
+
+      // One never run half a minute after one sent text alone; the page reads on from its call, its result there.
+      call(t + 90_000, "c5", "rh send me 开始跑测试");
+      sent(t + 91_000);
+      done(t + 91_500, "c5");
+      call(t + 121_000, "c6", "bun test || rh send me 测试挂了");
+      done(t + 125_000, "c6");
+      expect(await fromCall("c6")).toBeUndefined();
+    } finally {
+      process.env.HOME = home;
+    }
+  });
+});
+
 test("#356: a script or style of the page comes as the brotli built beside it to a browser that takes br, else gzipped, else as it is; one with none built beside it, and the HTML, gzipped", async () => {
   await withWeb(async (at, web) => {
     const js = "export const said = 'hello';\n".repeat(50);
@@ -240,21 +436,31 @@ test("#356: a script or style of the page comes as the brotli built beside it to
   });
 });
 
+test("#595: /api/board says noHerdr only while herdr is not where switching looks for it, so the page hides its ways to the terminal", async () => {
+  await withWeb(async (at, _web, _store, dir) => {
+    const noHerdr = async () => ((await (await get("/api/board", BOARD_LOGIN, {}, undefined, at)).json()) as BoardData).noHerdr;
+    expect(await noHerdr()).toBeUndefined();
+    rmSync(join(dir, "herdr"));
+    expect(await noHerdr()).toBe(true);
+  });
+});
+
 test("#356: each event stream opens by naming the page rhodium serves now, by the script its HTML loads first; with none built, null", async () => {
   await withWeb(async (at, web) => {
     const pageOf = async () => {
       const s = await stream(undefined, undefined, at);
       await until(() => s.pages.length > 0);
       await s.close();
-      return s.pages;
+      // Each stream's own id too, which the page says whether it is in front by (#593).
+      return s.pages.map((p): unknown => ({ ...(p as object), stream: (p as { stream?: string }).stream?.length }));
     };
-    expect(await pageOf()).toEqual([{ entry: null }]);
+    expect(await pageOf()).toEqual([{ entry: null, stream: 36 }]);
     const html = (entry: string) => `<!doctype html><script src="./theme.js"></script><script type="module" crossorigin src="${entry}"></script><link rel="modulepreload" href="./assets/lib-1.js">`;
     writeFileSync(join(web, "index.html"), html("./assets/index-A1.js"));
-    expect(await pageOf()).toEqual([{ entry: "./assets/index-A1.js" }]);
+    expect(await pageOf()).toEqual([{ entry: "./assets/index-A1.js", stream: 36 }]);
     // Built anew under a rhodium still running, as from source: the next stream says so.
     writeFileSync(join(web, "index.html"), html("./assets/index-B2.js"));
-    expect(await pageOf()).toEqual([{ entry: "./assets/index-B2.js" }]);
+    expect(await pageOf()).toEqual([{ entry: "./assets/index-B2.js", stream: 36 }]);
   });
 });
 

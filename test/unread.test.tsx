@@ -158,6 +158,21 @@ test("story 471: a turn that sent its result to IM with rh send me is neither un
   expect(doc.title).toBe("(1) Rhodium");
 });
 
+test("story 575: a turn whose rh send stayed on the board (web) is unread all the same, a question after it or not, its final reply in IM or not", () => {
+  const web = (slot: string) => seen.forEach((f) => f({ type: "send_me", slot, trace: null, data: { web: true } }));
+  tell("slot_state", "w/a", "running");
+  web("w/a");
+  tell("slot_state", "w/a", "waiting");
+  tell("slot_state", "w/a", "running");
+  tell("slot_state", "w/a", "idle");
+  expect(doc.title).toBe("(1) Rhodium");
+  tell("slot_state", "w/b", "running");
+  web("w/b");
+  tell("final_reply", "w/b");
+  tell("slot_state", "w/b", "idle");
+  expect(doc.title).toBe("(2) Rhodium");
+});
+
 test("story 471: your /compact, a turn of its own on Claude with no reply, is neither unread nor reminded of; the next turn, with none, is", async () => {
   front(false);
   tell("slot_state", "w/a", "running");

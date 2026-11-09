@@ -1,10 +1,12 @@
 // What Rhodium tells the agent (architecture §6.1), seen from seam one: what stays the same is in
 // the system prompt file the agent is launched with; where a message came from is its first line.
 import { afterEach, expect, test } from "bun:test";
-import { readFileSync, renameSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { newInstance, until, withoutSource, type Instance } from "./instance";
 import { feishuCapabilities } from "../src/feishu";
 import { systemPrompt } from "../src/prompt";
+import { skillText } from "../src/commands";
+import { chatOf, sendWord } from "../src/router";
 
 const ME = "you-openid";
 
@@ -54,8 +56,9 @@ test("story 7: the agent is launched with an appended system prompt: rh's usage,
   // Your message joining the turn after it, or your answer to its ask in IM, lifts that: what it says next and the final reply go out again (#234, #237).
   expect(prompt).toContain("之后用户又发来消息、并进这个回合，或者在 IM 里回答了你的提问的，你后面说的话和最终回复照常转发。");
   expect((await rhodium.rh(["--skill"])).out).toContain("不再代发这个回合的最终回复；之后用户又发来消息、并进这个回合，或者在 IM 里回答了你的提问的，照常代发。");
-  // Where rh send me lands is Rhodium's to pick, not the agent's: it promises no platform (2026-10-22).
-  expect(prompt).toContain("`rh send me` 发到现在指着你的窗口里用户最近用的那个，没有就发主窗口，由 Rhodium 定，你选不了。不要向用户承诺发到某个平台");
+  // rh send me goes where you last wrote, the board too; the agent may name where instead (story 582).
+  expect(prompt).toContain("`rh send me` 按默认规则发：用户最后在哪给你说话就发到哪，网页也算。");
+  expect(prompt).not.toContain("你选不了");
   expect((await rhodium.rh(["--skill"])).out).toContain("没有窗口指着你时，子槽位用指着根槽位的窗口，再没有就发主窗口");
   // A turn something else began sends its reply to no chat; a child's goes, its start, to its parent (architecture §9.3).
   expect(prompt).toContain("别的消息开始的回合，最终回复不发回 IM；你是子槽位时，它的开头会随汇报交给父槽位。");
@@ -63,8 +66,8 @@ test("story 7: the agent is launched with an appended system prompt: rh's usage,
   expect(prompt).toContain("用户的消息发出后超过 5 分钟才交给你的（例如排队等额度），这一行还写发送时间，例如 [来自 QQ 私聊，发送于 21:05]；不是当天的写成 [来自 QQ 私聊，发送于 10-22 21:05]。");
   // The format limits of each bot, from its capability table, under the name its private chat goes
   // by in the first line of a message from it (2026-10-23).
-  expect(prompt).toMatch(/^- 假 IM Bot q 的私聊：.*2000 字.*Markdown；行首 # 后不带空格的写法会按原文显示。/m);
-  expect(prompt).toMatch(/^- 假 IM Bot t 的私聊：.*4096 字.*Markdown.*HTML/m);
+  expect(prompt).toMatch(/^- 假 IM Bot q 的私聊（`rh send q`）：.*2000 字.*Markdown；行首 # 后不带空格的写法会按原文显示。/m);
+  expect(prompt).toMatch(/^- 假 IM Bot t 的私聊（`rh send t`）：.*4096 字.*Markdown.*HTML/m);
 }, 30_000);
 
 test("story 100: the agent is told a one-off child is archived the configured time after its last turn ends, and that 回收时长 only stops the process", async () => {
@@ -88,13 +91,13 @@ test("story 100: the agent is told a one-off child is archived the configured ti
 
 /** Slot w/a, the target of a QQ-like bot q alone, whose agent program is gone for a moment as your
  *  "hi" comes, so the message waits for the start (as in program-wait.test.ts); returns what the agent got. */
-async function waited(durations: string): Promise<string> {
+async function waited(durations: string, at?: number): Promise<string> {
   rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" } }, toml: `[durations]\nprogramWait = "10s"\n${durations}`, env: { TZ: "UTC" } });
   await rhodium.start();
   await rhodium.slots("a");
   const claude = rhodium.claude.path;
   renameSync(claude, `${claude}.updating`);
-  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "hi" });
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "hi", at });
   await Bun.sleep(1500);
   renameSync(`${claude}.updating`, claude);
   await until(() => asked().length === 1, 15_000);
@@ -105,8 +108,8 @@ async function waited(durations: string): Promise<string> {
 const utc = (at: number) => ({ date: new Date(at).toISOString().slice(5, 10), time: new Date(at).toISOString().slice(11, 16) });
 
 test("your message that waited longer than durations.sentAtAfter by the time the agent gets it says when you sent it, the date too if not today (2026-10-23)", async () => {
-  const sent = Date.now();
-  expect(await waited('sentAtAfter = "1s"')).toBe(`[来自 假 IM 私聊，发送于 ${utc(sent).time}]\nhi`);
+  const sent = Date.now(); // when the message says it was sent: before the instance starts, which may cross a minute (#575)
+  expect(await waited('sentAtAfter = "1s"', sent)).toBe(`[来自 假 IM 私聊，发送于 ${utc(sent).time}]\nhi`);
   // Sent two days ago, say kept by the platform while Rhodium was down: it says the day.
   const old = sent - 2 * 86_400_000;
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: "again", at: old });
@@ -119,7 +122,7 @@ test("your message that waited, but less than 5 minutes, has the plain first lin
   expect(await waited("")).toBe("[来自 假 IM 私聊]\nhi");
   // The one bot on its platform: its format limits go by the chat's name as that line has it.
   const [run] = rhodium.claude.runs();
-  expect(readFileSync(run!.argv[run!.argv.indexOf("--append-system-prompt-file") + 1]!, "utf8")).toMatch(/^- 假 IM 私聊：.*2000 字/m);
+  expect(readFileSync(run!.argv[run!.argv.indexOf("--append-system-prompt-file") + 1]!, "utf8")).toMatch(/^- 假 IM 私聊（`rh send q`）：.*2000 字/m);
 }, 30_000);
 
 test("story 8: each message of yours reaches the agent with a first line naming the chat it came through as you call it, never by its id", async () => {
@@ -133,6 +136,63 @@ test("story 8: each message of yours reaches the agent with a first line naming 
 }, 30_000);
 
 test("story 457: the system prompt tells the agent a Feishu chat's limits: 4000 characters, Markdown, its HTML tags and :name: shown as written", () => {
-  const prompt = systemPrompt([{ chat: "飞书私聊", caps: feishuCapabilities(3000) }], 86_400_000, 300_000);
-  expect(prompt).toContain("- 飞书私聊：一条消息最多 4000 字，更长的自动分成几条；可以用 Markdown；HTML 标签、:表情名:的写法会按原文显示。");
+  const prompt = systemPrompt([{ chat: "飞书私聊", send: "feishu", caps: feishuCapabilities(3000) }], 86_400_000, 300_000);
+  expect(prompt).toContain("- 飞书私聊（`rh send feishu`）：一条消息最多 4000 字，更长的自动分成几条；可以用 Markdown；HTML 标签、:表情名:的写法会按原文显示。");
 });
+
+test("story 582: the agent is told rh send me's root slot step, that a child not talked to has it refused, that a turn begun in a chat takes no rh send me there, and which turns no report follows", () => {
+  const prompt = systemPrompt([], 86_400_000, 300_000);
+  expect(prompt).toContain("你是子槽位、没有窗口指着你时，发到指着根槽位的窗口里用户最近用的那个；都没有就发主窗口。");
+  expect(prompt).toContain("`rh send me` 会被拒：把结果和文件路径写进最终回复，它会随汇报交给父槽位");
+  expect(prompt).toContain("进度直接写在回复里。不要往同一个窗口用 `rh send me` 发文字");
+  expect(skillText()).toContain("不要往同一个窗口用 rh send me 发文字。");
+  expect(prompt).toContain("用户发起或插过话的回合，子槽位跑完也不汇报。");
+  // rh send's own help says it too.
+  expect(skillText()).toContain("rh send me 会被拒：把结果和文件路径写进最终回复，它会随汇报交给父槽位，不用再 rh send 给父槽位。");
+});
+
+test("story 582: the agent is told rh send me's default, the board too, the destinations it may name, each bot's among them, that one that can't send falls back, the receipt, and that nothing is remembered", () => {
+  const prompt = systemPrompt([{ chat: "QQ Bot echo 的私聊", send: "echo", caps: feishuCapabilities(3000) }], 86_400_000, 300_000);
+  expect(prompt).toContain("- QQ Bot echo 的私聊（`rh send echo`）：");
+  for (const text of [prompt, skillText()]) {
+    expect(text).toContain("用户最后在哪给你说话就发到哪，网页也算");
+    expect(text).toContain("指定的地方发不出去，改按默认规则发");
+    expect(text).toContain("照回执告诉用户");
+    expect(text).toContain("Rhodium 不记去处");
+    expect(text).toContain("用户要你往某处推时，带上去处就能发");
+    expect(text).not.toContain("你选不了");
+  }
+  expect(prompt).toContain("`rh send web` 留在网页上");
+  expect(skillText()).toContain("rh send me|web|<平台>|<Bot 名> [--file <路径>]...");
+});
+
+test("story 576: a bot named for another platform, one of several on its own, has no word of rh send's that reaches it, and the system prompt gives none", () => {
+  const config = { bots: { qq: { platform: "telegram" as const }, t: { platform: "telegram" as const }, q: { platform: "qq" as const } } };
+  expect([sendWord(config, { name: "qq", platform: "telegram" }), sendWord(config, { name: "t", platform: "telegram" }), sendWord(config, { name: "q", platform: "qq" })]).toEqual([null, "t", "qq"]);
+  const prompt = systemPrompt([{ chat: "Telegram Bot qq 的私聊", send: null, caps: feishuCapabilities(3000) }], 86_400_000, 300_000);
+  expect(prompt).toContain("- Telegram Bot qq 的私聊：一条消息最多");
+});
+
+test("#598: a bot taken out of the config, its row still kept, no longer makes its platform's other bot go by name", async () => {
+  // Feishu's one bot left in the config is 飞书私聊; the one gone, should it come up, keeps its name.
+  const config = { bots: { kept: { platform: "feishu" as const } } };
+  expect(chatOf(config, { name: "kept", platform: "feishu" }, "私聊")).toBe("飞书私聊");
+  expect(chatOf(config, { name: "gone", platform: "feishu" }, "私聊")).toBe("飞书 Bot gone 的私聊");
+
+  // Through rhodium: bot t's row stays after its [bots.t] table goes, so the database has two bots of
+  // the fake platform and the config one. The source line and the system prompt both call q's chat 假 IM 私聊.
+  rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" }, t: { like: "telegram", owner: ME, target: "w/a" } } });
+  await rhodium.start();
+  await rhodium.stop();
+  const toml = readFileSync(rhodium.config, "utf8");
+  writeFileSync(rhodium.config, toml.slice(0, toml.indexOf("[bots.t]")));
+  await rhodium.start();
+  await rhodium.slots("a");
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "hello" });
+  await until(() => asked().length === 1, 15_000);
+  expect(asked()).toEqual(["[来自 假 IM 私聊]\nhello"]);
+  const [run] = rhodium.claude.runs();
+  const prompt = readFileSync(run!.argv[run!.argv.indexOf("--append-system-prompt-file") + 1]!, "utf8");
+  expect(prompt).toMatch(/^- 假 IM 私聊（`rh send q`）：.*2000 字/m);
+  expect(prompt).not.toContain("Bot q");
+}, 30_000);

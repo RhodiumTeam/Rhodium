@@ -127,6 +127,7 @@ test("story 22: rh stop while the start waits for the program ends the wait at o
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: "again" });
   const [reply] = await posts(1);
   expect(reply!.text).toBe("fake reply");
+  await until(() => said().length === 2, 15_000); // the fake logs a line as it takes it, after the first reply (#575)
   expect(said()).toEqual(["hi", "again"]);
 }, 30_000);
 

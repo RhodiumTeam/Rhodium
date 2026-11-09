@@ -1,13 +1,15 @@
 // A Codex slot end to end (seam one): how rhodium launches Codex's app-server, sends to it, stops its
 // turns, puts its approvals to you, takes over after a restart, and when it does not start it
 // (architecture §6.4, spec codex.md).
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync } from "node:fs";
+import { connect, createServer } from "node:net";
 import { join } from "node:path";
 import { terminalUnset } from "../src/agents";
 import type { Posted } from "../src/fake-im";
 import { installFakeAgent } from "./fake-agent/fake-agent";
-import { BOARD_LOGIN, newInstance, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
+import { BOARD_LOGIN, newInstance, recorded, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
 
 const ME = "you-openid";
 
@@ -103,13 +105,47 @@ test("story 488: /stop interrupts the running turn; nothing is left running, and
   expect(rhodium.codex.runs()).toHaveLength(1);
 }, 30_000);
 
+/** Stands in for the slot's holder at its socket, for the next connection: passes everything on,
+ *  but what the holder sends after its hello_ok, out.log fed again first, only once release() is
+ *  called, as a slow replay would (#574). */
+function holdReplay(): () => void {
+  const dir = join(rhodium.dir, "run/hold");
+  const sock = join(dir, readdirSync(dir)[0]!);
+  renameSync(sock, `${sock}.held`);
+  let release!: () => void;
+  let queue = new Promise<void>((r) => (release = r));
+  const server = createServer((rh) => {
+    server.close();
+    const holder = connect(`${sock}.held`);
+    rh.pipe(holder);
+    let greeted = false;
+    holder.on("data", (chunk: Buffer) => {
+      const at = greeted ? 0 : chunk.indexOf(10) + 1 || chunk.length;
+      greeted ||= chunk[at - 1] === 10;
+      rh.write(chunk.subarray(0, at));
+      queue = queue.then(() => void rh.write(chunk.subarray(at)));
+    });
+    holder.on("close", () => void queue.then(() => rh.destroy()));
+    rh.on("close", () => holder.destroy());
+    for (const s of [rh, holder]) s.on("error", () => {});
+  }).listen(sock);
+  return release;
+}
+
 test("story 490: Rhodium restarts mid-turn; the turn goes on, a message still joins it, and its reply comes back", async () => {
   await slot({ codex: { script: "codex-until-steered" } });
   const first = await say("run the tests");
   await until(async () => (await rhodium.state("w/a")) === "运行中", 15_000);
   await rhodium.stop();
+  const release = holdReplay();
   await rhodium.start();
   await say("also tell me the time");
+  // The message comes before the replay has told the driver which thread and turn run: it waits for it.
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  await until(() => db.query("SELECT 1 FROM agentInput WHERE body LIKE '%also tell me the time%'").get() !== null, 15_000);
+  db.close();
+  await Bun.sleep(300);
+  release();
   expect((await posts())[0]).toMatchObject({ text: "[🔧 exec_command]\n\nsteered", replyTo: first.messageId });
   expect(rhodium.codex.runs()).toHaveLength(1);
   expect(told()).toEqual([["run the tests", "also tell me the time"]]);
@@ -201,6 +237,7 @@ test("story 490: Rhodium restarts with an approval open: it is not asked again, 
   await rhodium.ok("set", "w/a", "approval=on");
   await say("build it");
   await find("要运行这条命令，允许吗？\n\nmake\n");
+  await recorded(rhodium, "SELECT 1 FROM ask WHERE status = 'open' AND pushedAt IS NOT NULL");
   await rhodium.stop();
   await rhodium.start();
   await Bun.sleep(500); // a second push would show up by now

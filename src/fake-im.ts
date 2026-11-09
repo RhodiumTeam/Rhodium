@@ -52,8 +52,9 @@ export type Posted = { kind: "send" | "edit" | "unbutton" | "toast"; messageId: 
 type OutboundWire = Omit<OutboundMessage, "file"> & { file?: { kind: "image" | "file"; name: string; data: string } };
 
 /** timeout: the platform took the message, but the bot never heard back. hang: it took the message
- *  and holds the request open till the bot hangs up, say a rhodium killed mid-send. */
-export type Outcome = "ok" | "fail" | "timeout" | "hang";
+ *  and holds the request open till the bot hangs up, say a rhodium killed mid-send. refuse: it turned
+ *  the message down for another reason than its quota, as QQ does an active message you turned off. */
+export type Outcome = "ok" | "fail" | "timeout" | "hang" | "refuse";
 
 /** name is the [bots.<name>] key tests and rhodium address the bot by. A QQ-like bot takes
  *  passiveReplies to each inbound message (limits.qqPassiveReplies) for passiveWindowMs after it
@@ -220,7 +221,7 @@ class PlatformBot {
   /** Queue how the next send or edit (or either, when on is left out) turns out; on "row", whether
    *  the next row push fails. */
   next(outcome: unknown, on?: unknown) {
-    if (!["ok", "fail", "timeout", "hang"].includes(outcome as string)) throw new Error(`unknown outcome ${outcome}`);
+    if (!["ok", "fail", "timeout", "hang", "refuse"].includes(outcome as string)) throw new Error(`unknown outcome ${outcome}`);
     if (on !== undefined && on !== "send" && on !== "edit" && on !== "row") throw new Error(`on must be "send", "edit" or "row", not ${on}`);
     this.outcomes.push({ outcome: outcome as Outcome, on });
   }
@@ -231,6 +232,7 @@ class PlatformBot {
     const i = this.outcomes.findIndex((o) => !o.on || o.on === p.kind);
     const outcome = i < 0 ? "ok" : this.outcomes.splice(i, 1)[0]!.outcome;
     if (outcome === "fail") return { status: "failed", error: "fake-im: set to fail" };
+    if (outcome === "refuse") return { status: "failed", error: "fake-im: set to refuse", refused: true };
     if (!refused) this.post(chat, p);
     if (outcome === "hang") return null;
     if (outcome === "timeout") return { status: "unknown", error: "fake-im: timed out" };

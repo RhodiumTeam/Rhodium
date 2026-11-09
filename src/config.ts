@@ -1,6 +1,6 @@
 // The config file (docs/spec/v1.md "配置"): TOML, mode 0600 because it holds bot tokens.
 // Read once at startup; changes need a restart, but for a bot rh bot adds.
-import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { isAbsolute } from "node:path";
 import { version } from "../package.json";
@@ -36,7 +36,7 @@ export const durations = {
   feishuEdit: "3s", // architecture §8.2, the least time between two edits of a turn's Feishu card
   // The longest each is kept; limits.stateMaxMB may see them go sooner (architecture §7.8).
   holdDirKeep: "7d", // architecture §4.3
-  inboundKeep: "90d", // architecture §7.1, inbound and outbound records with their quoted text (§8.3)
+  inboundKeep: "90d", // architecture §7.1, inbound and outbound records with their quoted text (§8.3), and the media dir (§7.8)
   eventKeep: "180d", // architecture §7.2
   backupEvery: "24h", // architecture §7.8, also the retention cleanup; never 0
   doctorEvery: "24h", // architecture §12, the daily rh doctor; never 0
@@ -58,6 +58,7 @@ const limits = {
   botFailures: 5, // architecture §8.6, failed tries in a row to reach its platform that mark a bot faulted; 0 = never
   minFreeMB: 2048, // architecture §7.8, free disk below which no slot is made or started
   stateMaxMB: 5120, // architecture §7.8, records and ended hold dirs past which the oldest go
+  outRestartMB: 64, // product §4.4, output of a headless agent process past which it goes between turns; 0 = never
 };
 
 // Global defaults for the per-slot settings that `rh set` overrides.
@@ -70,6 +71,13 @@ const programs = { ...(Object.fromEntries(Object.entries(AGENTS).map(([k, a]) =>
 /** Where a [programs] entry is, looked up afresh each time so an update reaches the next process:
  *  an absolute path as is, a bare name on PATH (the agents'); null if it is not there. */
 export const locate = (program: string, PATH: string): string | null => (isAbsolute(program) ? program : Bun.which(program, { PATH }));
+
+/** Whether Herdr is installed: herdr is where switching to the terminal looks for it (product §4.2).
+ *  Whether it runs is not asked. */
+export function hasHerdr(cfg: Config): boolean {
+  const herdr = locate(cfg.programs.herdr, cfg.agentPath);
+  return herdr !== null && existsSync(herdr);
+}
 
 // The Herdr session TUI panes open in (architecture §10): yours. Tests use one of their own.
 const herdr = { session: "default" };
@@ -221,6 +229,8 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
   if (b !== undefined && !isTable(b)) throw new Error("config: bots must be a table");
   for (const [name, bot] of Object.entries(b ?? {})) {
     if (!isTable(bot)) throw new Error(`config: bots.${name} must be a table`);
+    // rh send me and rh send web are to you, by the default and on the board (product §5.9).
+    if (name === "me" || name === "web") throw new Error(`config: bots.${name}: a bot may not be named me or web, which rh send takes for you; rename it`);
     if (!platforms.includes((bot as BotConfig).platform)) {
       throw new Error(`config: bots.${name}.platform must be one of ${platforms.join(", ")}`);
     }

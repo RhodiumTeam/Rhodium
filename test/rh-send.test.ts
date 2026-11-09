@@ -44,14 +44,45 @@ async function texts(n: number, bot = "q"): Promise<string[]> {
   return (await rhodium.im.log(bot, ME)).map((p) => p.text);
 }
 
-test("story 46: a child you never messaged sends rh send me to its root slot's chat, from any depth, led by its name as that chat goes to another slot", async () => {
+test("story 46: a child you never messaged, its parent gone, sends rh send me to its root slot's chat, from any depth, led by its name as that chat goes to another slot", async () => {
   await begin();
-  const leaf = plan(["send", "me", "from c2"]);
-  await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan(["spawn", "c1", plan(["spawn", "c2", leaf])]) });
-  expect(await texts(2)).toContain("〔w/c2〕\nfrom c2");
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan(["spawn", "c1", plan(["spawn", "c2", plan()])]) });
+  await until(async () => (await rhodium.state("w/c2")) === "空闲", 15_000);
+  // With its parent there, its result would go to the parent alone (story 578).
+  await rhodium.ok("archive", "w/c1");
+  await rhodium.ok("send", "w/c2", plan(["send", "me", "from c2"]));
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.text === "〔w/c2〕\nfrom c2"), 15_000);
   await until(async () => (await runOf("w/c2")).rh.length > 0, 15_000);
-  expect((await runOf("w/c2")).rh).toMatchObject([{ args: ["send", "me", "from c2"], code: 0 }]);
+  expect((await runOf("w/c2")).rh).toMatchObject([{ args: ["send", "me", "from c2"], code: 0, out: "已发到假 IM 私聊。\n" }]);
 }, 30_000);
+
+for (const like of ["qq", "telegram"] as const)
+  test(`story 589 (${like}): your quote of another slot's rh send, led by its name, goes to that slot, archived or not, and you hear so`, async () => {
+    await begin({ bots: { q: { like, owner: ME, target: "w/a" } } });
+    await rhodium.ok("new", "w/b");
+    await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan() });
+    await texts(1);
+    await rhodium.ok("send", "w/b", plan(["send", "q", "which snapshot?"]));
+    const asked = async () => (await rhodium.im.log("q", ME)).find((p) => p.text === "〔w/b〕\nwhich snapshot?");
+    await until(async () => (await asked()) !== undefined && (await rhodium.state("w/b")) === "空闲", 15_000);
+    await rhodium.ok("archive", "w/b");
+    const ref = (await asked())!.messageId;
+    await rhodium.im.inject("q", { chat: ME, sender: ME, text: "the old one", quote: like === "telegram" ? { ref, text: "〔w/b〕\nwhich snapshot?" } : { ref } });
+    await until(() => told("w/b").some((t) => t.endsWith("the old one")), 15_000);
+    expect(told("w/a").some((t) => t.includes("the old one"))).toBe(false);
+    expect(await texts(4)).toContain("已交给 w/b。");
+    // Sent while this chat went to w/b, it bears no name: a quote of it goes where the chat goes now.
+    const use = await rhodium.im.inject("q", { chat: ME, sender: ME, text: "/rh_use w/b" });
+    await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.replyTo === use.messageId), 15_000);
+    await rhodium.ok("send", "w/b", plan(["send", "q", "plain"]));
+    const plain = async () => (await rhodium.im.log("q", ME)).find((p) => p.text === "plain");
+    await until(async () => (await plain()) !== undefined, 15_000);
+    await rhodium.im.inject("q", { chat: ME, sender: ME, text: "/rh_use w/a" });
+    const ref2 = (await plain())!.messageId;
+    await rhodium.im.inject("q", { chat: ME, sender: ME, text: "to a", quote: like === "telegram" ? { ref: ref2, text: "plain" } : { ref: ref2 } });
+    await until(() => told("w/a").some((t) => t.endsWith("to a")), 15_000);
+    expect(told("w/b").some((t) => t.includes("to a"))).toBe(false);
+  }, 30_000);
 
 test("story 90: a child's report reaches its parent once the child is done; with a background task running it waits for the turn that task wakes", async () => {
   // Each turn runs its rh calls, starts a background task and ends with "started"; the task then
@@ -399,8 +430,16 @@ test("story 96: once its parent is archived, a child's done and stuck come to yo
   await rhodium.im.inject("qc", { chat: ME, sender: ME, text: "1" });
   await until(async () => (await notices()).length === 1, 15_000);
   expect((await notices())[0]).toContain("w/c 完成了");
-  // Its next run asks again: stuck.
+  // A run you begin asks again: you have its ask, and no notice besides (story 579).
+  const asks = async () => (await rhodium.im.log("qc", ME)).filter((p) => p.text.includes("允许吗？")).length;
   await rhodium.im.inject("qc", { chat: ME, sender: ME, text: "once more" });
+  await until(async () => (await asks()) === 1, 15_000);
+  await rhodium.im.inject("qc", { chat: ME, sender: ME, text: "2" });
+  await until(async () => (await rhodium.state("w/c")) === "空闲", 15_000);
+  await Bun.sleep(500);
+  expect(await notices()).toHaveLength(1);
+  // One you did not begin: stuck.
+  await rhodium.ok("send", "w/c", "again");
   await until(async () => (await notices()).length === 2, 15_000);
   expect((await notices())[1]).toContain("w/c 卡住了");
 

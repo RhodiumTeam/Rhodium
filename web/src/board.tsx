@@ -5,7 +5,7 @@
 // whose chats land in it, its state, and the last thing said.
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "cn";
-import { ArrowUp, ChevronRight, Import, Pin, Search, SquarePen, type LucideIcon } from "lucide-react";
+import { ArrowUp, ChevronRight, Import, Pin, Quote, Search, SquarePen, type LucideIcon } from "lucide-react";
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent, type ReactNode, type RefObject, type TouchEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { AgentLogo, ago, goHash, MAC } from "./common";
@@ -286,7 +286,8 @@ function Workspace({ name, rows }: { name: string; rows: Row[] }) {
   const [at] = useLocation();
   return (
     <Collapsible className="mt-5 @min-[40rem]:mt-6.5" open={open} onOpenChange={(o) => (setOpen(o), fold(name, !o))}>
-      <CollapsibleTrigger className="group flex items-center gap-1 pb-[7px] pl-4 text-[13px] font-semibold tracking-[0.01em] text-muted-foreground transition-colors hover:text-foreground">
+      {/* Its focus ring round its name and arrow, as far from them above as below, clear of the card; the name where it was. */}
+      <CollapsibleTrigger className="group -mt-1 mb-[3px] ml-2.5 flex items-center gap-1 rounded-md px-1.5 py-1 text-[13px] font-semibold tracking-[0.01em] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
         {name}
         {!open && <Count rows={rows} className="font-normal" />}
         <ChevronRight className="size-3.5 opacity-60 transition-transform group-data-panel-open:rotate-90" />
@@ -331,6 +332,14 @@ function cut(t: Text, left: number): number | undefined {
   let k = t.n - 1;
   while (k > t.keep && Math.ceil(t.w(k) + t.ell) > left) k--;
   return Math.ceil(t.w(k) + t.ell);
+}
+
+/** The rename box's workspace prefix out of room (#633), in px: undefined, whole; cut at a letter with the
+ *  "…", keeping its keep letters; else 0, none, never half a letter. */
+export function cutOrNone(t: Text, left: number): number | undefined {
+  if (t.w(t.n) <= left + 0.5) return undefined;
+  const box = cut(t, left);
+  return box === undefined || box > left ? 0 : box;
 }
 
 /** A slot's name and the Bots' faces after it out of room (stories 433, 439), in px: room for it all;
@@ -384,6 +393,16 @@ export const facesRoom = (k: number, count: number, size: number) =>
 // What measures the "…" as the browser draws it, made as the first full name is.
 let pen: CanvasRenderingContext2D | null = null;
 
+/** el's text as the browser draws it, a cut keeping keep of its letters. */
+export function measure(el: HTMLElement, keep: number): Text {
+  const t = el.firstChild!;
+  const cs = getComputedStyle(el);
+  const range = document.createRange();
+  pen ??= document.createElement("canvas").getContext("2d")!;
+  pen.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  return { w: (k) => (range.setStart(t, 0), range.setEnd(t, k), range.getBoundingClientRect().width), n: t.textContent!.length, keep, ell: pen.measureText("…").width };
+}
+
 /** A slot's name in a box that takes className, the Bots whose chats land in the slot right after it
  *  (story 437), their marks with the classes mark has (Face's row); with ws, its full name, the
  *  workspace's part grey. Out of room, squeezed (squeeze): measured as it is drawn and again as the box's
@@ -398,18 +417,10 @@ export function Name({ ws, name, bots, mark = "", className }: { ws?: string; na
     const box = ref.current!;
     const own = box.querySelector<HTMLElement>(":scope > [data-own]")!;
     const part = ws === undefined ? null : (box.firstElementChild as HTMLElement);
-    const range = document.createRange();
-    const text = (el: HTMLElement, keep: number) => {
-      const t = el.firstChild!;
-      const cs = getComputedStyle(el);
-      pen ??= document.createElement("canvas").getContext("2d")!;
-      pen.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-      return { w: (k: number) => (range.setStart(t, 0), range.setEnd(t, k), range.getBoundingClientRect().width), n: t.textContent!.length, keep, ell: pen.measureText("…").width };
-    };
     const fit = () => {
       const size = parseFloat(getComputedStyle(box).getPropertyValue("--face")) || 18;
       const slash = part ? part.nextElementSibling!.getBoundingClientRect().width : 0;
-      const s = squeeze(box.getBoundingClientRect().width, part ? text(part, Math.min(3, ws!.length)) : undefined, slash, text(own, keepOf(name)), (k) => facesRoom(k, bots.length, size), bots.length);
+      const s = squeeze(box.getBoundingClientRect().width, part ? measure(part, Math.min(3, ws!.length)) : undefined, slash, measure(own, keepOf(name)), (k) => facesRoom(k, bots.length, size), bots.length);
       if (part) part.style.width = s.ws === undefined ? "" : `${s.ws}px`;
       own.style.maxWidth = s.name === undefined ? "" : `${s.name}px`;
       const k = s.faces ?? Math.min(3, bots.length);
@@ -522,9 +533,22 @@ function Unread({ id }: { id: string }) {
   return useUnread(id) && <span role="img" aria-label="未读" className="mr-1.5 inline-block size-2 rounded-full bg-done align-[0.05em]" />;
 }
 
-/** What a slot's second line says: why it is not in a turn, or the last thing said, yours after 你：. */
+/** What a slot's second line says: why it is not in a turn, or the last thing said, yours after 你：,
+ *  a quote sign before what was said under a quote (#607). */
 const Last = ({ c, why }: { c: Card; why: boolean }) =>
-  why ? c.state : c.last && (yours(c.last) ? <><b className="font-medium text-foreground/75">你：</b>{c.last.text}</> : c.last.text);
+  why
+    ? c.state
+    : c.last && (
+        <>
+          {yours(c.last) && <b className="font-medium text-foreground/75">你：</b>}
+          {c.last.quoted && (
+            <span role="img" aria-label="引用" className="mr-1">
+              <Quote className="inline size-[1em] align-[-0.125em]" />
+            </span>
+          )}
+          {c.last.text}
+        </>
+      );
 
 let resting: ReturnType<typeof setTimeout> | undefined;
 let slotCode: typeof import("./slot") | undefined;
@@ -547,6 +571,8 @@ const toward = (id: string) => {
  *  sight as the slot changes but by a click on it. */
 function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
   const why = whyNot(c, kind);
+  // A line under its name (#587): with none, the name is level with the logo's middle.
+  const two = why || !!c.last;
   const state = kind === "done" && c.turnEndedAt ? `${word(c, kind)}结束` : word(c, kind);
   const kid = depth > 0;
   const quiet = kind === "idle" ? "opacity-70" : kind === "archived" ? "opacity-60" : "";
@@ -561,11 +587,16 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
     <div
       style={{ "--d": Math.min(depth, 2) } as CSSProperties}
       className={cn(
-        // Its ground, which the Bots' marks ring themselves in, and a rename box covers it with.
-        "relative [--av:40px] [--row:var(--card)] @min-[40rem]:[--av:34px]",
+        // Its ground, which the Bots' marks ring themselves in, and a rename box covers it with. Its chat open, a
+        // step deeper than a pointed row, as in the sidebar: in light mode --accent is as light as the pointed
+        // row's ground, so the two looked alike (#587). Pointed or pressed, it stays.
+        "relative [--av:40px] @min-[40rem]:[--av:34px]",
+        open ? "[--row:color-mix(in_oklab,var(--foreground)_7%,var(--card))]" : "[--row:var(--card)]",
+        // Its padding, a child's further in at the left, which a rename box over it keeps too (#647).
+        "[--pl:calc(14px+var(--d)*52px)] [--pr:14px] @min-[40rem]:[--pl:calc(20px+var(--d)*42px)] @min-[40rem]:[--pr:20px]",
         // A line between rows, from the text on.
-        "not-first:before:absolute not-first:before:top-0 not-first:before:right-0 not-first:before:left-[calc(14px+var(--d)*52px+var(--av)+12px)] not-first:before:border-t not-first:before:border-border",
-        "@min-[40rem]:not-first:before:left-[calc(20px+var(--d)*42px+var(--av)+14px)]",
+        "not-first:before:absolute not-first:before:top-0 not-first:before:right-0 not-first:before:left-[calc(var(--pl)+var(--av)+12px)] not-first:before:border-t not-first:before:border-border",
+        "@min-[40rem]:not-first:before:left-[calc(var(--pl)+var(--av)+14px)]",
         kid && "[--av:30px] @min-[40rem]:[--av:26px]",
       )}
     >
@@ -579,22 +610,27 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
         onClick={onClick}
         {...hold}
         className={cn(
-          "grid grid-cols-[var(--av)_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 py-[11px] pr-3.5 pl-[calc(14px+var(--d)*52px)] [--c:var(--muted-foreground)]",
-          "bg-(--row) hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--card))] active:[--row:var(--accent)]",
+          "grid grid-cols-[var(--av)_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 py-[11px] pr-(--pr) pl-(--pl) [--c:var(--muted-foreground)]",
+          // Scrolled to, the last row brings its card's bottom too, as far as the list's room under it.
+          "scroll-mb-[calc(1.5rem+env(safe-area-inset-bottom))]",
+          "bg-(--row)",
+          !open && "hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--card))] active:[--row:var(--accent)]",
           // Inside the row: the card's rounded corners cut off what sticks out.
           "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
-          "@min-[40rem]:grid-cols-[var(--av)_calc(250px-var(--d)*42px-var(--av)+var(--bw))_minmax(0,1fr)_auto] @min-[40rem]:gap-x-3.5 @min-[40rem]:pr-5 @min-[40rem]:pl-[calc(20px+var(--d)*42px)]",
+          "@min-[40rem]:grid-cols-[var(--av)_calc(250px-var(--d)*42px-var(--av)+var(--bw))_minmax(0,1fr)_auto] @min-[40rem]:gap-x-3.5",
           kid && "py-[9px] @min-[40rem]:py-2",
           // Room at the right for its restore button.
           archived && "pr-14 @min-[40rem]:pr-16",
-          open && "[--row:var(--accent)] hover:[--row:var(--accent)]",
           COLOR[kind],
           hold?.className,
         )}
       >
         <span
           className={cn(
-            "relative row-span-2 grid size-(--av) place-items-center self-start rounded-[calc(var(--av)*0.3)] bg-muted font-semibold text-muted-foreground @min-[40rem]:row-span-1 @min-[40rem]:self-center",
+            // Its ground a shade off the row's, as --muted is off --card, so it shows in the open, pressed
+            // or pointed row too, whose ground is near --accent (#587).
+            "relative grid size-(--av) place-items-center rounded-[calc(var(--av)*0.3)] bg-[color-mix(in_oklab,var(--foreground)_3.5%,var(--row))] font-semibold text-muted-foreground dark:bg-[color-mix(in_oklab,var(--foreground)_8%,var(--row))]",
+            two && "row-span-2 self-start @min-[40rem]:row-span-1 @min-[40rem]:self-center",
             kind === "idle" && "opacity-85",
             kind === "archived" && "opacity-50 grayscale",
           )}
@@ -604,7 +640,7 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
           {kind !== "idle" && kind !== "archived" && (
             <span
               className={cn(
-                "absolute -right-[3px] -bottom-[3px] size-3 rounded-full border-[2.5px] border-card bg-(--c) @min-[40rem]:size-[11px] @min-[40rem]:border-2",
+                "absolute -right-[3px] -bottom-[3px] size-3 rounded-full border-[2.5px] border-(--row) bg-(--c) @min-[40rem]:size-[11px] @min-[40rem]:border-2",
                 kid && "size-2.5 border-2 @min-[40rem]:size-[9px]",
               )}
             >
@@ -623,16 +659,18 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
           <Unread id={c.id} />
           {state}
         </span>
-        <span
-          className={cn(
-            "col-span-2 truncate text-[13.5px] text-muted-foreground @min-[40rem]:col-span-1 @min-[40rem]:col-start-3 @min-[40rem]:row-start-1 @min-[40rem]:text-sm",
-            kid && "text-[13px]",
-            why && "text-(--c)",
-            quiet,
-          )}
-        >
-          <Last c={c} why={why} />
-        </span>
+        {two && (
+          <span
+            className={cn(
+              "col-span-2 truncate text-[13.5px] text-muted-foreground @min-[40rem]:col-span-1 @min-[40rem]:col-start-3 @min-[40rem]:row-start-1 @min-[40rem]:text-sm",
+              kid && "text-[13px]",
+              why && "text-(--c)",
+              quiet,
+            )}
+          >
+            <Last c={c} why={why} />
+          </span>
+        )}
       </Link>
       {archived && (
         <Suspense>
@@ -955,6 +993,8 @@ function SideWorkspace({ name, rows, row }: { name: string; rows: Row[]; row: (r
  *  ground of its own, and is in sight as the sidebar comes or the slot changes but by a click on it. */
 function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Row; from: "list" | "topology"; under?: boolean }) {
   const why = whyNot(c, kind);
+  // A line under its name (#587): with none, the name is level with the logo's middle.
+  const two = why || !!c.last;
   const kid = depth > 0;
   const quiet = kind === "idle" ? "opacity-70" : kind === "archived" ? "opacity-60" : "";
   const open = openSlot(useLocation()[0]) === c.id;
@@ -963,8 +1003,12 @@ function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Ro
   const onClick = useInSight(link, c.id, open);
   const [hold, menu] = useRowMenu(c);
   return (
-    // Its ground, which the Bots' marks ring themselves in, and a rename box covers it with.
-    <div className="relative [--row:var(--sidebar)]">
+    // Its ground, which the Bots' marks ring themselves in, and a rename box covers it with, rounded as it is,
+    // within its padding (#647).
+    <div
+      style={{ "--pl": `${8 + (under ? 14 : 0) + Math.min(depth, 2) * 16}px` } as CSSProperties}
+      className={cn("relative rounded-lg [--pr:8px]", open ? "[--row:color-mix(in_oklab,var(--foreground)_7%,var(--sidebar))]" : "[--row:var(--sidebar)]")}
+    >
       <a
         ref={link}
         href={maxHash(c.id, from)}
@@ -972,24 +1016,23 @@ function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Ro
         aria-current={open ? "page" : undefined}
         onClick={onClick}
         {...hold}
-        style={{ paddingLeft: 8 + (under ? 14 : 0) + Math.min(depth, 2) * 16 }}
         className={cn(
-          "grid scroll-mt-[calc(var(--tab,0px)-2rem)] scroll-mb-2 grid-cols-[var(--av)_minmax(0,1fr)_auto] items-center gap-x-2.5 rounded-lg py-1.5 pr-2 [--av:28px] [--c:var(--muted-foreground)]",
-          "bg-(--row) hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--sidebar))]",
+          "grid scroll-mt-[calc(var(--tab,0px)-2rem)] scroll-mb-2 grid-cols-[var(--av)_minmax(0,1fr)_auto] items-center gap-x-2.5 rounded-lg py-1.5 pr-(--pr) pl-(--pl) [--av:28px] [--c:var(--muted-foreground)]",
+          "bg-(--row)",
+          !open && "hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--sidebar))]",
           "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
           // Wide, the phone's two lines, the logo a size up.
           "group-data-wide/side:gap-x-3 group-data-wide/side:gap-y-0.5 group-data-wide/side:py-2.5 group-data-wide/side:[--av:40px]",
           kid && "[--av:22px] group-data-wide/side:py-2 group-data-wide/side:[--av:30px]",
           archived && "pr-10",
-          open && "[--row:color-mix(in_oklab,var(--foreground)_7%,var(--sidebar))] hover:[--row:color-mix(in_oklab,var(--foreground)_7%,var(--sidebar))]",
           COLOR[kind],
           hold?.className,
         )}
       >
-        <span className={cn("relative row-span-2 grid size-(--av) place-items-center self-start rounded-[calc(var(--av)*0.3)] bg-background font-semibold text-muted-foreground", kid ? "mt-px" : "mt-0.5", archived && "opacity-50 grayscale")}>
+        <span className={cn("relative grid size-(--av) place-items-center rounded-[calc(var(--av)*0.3)] bg-background font-semibold text-muted-foreground", two && "row-span-2 self-start", two && (kid ? "mt-px" : "mt-0.5"), archived && "opacity-50 grayscale")}>
           {c.agent ? <AgentLogo agent={c.agent} className="size-[58%]" /> : <span aria-hidden>{c.name[0]?.toUpperCase()}</span>}
           {kind !== "idle" && !archived && (
-            <span className={cn("absolute -right-[3px] -bottom-[3px] size-2.5 rounded-full border-2 border-sidebar bg-(--c) group-data-wide/side:size-3", kid && "size-2 group-data-wide/side:size-2.5")}>
+            <span className={cn("absolute -right-[3px] -bottom-[3px] size-2.5 rounded-full border-2 border-(--row) bg-(--c) group-data-wide/side:size-3", kid && "size-2 group-data-wide/side:size-2.5")}>
               {kind === "running" && !why && <span className="absolute inset-0 rounded-full bg-(--c) opacity-55 motion-safe:animate-ripple" />}
             </span>
           )}
@@ -1006,9 +1049,11 @@ function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Ro
           <Unread id={c.id} />
           {!archived && word(c, kind)}
         </span>
-        <span className={cn("col-start-2 col-end-4 truncate text-[12.5px] text-muted-foreground group-data-wide/side:text-[13.5px]", kid && "group-data-wide/side:text-[13px]", why && "text-(--c)", quiet)}>
-          <Last c={c} why={why} />
-        </span>
+        {two && (
+          <span className={cn("col-start-2 col-end-4 truncate text-[12.5px] text-muted-foreground group-data-wide/side:text-[13.5px]", kid && "group-data-wide/side:text-[13px]", why && "text-(--c)", quiet)}>
+            <Last c={c} why={why} />
+          </span>
+        )}
       </a>
       {archived && (
         <Suspense>

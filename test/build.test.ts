@@ -147,14 +147,20 @@ test("stories 136, 138, 210, 211: the built rhodium serves the board page at / w
     expect(size(terminal)).toBeLessThanOrEqual(250 * 1024);
     expect(terminal.map((f) => f.text).join("\n")).toContain("ghostty");
     expect([...first, ...chat].map((f) => f.text).join("\n")).not.toContain("ghostty");
+    // The picture viewer comes only once a picture opens, beyond the chat's (spec web-images).
+    const viewer = await part("viewer", slot, [...files, ...chat.map((f) => f.file)]);
+    expect(viewer.map((f) => f.text).join("\n")).toContain("下载原图");
+    expect([...first, ...chat].map((f) => f.text).join("\n")).not.toContain("下载原图");
 
-    // What the scripts ask the API for, and the API answering there.
-    const code = [script, ...chat.map((f) => f.text), drawn, ...terminal.map((f) => f.text)].join("\n");
-    for (const path of ["api/terminal?slot=", "api/board", "api/events", "api/slot?id=", "api/messages?slot=", "api/messages?conversation=", "api/topology", "api/rhodium"]) expect(code).toContain(path);
+    // What the scripts ask the API for, and the API answering there: the first screen's, whichever of its files the build put it in.
+    const code = [...first, ...chat, ...terminal].map((f) => f.text).concat(drawn).join("\n");
+    for (const path of ["api/terminal?slot=", "api/media?h=", "api/board", "api/events", "api/slot?id=", "api/messages?slot=", "api/messages?conversation=", "api/topology", "api/rhodium", "api/front"]) expect(code).toContain(path);
     // The event stream opens by naming the page it serves, by the entry script the HTML loads (#356).
     const ac = new AbortController();
     const stream = (await get("/api/events", { signal: ac.signal })).body!.getReader();
-    expect(new TextDecoder().decode((await stream.read()).value)).toBe(`event: page\ndata: ${JSON.stringify({ entry: `./${entry}` })}\n\n`);
+    // With the stream's id, which the page says whether it is in front by (#593).
+    const [head, data] = new TextDecoder().decode((await stream.read()).value).split("\ndata: ");
+    expect([head, JSON.parse(data!)]).toEqual(["event: page", { entry: `./${entry}`, stream: expect.stringMatching(/^[\w-]{36}$/) }]);
     ac.abort();
     expect(await (await get("/api/board")).json()).toEqual({ workspaces: [], bots: [] });
     expect((await get("/api/rhodium")).status).toBe(200);

@@ -5,20 +5,21 @@
 import { AlertDialog } from "@base-ui/react/alert-dialog";
 import { Menu } from "@base-ui/react/menu";
 import { cn } from "cn";
-import { Archive, ArchiveRestore, ArrowUp, Check, ChevronDown, CircleAlert, CornerUpRight, FileText, List, ListPlus, LoaderCircle, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, RotateCw, Square, SquarePen, SquareTerminal, Trash2, Workflow, X, Zap, type LucideIcon } from "lucide-react";
-import { useContext, useEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject } from "react";
+import { Archive, ArchiveRestore, ArrowUp, Check, ChevronDown, CircleAlert, CornerUpRight, FileText, List, ListPlus, LoaderCircle, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, Quote, RotateCw, Square, SquarePen, SquareTerminal, Trash2, Workflow, X, Zap, type LucideIcon } from "lucide-react";
+import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject, type UIEvent } from "react";
 import { useLocation } from "wouter";
 import { AGENTS } from "../../src/agents";
-import { parseCommand, type AgentKind, type BoardAct } from "../../src/contracts";
+import { parseCommand, plain, quoteOf, quoting, type AgentKind, type BoardAct } from "../../src/contracts";
 import type { Candidate } from "../../src/panels";
 import type { RhReply } from "../../src/router";
-import { flash } from "./board";
-import { AgentLogo, breakLong, chatAt, goHash, MAC, Max, ModelName, ROOM } from "./common";
+import { cutOrNone, flash, measure } from "./board";
+import { AgentLogo, breakLong, chatAt, FileRow, goHash, MAC, Max, ModelName, ROOM } from "./common";
 import { buttonVariants } from "./components/ui/button";
 import { posting, request, type Card, type Command, type Messages, type Sent, type SlotData } from "./data";
 import { InfoCard } from "./card";
 import { AgentSheet, Answer, matching, ModelSheet, Palette } from "./palette";
 import { dismiss, toast, useToasts, type Toast } from "./toast";
+import { useTerminalEntry } from "./settings";
 import { askOnce } from "./unread";
 
 const TRIES = 3;
@@ -67,6 +68,38 @@ export function forAgent(text: string, files: number): string | null {
   const words = bang ? text.slice(bang[0].length) : text;
   if (bang && !words.trim() && !files) return null;
   return words.trimStart().startsWith("/") ? null : words;
+}
+
+/** What you typed, with files attached, under the reply you quote (story 573), as a quote from IM
+ *  reaches the agent (router's im): the quote, an empty line, then your words, a ! before them still
+ *  first. What is run as a command, by Rhodium or the agent, even queued, stays as typed. */
+export function withQuote(reply: string, typed: string, files = 0): string {
+  if (forAgent(typed, files) === null) return typed;
+  const bang = /^[!！]\s*/.exec(typed)?.[0] ?? "";
+  return bang + [quoting(reply) + "\n", typed.slice(bang.length)].filter(Boolean).join("\n");
+}
+
+/** What you said, in its bubble (story 573): a quote it starts with on one quiet line, cut where it
+ *  does not fit, then your words. */
+export function Words({ text }: { text: string }) {
+  const q = quoteOf(text);
+  const words = q ? q.rest : text;
+  return (
+    <>
+      {/* Under words, 12rem asked for, so a short reply's bubble still shows how the quote starts; no
+          more, so a long quote does not stretch it; then as wide as the bubble, never wider. Alone, as
+          wide as it reads, down to none, so the bubble stays in the room. Cut where it ends. */}
+      {q && (
+        <p className={cn("grid grid-cols-[max-content_minmax(0,auto)] items-center gap-1.5 text-sm text-muted-foreground", words && "w-48 max-w-full min-w-full")}>
+          <span role="img" aria-label="引用">
+            <Quote className="size-3.5" />
+          </span>
+          <span className="truncate">{plain(q.quote)}</span>
+        </p>
+      )}
+      {words && <p className="whitespace-pre-wrap wrap-anywhere">{breakLong(words)}</p>}
+    </>
+  );
 }
 
 /** What the key does now (story 282), as Rhodium will read what you typed (router's boardSay): with no
@@ -172,6 +205,41 @@ export function keep(storage: () => Storage, key: string, value: string | null) 
   } catch {}
 }
 
+/** Writes how far a scroller can still go left and right, up and down, how wide its upright bar is and
+ *  how high the one under it, none where bars lie over what scrolls, for its edge-fade or edge-fade-y
+ *  (index.css). */
+const edges = (el: HTMLElement) => {
+  el.style.setProperty("--os", `${el.scrollLeft}px`);
+  el.style.setProperty("--oe", `${el.scrollWidth - el.clientWidth - el.scrollLeft}px`);
+  el.style.setProperty("--ot", `${el.scrollTop}px`);
+  el.style.setProperty("--ob", `${el.scrollHeight - el.clientHeight - el.scrollTop}px`);
+  el.style.setProperty("--bar", `${el.offsetWidth - el.clientWidth}px`);
+  el.style.setProperty("--under", `${el.offsetHeight - el.clientHeight}px`);
+};
+/** A scroller's ref and onScroll that keep its edge-fade up to date: on a scroll, and as the scroller or
+ *  what it holds changes size, a line or a row still being written, a part swapped for another or
+ *  opened included (#638); the scroller may come later than its component. A message box holds no
+ *  element: it reads them again as its text changes. box: a ref that gets the scroller too. */
+export function useEdges<T extends HTMLElement>(box?: RefObject<T | null>) {
+  const ref = useCallback((el: T | null) => {
+    if (box) box.current = el;
+    if (!el) return;
+    const sized = new ResizeObserver(() => edges(el));
+    const watch = () => {
+      sized.disconnect();
+      for (const n of [el, ...el.children]) sized.observe(n);
+    };
+    const swapped = new MutationObserver(watch);
+    swapped.observe(el, { childList: true });
+    watch();
+    return () => {
+      sized.disconnect();
+      swapped.disconnect();
+      if (box) box.current = null;
+    };
+  }, []);
+  return { ref, onScroll: (e: UIEvent<T>) => edges(e.currentTarget) };
+}
 /** A choice in a menu: its icon and what it says; on: the one now, ticked. */
 export type Choice = { icon?: LucideIcon; label: string; on?: boolean; run: () => void };
 
@@ -307,13 +375,14 @@ export function Remove({ slot, name, open, onOpenChange }: { slot: string; name:
 /** A headless slot's row's menu on the list and the sidebar (spec web-write "列表行的菜单", stories 535,
  *  550), at where the right click was; null: closed. A live one's are what its chat's 更多 and the bar
  *  under where you type do: 停止 while its turn runs, 开新对话, 改名, the name in its row turning into a
- *  box, 切到终端, asking first, and 归档, its toast with 撤销; and, after 停止, 置顶 or 取消置顶 (#506). An
+ *  box, 切到终端, asking first, unless 终端入口 is off or there is no Herdr, and 归档, its toast with 撤销; and, after 停止, 置顶 or 取消置顶 (#506). An
  *  archived one has 恢复 and 删除. */
 export function RowMenu({ c, at, close }: { c: Card; at: { x: number; y: number } | null; close: () => void }) {
   const [, run] = useAct();
   const [removing, setRemoving] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [switching, setSwitching] = useState(false);
+  const entry = useTerminalEntry();
   // In a turn, as inTurn has it, by the state the board names.
   const turn = ["启动中", "运行中", "需要你"].includes(c.state);
   const choices: Choice[] =
@@ -323,7 +392,7 @@ export function RowMenu({ c, at, close }: { c: Card; at: { x: number; y: number 
           c.pinnedAt === null ? { icon: Pin, label: "置顶", run: () => void run({ kind: "pin", slot: c.id, on: true }) } : { icon: PinOff, label: "取消置顶", run: () => void run({ kind: "pin", slot: c.id, on: false }) },
           { icon: SquarePen, label: "开新对话", run: () => void act({ kind: "common", slot: c.id, name: "new" }).then(told) },
           { icon: Pencil, label: "改名", run: () => setRenaming(true) },
-          { icon: SquareTerminal, label: "切到终端", run: () => setSwitching(true) },
+          ...(entry ? [{ icon: SquareTerminal, label: "切到终端", run: () => setSwitching(true) }] : []),
           { icon: Archive, label: "归档", run: () => void run({ kind: "rh", argv: ["archive", c.id] }) },
         ]
       : [
@@ -334,8 +403,10 @@ export function RowMenu({ c, at, close }: { c: Card; at: { x: number; y: number 
     <>
       <MenuAt at={at} close={close} choices={choices} />
       {renaming && (
-        // The row's own ground over it, the box the only frame, no wider than a name wants; the line above stays.
-        <div className="absolute inset-x-0 top-px bottom-0 z-10 flex items-center bg-(--row) px-3 text-[15px] *:max-w-96">
+        // The row's own ground and corners over it, within its padding, so the workspace starts where its logo does
+        // and the box ends where its state does (#647); the box the only frame, no wider than a name wants; the line
+        // above stays.
+        <div className="absolute inset-x-0 top-px bottom-0 z-10 flex items-center rounded-[inherit] bg-(--row) pr-(--pr) pl-(--pl) text-[15px] *:max-w-96">
           <Rename d={c} done={() => setRenaming(false)} />
         </div>
       )}
@@ -352,6 +423,28 @@ export function Rename({ d, done }: { d: { id: string; ref: string }; done: () =
   const over = useRef(false); // sent or given up: the box's blur as it goes is not a second word
   const ws = d.ref.slice(0, d.ref.indexOf("/") + 1);
   const name = d.ref.slice(ws.length);
+  const box = useRef<HTMLSpanElement>(null);
+  // The workspace takes what the box leaves past the input's basis: whole, cut to two letters and the "…" at least, or none (#633).
+  useLayoutEffect(() => {
+    const el = box.current!;
+    const part = el.firstElementChild as HTMLElement;
+    const field = el.lastElementChild as HTMLInputElement;
+    const input = getComputedStyle(field);
+    const t = measure(part, 2);
+    const fit = () => {
+      // Measured uncut: WebKit measures a text it cut with the "…" only up to the cut.
+      part.style.width = "";
+      const w = cutOrNone(t, el.getBoundingClientRect().width - parseFloat(input.flexBasis) - parseFloat(input.marginLeft));
+      part.style.width = w === undefined ? "" : `${w}px`;
+    };
+    // Still all picked, as it opened, the name from its start (#644): browsers show its end, and keep the scroll a resize leaves.
+    const start = () => field.selectionStart === 0 && field.selectionEnd === field.value.length && (field.scrollLeft = 0);
+    fit();
+    const sized = new ResizeObserver(() => (fit(), start()));
+    sized.observe(el);
+    sized.observe(field);
+    return () => sized.disconnect();
+  }, [ws]);
   const end = async (value?: string) => {
     if (over.current) return;
     over.current = true;
@@ -360,15 +453,17 @@ export function Rename({ d, done }: { d: { id: string; ref: string }; done: () =
     done();
   };
   return (
-    <span className="flex min-w-0 flex-1 items-center">
-      <span className="min-w-0 truncate font-normal text-muted-foreground">{ws}</span>
+    <span ref={box} className="flex min-w-0 flex-1 items-center">
+      <span className="flex-none truncate font-normal text-muted-foreground">{ws}</span>
       <input
         autoFocus
         aria-label="槽位名"
         defaultValue={name}
         disabled={busy}
         enterKeyHint="done"
-        onFocus={(e) => e.currentTarget.select()}
+        // All picked, backward: WebKit shows the end a selection is moving, so its start; Chromium shows its far end,
+        // which start above takes back (#644).
+        onFocus={(e) => e.currentTarget.setSelectionRange(0, e.currentTarget.value.length, "backward")}
         onKeyDown={(e) => {
           // An input method's Enter picks its word; Safari tells it by keyCode 229 alone.
           if (e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -376,7 +471,10 @@ export function Rename({ d, done }: { d: { id: string; ref: string }; done: () =
           else if (e.key === "Escape") void end();
         }}
         onBlur={(e) => void end(e.currentTarget.value)}
-        className="ml-0.5 h-6 w-0 min-w-24 flex-1 rounded-md border bg-background px-1.5 font-semibold outline-none transition-colors hover:border-ring/50 focus:ring-2 focus:ring-ring/50"
+        // Its focus ring an outline inside its border, drawn over the picked name, whose ground is taller than the
+        // ring leaves inside (#644): opaque, as ring/50 looks on the box's ground, and in that colour from the start,
+        // whole at once.
+        className="ml-0.5 h-6 min-w-16 flex-[1_1_6rem] rounded-md border bg-background px-1.5 font-semibold outline-[color-mix(in_oklab,var(--ring)_50%,var(--background))] transition-colors hover:border-ring/50 focus:outline-2 focus:-outline-offset-3"
       />
     </span>
   );
@@ -459,13 +557,26 @@ const boxes = new Set<(slot: string, words: string) => boolean>();
 /** Where you type to each slot shown, as it takes files dropped on its chat. */
 const drops = new Set<(slot: string, files: File[]) => void>();
 
+/** Where you type to each slot shown, as it takes a reply you quote. */
+const quoters = new Set<(slot: string, reply: string) => void>();
+
 /** Files dropped on slot's chat (#286): attached where you type to it, as + attaches them. */
 export const attach = (slot: string, files: File[]) => drops.forEach((f) => f(slot, files));
-/** Puts words back where you type to the slot, after what is there: in its box, if shown, else its draft. */
-function putBack(slot: string, words: string): void {
+/** Quotes reply where you type to slot (story 573), in place of the one quoted before. */
+export const quote = (slot: string, reply: string) => quoters.forEach((f) => f(slot, reply));
+/** What is attached to each slot and not sent, kept as its draft is (#582): for the page's life, as a
+ *  File cannot go in storage. */
+const unsentFiles = new Map<string, File[]>();
+/** The reply each slot quotes and has not sent (story 573), kept as what it attaches is. */
+const unsentQuotes = new Map<string, string>();
+/** Puts words and files back where you type to the slot, after what is there: in its box, if shown, else
+ *  its draft and what it keeps attached. */
+function putBack(slot: string, words: string, files: File[] = []): void {
   let shown = false;
   for (const f of boxes) shown = f(slot, words) || shown;
-  if (!shown) keepDraft(slot, [draft(slot), words].filter(Boolean).join("\n"));
+  if (shown) return void (files.length && attach(slot, files));
+  keepDraft(slot, [draft(slot), words].filter(Boolean).join("\n"));
+  if (files.length) unsentFiles.set(slot, [...(unsentFiles.get(slot) ?? []), ...files]);
 }
 
 /** One of your messages queued on the board that Rhodium gave back, say as the slot went to the
@@ -491,16 +602,21 @@ const MAX_FILES = 20 << 20;
 /** Where you type to the slot, at the bottom of its chat (spec web-write "页面"): words over many lines,
  *  sent with the key, or Ctrl+Enter, or Enter as picked from the key's menu (story 511); pictures and
  *  files attached with +, each to drop before it goes.
- *  What you type is kept as the slot's draft till sent (story 277). Sent, your words show at once
+ *  What you type is kept as the slot's draft till sent (story 277), and what you attach, till sent or
+ *  dropped, for the page's life (#582). Sent, your words show at once
  *  (story 273), unless Rhodium runs them, whose answer shows as frame() has it: the info card is over
  *  where you type, which still takes words (story 389). / at the start brings up the slot's commands (story 294). With a turn under way and nothing
  *  typed, the key stops it (story 264). The bar under it has the agent's logo and the model with its
  *  thinking level (agent, model, effort), ultracode marked where on, each opening its sheet (stories 302-304), as /rh_agent and
- *  /model do, picked or typed alone, and closing it tapped again (story 519); then terminal: the terminal key (story 265). A slot archived has
+ *  /model do, picked or typed alone, and closing it tapped again (story 519); then, switchable, the terminal key (story 265). A slot archived has
  *  none of the three, as the model sheet's /model and /effort on opening would bring it back. changed: what the chat shows has changed. */
-export function Composer({ slot, turn, terminal, log, changed, commands, agent, model, effort, ultracode }: { slot: string; turn: boolean; terminal: boolean; log: Messages; changed: () => void; commands: Command[]; agent: AgentKind | null; model: string | null; effort: string | null; ultracode: boolean }) {
+export function Composer({ slot, turn, archived, switchable, log, changed, commands, agent, model, effort, ultracode }: { slot: string; turn: boolean; archived: boolean; switchable: boolean; log: Messages; changed: () => void; commands: Command[]; agent: AgentKind | null; model: string | null; effort: string | null; ultracode: boolean }) {
   const [text, setText] = useState(() => draft(slot));
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<File[]>(() => unsentFiles.get(slot) ?? []);
+  useEffect(() => void (files.length ? unsentFiles.set(slot, files) : unsentFiles.delete(slot)), [slot, files]);
+  // The reply you quote (story 573), over what you type till you send words for the agent.
+  const [quoted, setQuoted] = useState<string | null>(() => unsentQuotes.get(slot) ?? null);
+  useEffect(() => void (quoted === null ? unsentQuotes.delete(slot) : unsentQuotes.set(slot, quoted)), [slot, quoted]);
   const [busy, setBusy] = useState(false);
   // The palette: the command ↑↓ are on, and what was typed when Esc closed it, till you type on.
   const [at, setAt] = useState(0);
@@ -517,14 +633,15 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
   const send = (text: string) => act({ kind: "say", slot, text });
   const picker = useRef<HTMLInputElement>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+  const edged = useEdges(box);
   const type = (t: string) => (setText(t), keepDraft(slot, t), setAt(0), setShut(null));
   const list = /^\/\S*$/.test(text) && text !== shut ? matching(commands, text.slice(1)) : [];
   const empty = !text.trim() && !files.length;
-  // Whether the box is empty now, not as go() began.
-  const now = useRef(empty);
-  now.current = empty;
   const mode = keyMode(turn, text, files.length);
   const stop = turn && empty;
+  // At its full height, text written in grows it no more and, away from the caret, scrolls it not:
+  // its fade is read again as the text changes (#579).
+  useLayoutEffect(() => edges(box.current!), [text]);
   // Words given back or taken from the queue to edit go after what is here.
   const current = useRef(text);
   current.current = text;
@@ -533,9 +650,11 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
   useEffect(() => {
     const f = (s: string, words: string) => s === slot && (type([current.current, words].filter(Boolean).join("\n")), true);
     const dropped = (s: string, more: File[]) => s === slot && setFiles((files) => [...files, ...more]);
+    const quoter = (s: string, reply: string) => s === slot && (setQuoted(reply), box.current?.focus());
     boxes.add(f);
     drops.add(dropped);
-    return () => (boxes.delete(f), void drops.delete(dropped));
+    quoters.add(quoter);
+    return () => (boxes.delete(f), drops.delete(dropped), void quoters.delete(quoter));
   }, [slot]);
   /** A command's answer, where frame() puts it: in the card, in place of what it had; a toast closes
    *  the card it was picked from, if that is still the one open. */
@@ -582,9 +701,11 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
     if (busy || (empty && !stop)) return;
     if (files.reduce((n, f) => n + f.size, 0) > MAX_FILES) return toast("附件一次最多 20MB。", true);
     if (stop) return halt();
-    const words = typed.trim();
     // Queued, it shows in the queue rather than as a bubble (story 283).
     const queued = keyMode(turn, typed, files.length) === "queue";
+    // Words for the agent go under the reply you quote, which then goes; a command leaves it.
+    const words = quoted === null ? typed.trim() : withQuote(quoted, typed.trim(), files.length);
+    if (words !== typed.trim()) setQuoted(null);
     const shown = queued ? null : forAgent(words, files.length);
     const s: Sent = { id: crypto.randomUUID(), text: shown ?? "", words, files, from: log.end };
     if (shown !== null) log.sent.push(s);
@@ -598,7 +719,8 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
       if (!files.length && own(words)) return;
       const r = await (files.length ? say(slot, s) : command(slot, words));
       show(r, words);
-      if (!r.ok && now.current) (type(words), setFiles(files));
+      // The slot's draft and attachments, not this box's: switched away and back, you type in another.
+      if (!r.ok && !draft(slot).trim() && !unsentFiles.has(slot)) putBack(slot, words, files);
       return;
     }
     // A message says how it went where it shows, red to try again. Queued, the queue shows it; turned
@@ -609,7 +731,7 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
     const r = await say(slot, s);
     setBusy(false);
     if (shown !== null) s.failed = r.ok ? undefined : r.error;
-    else if (!r.ok) (toast(r.error, true), putBack(slot, words), setFiles((since) => [...since, ...files]));
+    else if (!r.ok) (toast(r.error, true), putBack(slot, words, files));
     changed();
   };
   return (
@@ -619,27 +741,18 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
       {agent && <AgentSheet open={shown === "agent"} close={() => setShown((s) => (s === "agent" ? null : s))} agent={agent} turn={turn} send={send} />}
       {/* With a mouse its search box took the keyboard: closed, the caret is back where you type. */}
       <ModelSheet open={shown === "model"} close={() => (setShown((s) => (s === "model" ? null : s)), matchMedia("(pointer: fine)").matches && box.current?.focus())} send={send} />
-      <div className="relative mx-auto max-w-3xl rounded-3xl border bg-card shadow-xs transition-colors focus-within:border-ring hover:not-focus-within:border-ring/50">
+      <div className="relative mx-auto max-w-3xl rounded-3xl border bg-card shadow-xs">
         {list.length > 0 && <Palette list={list} at={Math.min(at, list.length - 1)} pick={pick} point={setAt} />}
-        {files.length > 0 && (
-          <ul aria-label="附件" className="flex gap-2 overflow-x-auto px-3 pt-3">
-            {files.map((f, i) => (
-              <li key={`${i} ${f.name}`} className="relative shrink-0 pt-1.5 pr-1.5">
-                {f.type.startsWith("image/") ? (
-                  <Thumb file={f} />
-                ) : (
-                  <span className="flex h-14 w-32 items-center gap-1.5 rounded-lg border bg-muted px-2 text-xs">
-                    <FileText className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="line-clamp-2 wrap-anywhere">{f.name}</span>
-                  </span>
-                )}
-                <button aria-label="移除" onClick={() => setFiles(files.filter((_, j) => j !== i))} className="absolute top-0 right-0 grid size-6 place-items-center rounded-full border bg-background shadow-xs transition-colors hover:bg-muted">
-                  <X className="size-3.5" />
-                </button>
-              </li>
-            ))}
-          </ul>
+        {quoted !== null && (
+          <div className="flex items-center gap-1.5 pt-1.5 pl-4 text-sm text-muted-foreground">
+            <Quote className="size-3.5 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">引用：{plain(quoted)}</span>
+            <button aria-label="取消引用" onClick={() => setQuoted(null)} className="hover-round -my-1.5 grid size-11 shrink-0 place-items-center hover:text-foreground">
+              <X className="size-4" />
+            </button>
+          </div>
         )}
+        {files.length > 0 && <Attached files={files} drop={(i) => setFiles(files.filter((_, j) => j !== i))} />}
         <textarea
           aria-label="消息"
           placeholder="发消息"
@@ -654,7 +767,7 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
             e.preventDefault();
             setFiles((files) => [...files, ...pasted]);
           }}
-          ref={box}
+          {...edged}
           onKeyDown={(e) => {
             // The palette open (story 296): ↑↓ move, Enter or Tab picks, Esc closes. Not while an input
             // method still composes what you type: its Enter takes the word, its Esc ends the composing.
@@ -674,15 +787,15 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
             else return;
             e.preventDefault();
           }}
-          className="block max-h-[40dvh] min-h-11 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground"
+          className="card-scroll edge-fade-y block max-h-[40dvh] scroll-py-8 min-h-11 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground"
         />
         <div className="flex min-w-0 items-center px-1 pb-1">
-          {agent && terminal && (
+          {agent && !archived && (
             <>
               <button aria-label="换 agent" aria-expanded={shown === "agent"} onClick={() => sheet("agent", true)} className="hover-round grid size-11 shrink-0 place-items-center">
                 <AgentLogo agent={agent} className="size-5" />
               </button>
-              <button aria-label="模型和思考强度" aria-expanded={shown === "model"} onClick={() => sheet("model", true)} className="flex h-11 min-w-0 items-center gap-1 rounded-full px-2.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-6 focus-visible:outline-ring">
+              <button aria-label="模型和思考强度" aria-expanded={shown === "model"} onClick={() => sheet("model", true)} className="flex h-11 min-w-0 items-center gap-1 rounded-full pr-2 pl-3 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-6 focus-visible:outline-ring">
                 <span className="truncate">
                   <ModelName name={model ?? "默认"} />
                 </span>
@@ -692,7 +805,7 @@ export function Composer({ slot, turn, terminal, log, changed, commands, agent, 
               </button>
             </>
           )}
-          {terminal && (
+          {switchable && (
             <ToTerminal slot={slot} turn={turn} className="hover-round grid size-11 shrink-0 place-items-center text-muted-foreground hover:text-foreground disabled:opacity-50">
               <SquareTerminal className="size-5" />
             </ToTerminal>
@@ -733,11 +846,11 @@ const HELD: Partial<Record<SlotData["queue"][number]["reason"], string>> = { aft
 /** The queue above where you type (spec web-write "待发队列", stories 283-286): how many wait, and once a
  *  stop paused them, a pause sign and 继续. Each a line: 插话 sends it in now (发送, paused), 编辑 takes it
  *  back where you type, 删除 takes it off. One with files has no 编辑: they cannot go back. One Rhodium
- *  holds for you can only be taken off, why under it. Three lines high, then it scrolls. Only what
- *  goes wrong is said: the queue itself shows what went right. */
+ *  holds for you can only be taken off, why under it. Three lines high, then it scrolls, faded where cut
+ *  (#579). Only what goes wrong is said: the queue itself shows what went right. */
 export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] }) {
   const [busy, setBusy] = useState<string | null>(null);
-  if (!queue.length) return null;
+  const scroller = useEdges<HTMLDivElement>();
   const run = async (key: string, a: Omit<Extract<BoardAct, { kind: "queued" }>, "kind" | "slot">, then?: () => void) => {
     if (busy) return;
     setBusy(key);
@@ -755,53 +868,94 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
   return (
     <section aria-label="待发队列" className="px-3 pt-1">
       <div className="mx-auto max-w-3xl rounded-2xl border bg-card text-sm shadow-xs">
-        <div className="flex h-9 items-center gap-1.5 pl-3 text-muted-foreground">
+        <div className="flex h-9 items-center gap-1.5 border-b pl-3 text-muted-foreground">
           <span role="img" aria-label={paused ? "暂停了" : "排着"}>
             {paused ? <Pause className="size-4" /> : <List className="size-4" />}
           </span>
           <span className="tabular-nums">{queue.length}</span>
           {paused && <span className="ml-auto">{button("go", "继续", <Play className="size-4" />, () => void run("go", { op: "now" }))}</span>}
         </div>
-        <ul className="max-h-[8.25rem] overflow-y-auto border-t">
-          {queue.map((q) => {
-            const held = HELD[q.reason];
-            return (
-              <li key={q.id} className="flex min-h-11 items-center pl-3">
-                {q.files > 0 && (
-                  <span role="img" aria-label="附件" className="mr-1.5 shrink-0 text-muted-foreground">
-                    <Paperclip className="size-3.5" />
-                  </span>
-                )}
-                <div className="min-w-0 flex-1 py-1">
-                  <p className="truncate">{q.text}</p>
-                  {held && <p className="text-xs text-muted-foreground">{held}</p>}
-                </div>
-                {!held &&
-                  (q.reason === "web_paused"
-                    ? button(`${q.id} now`, "发送", <ArrowUp className="size-4" />, () => void run(`${q.id} now`, { op: "now", input: q.id }))
-                    : button(`${q.id} now`, "插话", <CornerUpRight className="size-4" />, () => void run(`${q.id} now`, { op: "now", input: q.id })))}
-                {/* With files, a gap where 编辑 goes keeps the buttons in their columns. */}
-                {!held &&
-                  (q.files ? <span className="size-11 shrink-0" /> : button(`${q.id} edit`, "编辑", <Pencil className="size-4" />, () => void run(`${q.id} edit`, { op: "drop", input: q.id }, () => putBack(slot, q.text))))}
-                {button(`${q.id} drop`, "删除", <X className="size-4" />, () => void run(`${q.id} drop`, { op: "drop", input: q.id }))}
-              </li>
-            );
-          })}
-        </ul>
+        {/* The line over it is the head's: the fade would take it. */}
+        <div {...scroller} className="card-scroll edge-fade-y max-h-[8.25rem] scroll-py-8 overflow-y-auto">
+          <ul>
+            {queue.map((q) => {
+              const held = HELD[q.reason];
+              // Under a quote, your words, so two quoting the same are told apart; the quote's, with none.
+              const quoted = quoteOf(q.text);
+              return (
+                <li key={q.id} className="flex min-h-11 items-center pl-3">
+                  {q.files > 0 && (
+                    <span role="img" aria-label="附件" className="mr-1.5 shrink-0 text-muted-foreground">
+                      <Paperclip className="size-3.5" />
+                    </span>
+                  )}
+                  {quoted && (
+                    <span role="img" aria-label="引用" className="mr-1.5 shrink-0 text-muted-foreground">
+                      <Quote className="size-3.5" />
+                    </span>
+                  )}
+                  <div className="min-w-0 flex-1 py-1">
+                    <p className="truncate">{quoted ? quoted.rest.trim() || plain(quoted.quote) : q.text}</p>
+                    {held && <p className="text-xs text-muted-foreground">{held}</p>}
+                  </div>
+                  {!held &&
+                    (q.reason === "web_paused"
+                      ? button(`${q.id} now`, "发送", <ArrowUp className="size-4" />, () => void run(`${q.id} now`, { op: "now", input: q.id }))
+                      : button(`${q.id} now`, "插话", <CornerUpRight className="size-4" />, () => void run(`${q.id} now`, { op: "now", input: q.id })))}
+                  {/* With files, a gap where 编辑 goes keeps the buttons in their columns. */}
+                  {!held &&
+                    (q.files ? <span className="size-11 shrink-0" /> : button(`${q.id} edit`, "编辑", <Pencil className="size-4" />, () => void run(`${q.id} edit`, { op: "drop", input: q.id }, () => putBack(slot, q.text))))}
+                  {button(`${q.id} drop`, "删除", <X className="size-4" />, () => void run(`${q.id} drop`, { op: "drop", input: q.id }))}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       </div>
     </section>
   );
 }
 
-/** A picture you attached, small. */
-function Thumb({ file }: { file: File }) {
+/** What you attached, over where you type, lined up with the words (#577): past the box's edge it
+ *  scrolls, its edges faded as an unwrapped code block's are, its bar's thumb lined up too (13px of
+ *  track and its 3px clear border, the list's 16px). drop: the i-th let go. */
+function Attached({ files, drop }: { files: File[]; drop: (i: number) => void }) {
+  const scroller = useEdges<HTMLDivElement>();
+  return (
+    <div {...scroller} className="card-scroll edge-fade overflow-x-auto [--track-x:0.8125rem]">
+      <ul aria-label="附件" className="flex w-max gap-2 px-4 pt-3">
+        {files.map((f, i) => (
+          <li key={`${i} ${f.name}`} className="relative shrink-0 pt-1.5 pr-1.5">
+            {f.type.startsWith("image/") ? (
+              <Thumb file={f} className="size-14 rounded-lg border object-cover" />
+            ) : (
+              <span className="flex h-14 w-32 items-center gap-1.5 rounded-lg border bg-muted px-2 text-xs">
+                <FileText className="size-4 shrink-0 text-muted-foreground" />
+                <span className="line-clamp-2 wrap-anywhere">{f.name}</span>
+              </span>
+            )}
+            <button aria-label="移除" onClick={() => drop(i)} className="absolute top-0 right-0 grid size-6 place-items-center rounded-full border bg-background shadow-xs transition-colors hover:bg-muted">
+              <X className="size-3.5" />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** What the chat shows as a picture, known by its first bytes (board's media); the rest as a file. */
+const PICTURES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/** A picture you attached. */
+function Thumb({ file, className }: { file: File; className: string }) {
   const [url, setUrl] = useState<string>();
   useEffect(() => {
     const u = URL.createObjectURL(file);
     setUrl(u);
     return () => URL.revokeObjectURL(u);
   }, [file]);
-  return <img src={url} alt={file.name} className="size-14 rounded-lg border object-cover" />;
+  return <img src={url} alt={file.name} className={className} />;
 }
 
 /** A message you sent from here that the transcript has yet to bring (story 273): yours, faint, as one
@@ -816,20 +970,30 @@ export function Pending({ s, slot, log, changed }: { s: Sent; slot: string; log:
     s.failed = r.ok ? undefined : r.error;
     changed();
   };
+  const red = s.failed !== undefined && "border-destructive";
   return (
     <div className="grid grid-cols-[minmax(0,1fr)] justify-items-end gap-1 pl-10">
-      <div className={cn("max-w-full min-w-0 rounded-2xl rounded-tr-sm border bg-muted px-3 py-2", s.failed !== undefined ? "border-destructive" : "opacity-60")}>
-        {s.text && <p className="whitespace-pre-wrap wrap-anywhere">{breakLong(s.text)}</p>}
-        {s.files.map((f, i) =>
-          f.type.startsWith("image/") ? (
-            <Thumb key={i} file={f} />
-          ) : (
-            <p key={i} className="flex items-center gap-1 text-xs text-muted-foreground">
-              <Paperclip className="size-3 shrink-0" />
-              <span className="truncate">{f.name}</span>
-            </p>
-          ),
-        )}
+      {/* As the chat draws it once the transcript brings it (Said, Carried), so it does not jump then:
+          what it carried over its words, a picture as big as its preview will be. */}
+      <div className="flex max-w-full items-start gap-2">
+        <div className={cn("grid min-w-0 justify-items-end gap-1.5", s.failed === undefined && "opacity-60")}>
+          {s.files.length > 0 && (
+            <div className="grid grid-cols-[minmax(0,auto)] justify-items-end gap-1.5">
+              {s.files.map((f, i) =>
+                PICTURES.includes(f.type) ? (
+                  <Thumb key={i} file={f} className={cn("block max-h-[min(60dvh,800px)] max-w-[min(100%,800px)] rounded-xl border bg-muted", red)} />
+                ) : (
+                  <FileRow key={i} name={f.name} className={red} />
+                ),
+              )}
+            </div>
+          )}
+          {s.text && (
+            <div className={cn("min-w-0 rounded-2xl rounded-tr-sm border bg-muted px-3 py-2", red)}>
+              <Words text={s.text} />
+            </div>
+          )}
+        </div>
       </div>
       {/* Under it, not beside it, so a long one keeps its width on a phone; pulled out by the
           buttons' padding, so the retry icon sits on the bubble's right edge. */}

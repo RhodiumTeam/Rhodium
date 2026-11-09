@@ -8,9 +8,9 @@ import { AGENT_KINDS, AGENTS, DEFAULT_AGENT } from "./agents";
 import { askButtons, askLine, askText, parseAnswer, timeoutAnswer, type Answer, type AskKind, type AskPrompt, type ConfirmInput, type Said } from "./asks";
 import { COMMANDS, IM_COMMANDS, homeButtons, imCommand, imUsage, QQ_ROW, SETTINGS, slashMenu, SLOT_HINT, TELEGRAM_ROW, tilde, type Lists, type SettingKey, type SlotEntry } from "./commands";
 import { formatDuration, formatGB, fixedOwners, formatMB, owners, paired, parseDuration, type Config } from "./config";
-import { FROM_BOARD, parseCommand, type AgentAsk, type AgentEvent, type AgentKind, type BoardAct, type Button, type Capabilities, type Choice, type CommandResult, type CommonCommand, type Importable, type InboundMessage, type Input, type MenuItem, type PanelUi, type RowButton, type RhCaller, type TimerKind, type Used } from "./contracts";
+import { FROM_BOARD, parseCommand, quoting, type AgentAsk, type AgentEvent, type AgentKind, type BoardAct, type Button, type Capabilities, type Choice, type CommandResult, type CommonCommand, type Importable, type InboundMessage, type Input, type MenuItem, type PanelUi, type RowButton, type RhCaller, type TimerKind, type Used } from "./contracts";
 import { contextText, formatCommand, left, statusText, time, usageText, type SlotInfo } from "./im-commands";
-import { fileKind, mediaLine, withoutMedia } from "./media";
+import { fileKind, mediaLine, withoutMedia, type Media } from "./media";
 import { buttonRows, CANCEL, layout, moment, PAGE, showPanel, span, unpaged, width, type Candidate, type Panel } from "./panels";
 import { amid, MADE, PLATFORMS, series, type BotDef, type Made } from "./platforms";
 import { REPORT_LINE, RESUME_PROMPT, sendLine, sourceLine, withoutSource } from "./prompt";
@@ -39,8 +39,9 @@ export type State = {
   unsure: AgentInput[];
   // The chat each of your messages in queued or unsure came from, by agent input id.
   chatOf: Record<string, string>;
-  // For an IM message quoting one the platform gives no text for: that message's stored text, if any (architecture §8.3).
-  quoted: string | null;
+  // For an IM message quoting one on record in its chat (architecture §8.3): that message's stored text, for when the
+  // platform gives none; and the slot whose rh send to you it was, led by that slot's name (product §5.3).
+  quoted: { text: string | null; slot: string | null } | null;
   // An IM input's message is on record already: the platform delivered it again (architecture §7.3).
   // A board input's id is: the page sent it again, its answer lost (spec web-write).
   seen: boolean;
@@ -63,6 +64,8 @@ export type TurnProgress = Progress & { live?: string; chat?: string; left?: str
  *  newPairCode: a fresh pairing code no one can guess, for rh pair to give out.
  *  keepFile: copies the file at an absolute path into the media store, as media.ts's keepFile.
  *  diskFree: the free bytes on the disk the state dir is on, read when asked, as the clock is.
+ *  herdr: whether Herdr is installed (config.ts's hasHerdr), read when asked as diskFree is.
+ *  front: whether a page of the board is in front on some device, as the pages tell it (product §5.9).
  *  retarget: points each bot whose target is the slot from at to, in the config file (config.ts's
  *  renameTarget) and in config; throws when the file cannot be changed so.
  *  inboundOf: the ids of the chat's inbound messages on record, read when asked (rh forget). */
@@ -74,6 +77,8 @@ export type Ctx = {
   capabilities: (bot: string) => Capabilities | undefined;
   keepFile: (path: string, max: number) => { size: number; path?: string } | null;
   diskFree: () => number;
+  herdr: () => boolean;
+  front: () => boolean;
   retarget: (from: string, to: string) => { bots: string[]; backup: string } | null;
   inboundOf: (chat: string) => string[];
 };
@@ -103,7 +108,8 @@ export type RhReply =
 
 /** Handed off after the commit. A timer with at = null cancels it. */
 export type Effect =
-  | { kind: "rh_reply"; id: string; reply: RhReply }
+  // sent: rh send's messages to you, which the reply waits for the first try of (architecture §8.7).
+  | { kind: "rh_reply"; id: string; reply: RhReply; sent?: string[] }
   // Append [bots.<name>] to the config file and take the bot in. Should the write fail, it answers
   // rh call id with why, and the rh_reply after it finds no one waiting.
   | { kind: "add_bot"; id: string; name: string; table: Record<string, string> }
@@ -193,13 +199,14 @@ export const PASSED: readonly (string | null)[] = [AFTER_TURN, WEB_QUEUE, WEB_PA
 /** What your message to a slot in TUI mode gets back (product §4.2, docs/im-style.md §10.2), with
  *  what to do next: while Herdr restarts, it says so. ref: the slot's; home: the bot's default slot's,
  *  when the chat goes to another one (docs/im-style.md §10.2). board: it came from the board, whose
- *  banner takes the slot back (spec web-write). */
-function tuiRefused(s: Slot, ref: string, home: string | undefined, board = false): { text: string; buttons?: Button[] } {
+ *  banner takes the slot back (spec web-write). named: the chat goes to another slot, your quote took
+ *  the message to this one (im()): the /rh_release you are told to send names it, as a bare one there is not for it. */
+function tuiRefused(s: Slot, ref: string, home: string | undefined, board = false, named = false): { text: string; buttons?: Button[] } {
   if (s.herdrLostAt !== null) return { text: `Herdr 正在重启，这条没交给 ${ref}。等一会儿再发。` };
   const release = (label: string): Button => ({ label, data: `/rh_release ${ref}` });
   if (s.herdrPane !== null && s.tuiPid === null) return { text: `${ref} 没能切回无头，这条没交给它。`, buttons: [release("再试一次")] };
   if (board) return { text: `${ref} 在 TUI 里，这条没交给它。点横幅上的“收回终端”把它切回无头。` };
-  const text = `${ref} 在 TUI 里，这条没交给它。发 ${home ? `/rh_use - 改和 ${home} 说，或者发 ` : ""}/rh_release 把它切回无头。`;
+  const text = `${ref} 在 TUI 里，这条没交给它。发 ${home ? `/rh_use - 改和 ${home} 说，或者发 ` : ""}/rh_release ${named ? `${ref} ` : ""}把它切回无头。`;
   return { text, buttons: [release("切回无头"), { label: "换一个槽位", data: "/rh_use" }] };
 }
 
@@ -234,6 +241,7 @@ function routed(state: State, input: Input, ctx: Ctx): Decision {
   if (input.kind === "herdr") return herdrLink(state, input, ctx);
   if (input.kind === "import") return imported(state, input, ctx);
   if (input.kind === "edit_failed") return editFailed(state, input, ctx);
+  if (input.kind === "send_failed") return unsaid(state, ctx, nothing(), JSON.parse(input.payload) as Payload);
   if (input.kind === "recovery") {
     // Wakes that waited for room, should there be room now: maxRunning may have been raised.
     const d = nothing();
@@ -277,7 +285,10 @@ function routed(state: State, input: Input, ctx: Ctx): Decision {
     }
   }
   if (counted) d.writes.push(counted.write); // refused calls count too
-  if (reply) d.effects.push({ kind: "rh_reply", id: input.id, reply });
+  // rh send to you answers once its messages have been tried, which may have moved them to another bot
+  // (architecture §8.7).
+  const sent = reply?.ok && d.events.some((e) => e.type === "send_me") ? d.writes.flatMap((w) => (w.op === "insert" && w.table === "outbound" && w.row.status === "pending" ? [w.row.id] : [])) : [];
+  if (reply) d.effects.push({ kind: "rh_reply", id: input.id, reply, ...(sent.length && { sent }) });
   return d;
 }
 
@@ -389,7 +400,7 @@ function boardBind(state: State, ctx: Ctx, d: Decision, id: string, act: Extract
     } else {
       const bot = state.bots.find((b) => b.id === c.bot) ?? refuse("没有这个 Bot。");
       const now = target(state, bot, undefined, ctx);
-      if ((now?.id ?? null) !== c.from) stale(`${botName(state, ctx, bot)} 的默认目标${now ? `已经改成 ${ref(now)}` : "已经没有了"}`);
+      if ((now?.id ?? null) !== c.from) stale(`${botName(ctx, bot)} 的默认目标${now ? `已经改成 ${ref(now)}` : "已经没有了"}`);
       bots.push([bot, slot(c.to)]);
     }
   }
@@ -429,6 +440,8 @@ function boardAnswer(state: State, ctx: Ctx, d: Decision, id: string, act: Extra
   // The ask as it was sent there, its last message the one with the buttons.
   const shown = edits ? `${askMessages({ ...a, prompt: prompt(a) }, askFrom(state, ctx, slot, to.chat), to.caps).at(-1)!.text}\n\n${said}` : undefined;
   const result = answerAsk(state, ctx, d, slot, a, r.answer, WEB, undefined, shown);
+  // You wrote to it here last, as an answer in IM is contact there (product §5.9).
+  d.writes.push({ op: "update", table: "slot", where: { id: slot.id }, patch: { webAt: ctx.now } });
   if (to && !edits && place(quotas(state, ctx, d), to, null).status === "pending") outbound(d, ctx, { chat: to.chat.id, replyTo: null, trace: id, text: said });
   return { ok: true, text: r.receipt + (result ?? "") };
 }
@@ -449,7 +462,8 @@ export function askGone(state: Pick<State, "bots" | "chats">, ctx: Pick<Ctx, "co
 function boardCommon(state: State, ctx: Ctx, d: Decision, id: string, act: Extract<BoardAct, { kind: "common" }>): void {
   const slot = state.slots.find((s) => s.id === act.slot) ?? refuse("没有这个槽位。");
   if (slot.mode === "tui") refuse(tuiRefused(slot, slotView(state, slot).ref, undefined, true).text);
-  const patch: Patch<Slot> = {};
+  // You wrote to it here last, as a common command in IM is contact there (product §5.9).
+  const patch: Patch<Slot> = { webAt: ctx.now };
   common(state, slot, { name: act.name, args: act.args ?? "" }, patch, d, ctx, BOARD, id);
   d.writes.push({ op: "update", table: "slot", where: { id: slot.id }, patch });
 }
@@ -491,7 +505,8 @@ function boardSay(state: State, ctx: Ctx, d: Decision, id: string, act: Extract<
   if (slot.mode === "tui") refuse(tuiRefused(slot, ref, undefined, true).text);
   roomFor(ctx, slot, ref);
   const images = attachments.flatMap((a) => (a.mimeType ? [{ path: a.path, mimeType: a.mimeType }] : []));
-  const patch: Patch<Slot> = {};
+  // You wrote to it here last, for where rh send me goes (product §5.9).
+  const patch: Patch<Slot> = { webAt: ctx.now };
   const r = toAgent(state, ctx, d, slot, patch, { body, line: sourceLine(FROM_BOARD), bang: bang !== null, images, queue: true }, { turnChat: BOARD, turnInbound: id });
   d.writes.push({ op: "update", table: "slot", where: { id: slot.id }, patch });
   d.events.push({ source: "board", type: "board_routed", trace: id, slot: slot.id, data: { reason: r.reason, text: clip(body, ctx.config.limits.quoteMaxChars) } });
@@ -644,11 +659,14 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   const caps = ctx.capabilities(bot.id);
   // A page button names the page and the command that shows the panel (docs/im-style.md §11.4). A
   // number picks from the paged panel that is this chat's last message (Memo, panelsLeft()), unless
-  // an ask waits for an answer.
+  // an ask waits for an answer, or it quotes a slot's rh send led by its name: it is for that slot (product §5.3).
   const paged = m.button && /^page:(\d+):(.+)$/s.exec(m.button.data);
   const n = !m.button && /^\d+$/.test(m.text.trim()) ? Number(m.text.trim()) : 0;
-  const asked = () => state.asks.some((a) => a.status === "open" && (a.forwardedTo === chat.id || a.slot === target(state, bot, chat, ctx)?.id));
-  const byNumber = n && memo?.commands && !asked() ? memo.commands[n - 1] : undefined;
+  const bound = target(state, bot, chat, ctx);
+  // The slot whose rh send you quote, unless it is gone or is the one this chat goes to: then all goes as ever (architecture §8.3).
+  const quotedFrom = state.quoted?.slot ? state.slots.find((s) => s.id === state.quoted!.slot && s.id !== bound?.id) : undefined;
+  const asked = () => state.asks.some((a) => a.status === "open" && (a.forwardedTo === chat.id || a.slot === bound?.id));
+  const byNumber = n && memo?.commands && !asked() && !quotedFrom ? memo.commands[n - 1] : undefined;
   // On a platform that edits, what a press leads to shows in place of the message pressed.
   const edit = caps?.progress !== "edit" ? undefined : m.button?.message ? { message: m.button.message } : byNumber ? memo!.edit : undefined;
   const ui: PanelUi = { ...(paged && { page: Number(paged[1]) }), ...(edit && { edit }) };
@@ -694,7 +712,7 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   // Rhodium's own commands need no target slot (product §5.3).
   if (cmd?.kind === "rh") {
     const at = { chat: chat.id, inbound: id, ui, ...(m.button?.text !== undefined && { pressed: m.button.text }) };
-    const said = rhCommand(state, cmd, target(state, bot, chat, ctx), at, ctx, d, { bot, chat });
+    const said = rhCommand(state, cmd, bound, at, ctx, d, { bot, chat });
     if (said !== null) answer(d, ctx, { chat: chat.id, inbound: id, ui }, said);
     return record(null, "Rhodium 命令");
   }
@@ -710,11 +728,14 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
     d.writes.push({ op: "update", table: "slot", where: { id: other.id }, patch });
     return record(other.id, why);
   }
-  const slot = target(state, bot, chat, ctx);
+  // Your quote of another slot's rh send to you, led by its name, is for that slot: it goes there, not
+  // to the slot this chat goes to, as rh send would, an archived one brought back (product §5.3). A command goes as ever.
+  const sender = !cmd ? quotedFrom : undefined;
+  const slot = sender ?? bound;
   // An ask pushed here that this chat does not go to, say a child's in its root slot's chat or one
   // another bot forwarded (tell()), takes your answer here, before the slot this chat goes to (product §5.3).
   // With asks of another slot too, this chat's or another one pushed here, you pick from one list of them all.
-  const away = !bang && !cmd ? state.asks.filter((a) => a.status === "open" && a.forwardedTo === chat.id && a.slot !== slot?.id) : [];
+  const away = !bang && !cmd && !sender ? state.asks.filter((a) => a.status === "open" && a.forwardedTo === chat.id && a.slot !== slot?.id) : [];
   if (away.length) {
     const asks = state.asks.filter((a) => away.includes(a) || (a.status === "open" && a.slot === slot?.id));
     const one = asks.every((a) => a.slot === away[0]!.slot);
@@ -734,11 +755,23 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   // With asks open, your message is for them (product §5.3); a ! message interrupts instead. So it
   // is while the slot waits for its turn to end to switch to the terminal: the turn needs the answers.
   const open = openAsks(state, slot);
-  if (open.length && !bang && !cmd) return done(answerFromIm(state, ctx, d, open, text, attachments.length > 0, chat, id));
+  if (open.length && !bang && !cmd) {
+    // Your quote brought another slot's asks here: what you type here next, a number too, is for them (away above).
+    // As with an ask pushed here (pushAsk()), the picks and lists of the others you answer here are void.
+    if (sender) {
+      for (const a of open) if (a.forwardedTo !== chat.id) d.writes.push({ op: "update", table: "ask", where: { id: a.id }, patch: { forwardedTo: chat.id } });
+      for (const o of state.asks) {
+        if (o.status === "open" && o.slot !== sender.id && (o.forwardedTo === chat.id || o.slot === bound?.id) && (o.listNo !== null || o.pickedAt !== null)) {
+          d.writes.push({ op: "update", table: "ask", where: { id: o.id }, patch: { listNo: null, pickedAt: null } });
+        }
+      }
+    }
+    return done(answerFromIm(state, ctx, d, open, text, attachments.length > 0, chat, id));
+  }
   // From /rh_tui on, the agent is the terminal's: nothing of yours reaches it from IM (product §4.2).
   if (tui) {
-    const home = chat.target !== null ? target(state, bot, undefined, ctx) : undefined;
-    const refused = tuiRefused(slot, slotView(state, slot).ref, home && home.id !== slot.id ? slotView(state, home).ref : undefined);
+    const home = chat.target !== null && !sender ? target(state, bot, undefined, ctx) : undefined;
+    const refused = tuiRefused(slot, slotView(state, slot).ref, home && home.id !== slot.id ? slotView(state, home).ref : undefined, false, !!sender);
     // A press, say on an old /status, has it in place of that message (docs/im-style.md §9.1).
     answer(d, ctx, { chat: chat.id, inbound: id, ui }, refused.text, fitting(caps, refused.buttons));
     return done(refused.text, false);
@@ -751,12 +784,21 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   }
   // The quoted text on top; each attachment a line saying where it is kept, and a picture the
   // agent can see goes along too.
-  const quoted = m.quote && (m.quote.text ?? state.quoted ?? m.quote.fallback ?? "（找不到引用的原文）").replace(/^/gm, "> ") + "\n";
+  const quoted = m.quote && quotedOf(m.quote.text ?? state.quoted?.text ?? m.quote.fallback ?? "（找不到引用的原文）", m.quote.picked) + "\n";
   const images = attachments.flatMap((a) => (a.path && a.mimeType ? [{ path: a.path, mimeType: a.mimeType }] : []));
   const body = [quoted, text, ...attachments.map(mediaLine)].filter(Boolean).join("\n");
   const r = toAgent(state, ctx, d, slot, patch, { body, line: sourceLine(chatName(state, ctx, chat)), bang: bang !== null, images }, { turnChat: chat.id, turnInbound: id });
-  if (r.told) reply(d, ctx, chat.id, id, r.told);
-  return done(r.reason);
+  const told = [sender && `已交给 ${slotView(state, sender).ref}。`, r.told].filter(Boolean).join("\n");
+  if (told) reply(d, ctx, chat.id, id, told);
+  return done(sender ? `按引用交给发消息的槽位，${r.reason}` : r.reason);
+}
+
+/** A quoted message as the agent gets it (quoting): of a whole one, the start of its words, but the
+ *  lines saying where its pictures and files are kept whole, as the agent finds them by these (§8.3). */
+function quotedOf(text: string, picked?: true): string {
+  const { text: words, files } = withoutMedia(text);
+  const kept = files ? text.split("\n").slice(-files) : [];
+  return [words && quoting(words, picked), ...kept.map((l) => `> ${l}`)].filter(Boolean).join("\n");
 }
 
 /** Your message to the slot's agent (product §5.3), from a chat or from the board's page, whichever
@@ -863,9 +905,9 @@ function toAgent(
 
 /** A chat as you would call it, never by its id: its platform, its bot's name too when that platform
  *  has more than one bot, and 私聊 for a private chat of yours with it, whichever owner's. */
-function chatName(state: Pick<State, "bots">, ctx: Pick<Ctx, "config">, chat: Pick<Chat, "bot" | "platformChatId">): string {
+export function chatName(state: Pick<State, "bots">, ctx: Pick<Ctx, "config">, chat: Pick<Chat, "bot" | "platformChatId">): string {
   const bot = state.bots.find((b) => b.id === chat.bot)!;
-  return chatOf(state.bots, ctx.config, bot, ownerChat(bot, chat, ctx) ? "私聊" : "聊天窗口");
+  return chatOf(ctx.config, bot, ownerChat(bot, chat, ctx) ? "私聊" : "聊天窗口");
 }
 
 /** Whether the chat is an owner's private chat with the bot: its id is the owner's user id
@@ -886,15 +928,27 @@ function lift(state: State, ctx: Ctx, d: Decision, slot: Slot): void {
   d.writes.push({ op: "update", table: "conversation", where: { id: conv.id }, patch: { progress } });
 }
 
-/** chatName of your private chat with the bot, or of another chat of it: bots is every bot row. The
- *  system prompt names each bot's format limits so (runner), for the agent to match them to that line. */
-export function chatOf(bots: Pick<Bot, "platform">[], config: Pick<Config, "bots">, bot: Pick<Bot, "name" | "platform">, what: "私聊" | "聊天窗口"): string {
-  const several = bots.filter((b) => b.platform === bot.platform).length > 1;
-  // A bot goes by its label, where it has one; commands name it by its id (docs/spec/v1.md "配置").
-  const name = config.bots[bot.name]?.label ?? bot.name;
+/** chatName of your private chat with the bot, or of another chat of it. The system prompt names
+ *  each bot's format limits so (runner), for the agent to match them to that line. */
+export function chatOf(config: Pick<Config, "bots">, bot: Pick<Bot, "name" | "platform">, what: "私聊" | "聊天窗口"): string {
+  const name = nameAmong(config, bot);
   // A space between Latin letters and Chinese, none between Chinese and Chinese: QQ 私聊, 飞书私聊.
   const { label } = PLATFORMS[bot.platform];
-  return `${label}${several ? ` Bot ${name} 的` : /[A-Za-z]$/.test(label) ? " " : ""}${what}`;
+  return `${label}${name !== null ? ` Bot ${name} 的` : /[A-Za-z]$/.test(label) ? " " : ""}${what}`;
+}
+
+/** What rh send takes for your private chat with the bot (product §5.9): its platform's name, where it
+ *  is the one bot of its platform in the config and so goes by that, else its own; null for one named
+ *  for another platform, as rh send takes that word for the platform. */
+export const sendWord = (config: Pick<Config, "bots">, bot: Pick<Bot, "name" | "platform">): string | null =>
+  nameAmong(config, bot) === null && PLATFORM_WORDS.includes(bot.platform) ? bot.platform : PLATFORM_WORDS.includes(bot.name) ? null : bot.name;
+
+/** The bot's name where another bot of its platform is in the config (docs/im-style.md §2.6), else
+ *  null. A bot taken out of the config keeps its row, but no longer counts (#598). */
+function nameAmong(config: Pick<Config, "bots">, bot: Pick<Bot, "name" | "platform">): string | null {
+  const several = Object.entries(config.bots).some(([name, b]) => name !== bot.name && b.platform === bot.platform);
+  // A bot goes by its label, where it has one; commands name it by its id (docs/spec/v1.md "配置").
+  return several ? (config.bots[bot.name]?.label ?? bot.name) : null;
 }
 
 /** A Rhodium command typed in chat (im: the chat and its bot), or into a slot's chat on the board;
@@ -1636,7 +1690,7 @@ function agentEvent(state: State, e: AgentEvent, ctx: Ctx): Decision {
   const release = () => releaseQueued(d, e.conv, AFTER_INTERRUPT);
   const queuedFor = (reason: string) => state.queued.some((i) => i.conversation === e.conv && i.queueReason === reason);
   // A child waiting on you is stuck (architecture §9.2).
-  const stuck = (a: AgentAsk) => report(state, ctx, d, slot, "stuck", `它有提问在等用户回答：${askLine(a.kind, { tool: a.tool, input: a.input })}`);
+  const stuck = (a: AgentAsk) => report(state, ctx, d, slot, "stuck", `它有提问在等用户回答：${askLine(a.kind, { tool: a.tool, input: a.input })}`, { relay: "提问已经推给用户，不用转告。" });
   switch (e.type) {
     case "turn_start":
       // Also a turn the agent began by itself, say when a background task woke it: it has no
@@ -1653,8 +1707,10 @@ function agentEvent(state: State, e: AgentEvent, ctx: Ctx): Decision {
         releaseQueued(d, e.conv, AFTER_QUOTA);
         d.effects.push({ kind: "deliver", conversation: e.conv });
       }
-      // What it reported in its last turn is old news: this one reports afresh.
+      // What it reported in its last turn is old news: this one reports afresh, and has told you nothing yet.
       if (slot.reported !== null) set({ reported: null });
+      if (slot.turnToldYou !== null) set({ turnToldYou: null });
+      if (slot.turnPlanTimedOut) set({ turnPlanTimedOut: null });
       break;
     case "text_delta":
     case "item":
@@ -1688,9 +1744,12 @@ function agentEvent(state: State, e: AgentEvent, ctx: Ctx): Decision {
       // 未读 takes as a final_reply (spec web-maximize "未读和跑完提醒怎么做").
       if (e.compactOnly) d.events.push({ source: "agent", type: "compacted", slot: slot.id, ...(slot.turnInbound && { trace: slot.turnInbound }) });
       // Idle now: a child is done, unless a background task will wake it for another turn (architecture §9.2).
-      // Your /compact alone is no work of the child's.
+      // Your /compact alone is no work of the child's. One whose plan went unapproved at the timeout
+      // stopped to wait for you: stuck, its reply holding the plan's summary, though it reported stuck
+      // this turn already, of that ask or one it raised since.
       const done = () => {
-        if (!e.background && !e.compactOnly) report(state, ctx, d, slot, "done", replyStart(e.reply));
+        if (slot.turnPlanTimedOut) report(state, ctx, d, { ...slot, reported: null }, "stuck", `它的计划确认超时，没有批准，停下来等用户回复。${replyStart(e.reply)}`);
+        else if (!e.background && !e.compactOnly) report(state, ctx, d, slot, "done", replyStart(e.reply));
       };
       // Switching to the terminal (rh tui): the turn it waited for is over, so the headless agent goes
       // now, its exit opens the pane, and what was held for an interrupt waits for the switch back.
@@ -1801,7 +1860,8 @@ function agentEvent(state: State, e: AgentEvent, ctx: Ctx): Decision {
       break;
     }
     case "background":
-      // The last task is done: the slot is idle from now on. Claude's wakes it for a turn first.
+      // The last task is done: the slot is idle from now on. Claude's wakes it for a turn first, maybe
+      // in the next chunk, so the clock does not look at the output at once: a stop would cut that turn.
       // Claude also says it runs none after each initialize, as at a restart: no task ended then.
       if (!e.tasks.length && slot.state === "idle" && state.conversations.find((c) => c.id === e.conv)?.background) reapAt(d, ctx, slot, ctx.now);
       break;
@@ -1977,7 +2037,7 @@ function agentEvent(state: State, e: AgentEvent, ctx: Ctx): Decision {
       // Resumed at once, it takes back its own place.
       if (waits !== null) makeRoom(state, ctx, d, slot.id);
       // ponytail: the parent this wakes may take a place makeRoom just gave away, one over the limit.
-      if (!asked && !resume) report(state, ctx, d, slot, "stuck", "它崩溃了，没有自动恢复。", slot.id);
+      if (!asked && !resume) report(state, ctx, d, slot, "stuck", "它崩溃了，没有自动恢复。", { stopped: slot.id, relay: "用户已收到崩溃通知，不用转告。" });
       break;
     }
     case "protocol_error":
@@ -2063,16 +2123,26 @@ function agentEvent(state: State, e: AgentEvent, ctx: Ctx): Decision {
 function turnOver(d: Decision, ctx: Ctx, slot: Slot): void {
   d.writes.push({ op: "update", table: "slot", where: { id: slot.id }, patch: { turnEndedAt: ctx.now, activeAt: ctx.now } });
   if (slot.lifetime === "oneoff") d.effects.push({ kind: "timer", timer: "oneoff_archive", key: slot.id, at: ctx.now + ctx.config.durations.oneoffArchive });
-  reapAt(d, ctx, slot, ctx.now);
+  reapAt(d, ctx, slot, ctx.now, true);
 }
 
 /** The slot's reap time: its own, else the config's; 0 never reaps. */
 const reapAfter = (slot: Slot, ctx: Ctx) => slot.reapAfter ?? ctx.config.durations.idleReap;
 
-/** Sets the slot's idle reap clock to go off reap time after `from`. */
-function reapAt(d: Decision, ctx: Ctx, slot: Slot, from: number): void {
+/** Sets the slot's idle reap clock to go off reap time after `from`. soon: the agent may have written
+ *  more, so the clock looks at once, that output on record by then, whether it is past limits.outRestartMB. */
+function reapAt(d: Decision, ctx: Ctx, slot: Slot, from: number, soon = false): void {
   const reap = reapAfter(slot, ctx);
-  d.effects.push({ kind: "timer", timer: "idle_reap", key: slot.id, at: reap ? from + reap : null });
+  const at = soon && ctx.config.limits.outRestartMB ? ctx.now : reap ? from + reap : null;
+  d.effects.push({ kind: "timer", timer: "idle_reap", key: slot.id, at });
+}
+
+/** Whether the conversation's agent process has written more than limits.outRestartMB since it started (product §4.4).
+ *  An exited one's row, till the next launch replaces it, says nothing of the agent starting now. */
+function outgrown(state: State, ctx: Ctx, conversation: string): boolean {
+  const h = state.holders.find((h) => h.conversation === conversation);
+  const max = ctx.config.limits.outRestartMB * 2 ** 20;
+  return Boolean(max && h && !h.exited && h.outOffset - h.outStart > max);
 }
 
 /** The slots waiting for the agent's quota. */
@@ -2134,8 +2204,14 @@ function clock(state: State, input: Extract<Input, { kind: "clock" }>, ctx: Ctx)
     const a = state.asks.find((a) => a.id === input.key && a.status === "open");
     const s = a && state.slots.find((s) => s.id === a.slot);
     if (!a || !s || a.deadline === null) return d;
-    if (ctx.now < a.deadline) d.effects.push({ kind: "timer", timer: "ask_timeout", key: a.id, at: a.deadline });
-    else answerAsk(state, ctx, d, s, a, timeoutAnswer(a.kind, prompt(a)), "timeout");
+    if (ctx.now < a.deadline) {
+      d.effects.push({ kind: "timer", timer: "ask_timeout", key: a.id, at: a.deadline });
+      return d;
+    }
+    answerAsk(state, ctx, d, s, a, timeoutAnswer(a.kind, prompt(a)), "timeout");
+    // Unapproved, the plan's agent stops to wait for you: a child's turn's end reports it stuck again
+    // (architecture §9.2).
+    if (a.kind === "plan" && s.parent !== null) d.writes.push({ op: "update", table: "slot", where: { id: s.id }, patch: { turnPlanTimedOut: 1 } });
     return d;
   }
   if (input.timer === "idle_reap") {
@@ -2145,9 +2221,11 @@ function clock(state: State, input: Extract<Input, { kind: "clock" }>, ctx: Ctx)
     const from = s && Math.max(s.turnEndedAt ?? 0, s.startedIdleAt ?? 0);
     if (!s?.conversation || s.mode !== "headless" || s.state !== "idle" || !from || stopping(state, s.conversation)) return d;
     // A background task keeps the agent (product §4.4); the clock starts again once it is done (agent()).
-    const reap = reapAfter(s, ctx);
-    if (!reap || state.conversations.find((c) => c.id === s.conversation)?.background) return d;
-    if (ctx.now < from + reap) reapAt(d, ctx, s, from);
+    if (state.conversations.find((c) => c.id === s.conversation)?.background) return d;
+    // So much output, the process goes now, whatever the reap time: the next one's out.log starts afresh (architecture §4.5).
+    const [reap, big] = [reapAfter(s, ctx), outgrown(state, ctx, s.conversation)];
+    if (!big && !reap) return d;
+    if (!big && ctx.now < from + reap) reapAt(d, ctx, s, from);
     else stop(s, d, "clock"); // recorded first, so its exit is no crash; the next message resumes the conversation
     return d;
   }
@@ -2195,7 +2273,7 @@ function clock(state: State, input: Extract<Input, { kind: "clock" }>, ctx: Ctx)
       wake(state, ctx, d, { ...s, state: "idle" }, { source: "auto_continue", body: "继续" });
     } else {
       set({ state: "idle", turnChat: null, turnInbound: null, turnSentMe: null });
-      reapAt(d, ctx, s, s.turnEndedAt ?? ctx.now);
+      reapAt(d, ctx, s, s.turnEndedAt ?? ctx.now, true);
     }
     return d;
   }
@@ -2283,16 +2361,16 @@ function rebind(state: State, ctx: Ctx, d: Decision, chats: [Chat, Slot | null][
 }
 
 /** A bot as you call it: its platform, and its name where the platform has more than one (chatName). */
-function botName(state: Pick<State, "bots">, ctx: Pick<Ctx, "config">, b: Bot): string {
-  const several = state.bots.filter((x) => x.platform === b.platform).length > 1;
-  return `${PLATFORMS[b.platform].label} Bot${several ? ` ${ctx.config.bots[b.name]?.label ?? b.name}` : ""}`;
+function botName(ctx: Pick<Ctx, "config">, b: Bot): string {
+  const name = nameAmong(ctx.config, b);
+  return `${PLATFORMS[b.platform].label} Bot${name !== null ? ` ${name}` : ""}`;
 }
 
 /** The bots the slot is the default target of, as you call them (botName); "" for none. */
 function defaultOf(state: State, ctx: Ctx, s: Slot): string {
   return state.bots
     .filter((b) => target(state, b, undefined, ctx)?.id === s.id)
-    .map((b) => botName(state, ctx, b))
+    .map((b) => botName(ctx, b))
     .join("、");
 }
 
@@ -2387,21 +2465,36 @@ function wake(state: State, ctx: Ctx, d: Decision, slot: Slot, input: { source: 
   return null;
 }
 
+/** Whether you talk to the slot directly (product §6.1): a chat of yours bound to it (/rh_use), or
+ *  this turn one you began or joined, from IM or the board (turnChat). Its reply reached you then. */
+const direct = (state: State, s: Slot) => s.turnChat !== null || state.chats.some((c) => c.target === s.id);
+
+/** Whether the child's result reaches you by its report alone (architecture §9.2): its parent is still
+ *  there, and you are not talking to the child directly. Its rh send me is refused then. */
+function reportsUp(state: State, child: Slot): boolean {
+  const parent = parentOf(state, child);
+  return !!parent && parent.archivedAt === null && !direct(state, child);
+}
+
 /**
  * Tells the child's parent that it is done or stuck (architecture §9.2-9.4), each once a turn: an
  * internal message that wakes the parent, or, once the parent is archived or deleted, a notice for
- * you to decide. A parent merely reaped is woken as ever. None while a chat of yours points at the
- * child (/rh_use): you talk to it there. stopped: as for wake().
+ * you to decide. A parent merely reaped is woken as ever. None while you talk to the child directly
+ * (direct()). stopped: as for wake(); relay: why the parent need not pass a stuck one on to you.
  */
-function report(state: State, ctx: Ctx, d: Decision, child: Slot, what: "done" | "stuck", detail: string, stopped?: string): void {
-  if (child.parent === null || child.reported === what || state.chats.some((c) => c.target === child.id)) return;
+function report(state: State, ctx: Ctx, d: Decision, child: Slot, what: "done" | "stuck", detail: string, o: { stopped?: string; relay?: string } = {}): void {
+  if (child.parent === null || child.reported === what || direct(state, child)) return;
   d.writes.push({ op: "update", table: "slot", where: { id: child.id }, patch: { reported: what } });
   const parent = parentOf(state, child);
   d.events.push({ source: "agent", type: "child_report", slot: child.id, data: { what, parent: parent?.id ?? null } });
   const ref = slotView(state, child).ref;
   const text = `子槽位 ${ref} ${what === "done" ? "完成了" : "卡住了"}。${detail}`;
-  if (!parent || parent.archivedAt !== null) notify(state, ctx, d, child, ctx.newId(), `${text}\n它的父槽位已经不在，需要你拿主意。`);
-  else wake(state, ctx, d, parent, { source: "report", body: `${REPORT_LINE}\n${text}\n看它的状态和最近的对话：rh read ${ref}` }, { stopped });
+  if (!reportsUp(state, child)) return notify(state, ctx, d, child, ctx.newId(), `${text}\n它的父槽位已经不在，需要你拿主意。`);
+  // Its rh send me was refused, so what you hear of it is the parent's to say (product §6.1), unless it
+  // sent to you this turn to a destination named.
+  const told = `${child.turnToldYou ? "" : "它没有直接告诉用户。"}${o.relay ?? ""}`;
+  const body = [REPORT_LINE, text, told, `看它的状态和最近的对话：rh read ${ref}`].filter(Boolean).join("\n");
+  wake(state, ctx, d, parent!, { source: "report", body }, { stopped: o.stopped });
 }
 
 /** What a done report says of the child's last reply: its start; the parent reads the rest with rh read. */
@@ -2465,18 +2558,27 @@ function contacted(d: Decision, ctx: Ctx, chat: string): void {
 /** Of the chats, the one that wrote to a slot last (product §5.9). */
 const latest = (chats: Chat[]): Chat | undefined => (chats.length ? chats.reduce((a, b) => ((b.contactedAt ?? 0) > (a.contactedAt ?? 0) ? b : a)) : undefined);
 
+/** Your private chats, each owner's with each bot, or with the bots on picks. */
+const privateChats = (state: Bindings, ctx: Pick<Ctx, "config">, on: (b: Bot) => boolean = () => true) =>
+  state.chats.filter((c) => {
+    const bot = state.bots.find((b) => b.id === c.bot);
+    return bot && on(bot) && ownerChat(bot, c, ctx);
+  });
+
 /** Of your chats going to the slot now, else to its root slot, the one that wrote to a slot last
- *  (product §5.9): each owner's private chat with each bot. */
-function pointing(state: Bindings, ctx: Pick<Ctx, "config">, slot: Slot): Chat | undefined {
-  const going = (s: Slot) =>
-    state.chats.filter((c) => {
-      const bot = state.bots.find((b) => b.id === c.bot);
-      return bot && ownerChat(bot, c, ctx) && target(state, bot, c, ctx)?.id === s.id;
-    });
+ *  (product §5.9): each owner's private chat with each bot, or with the bots on picks. */
+function pointing(state: Bindings, ctx: Pick<Ctx, "config">, slot: Slot, on?: (b: Bot) => boolean): Chat | undefined {
+  const mine = privateChats(state, ctx, on);
+  const going = (s: Slot) => mine.filter((c) => target(state, state.bots.find((b) => b.id === c.bot)!, c, ctx)?.id === s.id);
   let root = slot;
   for (let p = parentOf(state, root); p; p = parentOf(state, p)) root = p;
   return latest(going(slot).length ? going(slot) : going(root));
 }
+
+/** Of your private chats with the bots on picks, the one pointing() finds for the slot, else the one you
+ *  wrote in last (product §5.9): for another bot to send by (elsewhere()), or for rh send to one. */
+const yours = (state: Bindings, ctx: Pick<Ctx, "config">, on: (b: Bot) => boolean, slot: Slot | undefined): Chat | undefined =>
+  (slot && pointing(state, ctx, slot, on)) || latest(privateChats(state, ctx, on));
 
 /** The slot's contact chat (product §5.9): the chat pointing at it or its root, else the main chat. */
 function contactChat(state: Bindings, ctx: Pick<Ctx, "config" | "newId">, d: Decision, slot: Slot | undefined): Chat | undefined {
@@ -2492,10 +2594,11 @@ export const contactOf = (state: Bindings, config: Config, slot: Slot): string |
  * with you take it, its text led by a line saying so; with none to, a QQ one waits for your next
  * message (product §5.5, architecture §8.7). say gives the messages for the chat to, as the
  * platform of caps takes them, after lead; on QQ they go from its bot only if all of them can
- * without waiting, so they keep their order. Returns the chat they went to, and whether another bot took them; undefined: nowhere
- * to go, so the event is all there is.
+ * without waiting, so they keep their order. Returns the chat they went to, and whether any wait for
+ * your reply there (held); undefined: nowhere to go, so the event is all there is, or, strict, at
+ * can't send them now, so nothing went.
  */
-function tell(state: State, ctx: Ctx, d: Decision, slot: Slot | undefined, trace: string, say: (caps: Capabilities | undefined, lead: string, to: To) => Payload[], at?: Chat): { chat: string; forwarded: boolean } | undefined {
+function tell(state: State, ctx: Ctx, d: Decision, slot: Slot | undefined, trace: string, say: (caps: Capabilities | undefined, lead: string, to: To) => Payload[], at?: Chat, strict?: true): { chat: string; held: boolean } | undefined {
   const chat = at ?? contactChat(state, ctx, d, slot);
   if (!chat) return undefined;
   const home: To = { chat, bot: state.bots.find((b) => b.id === chat.bot)!, caps: ctx.capabilities(chat.bot) };
@@ -2506,16 +2609,20 @@ function tell(state: State, ctx: Ctx, d: Decision, slot: Slot | undefined, trace
   // What QQ sends now (place()): passive replies but the one kept for the hint, then active messages.
   const room = Math.max(0, (inbound ? q.passive(inbound) : 0) - 1) + q.active(home.bot.id);
   const qq = home.caps?.sendLimit.kind === "qq_quota";
-  const other = (home.bot.connState === "faulted" || (qq && room < messages.length)) && elsewhere(state, ctx, d, q, home.bot, slot);
+  const cannot = home.bot.connState === "faulted" || (qq && room < messages.length);
+  if (cannot && strict) return undefined;
+  const other = cannot && elsewhere(state, ctx, d, q, home.bot, slot);
   const to = other || home;
   if (other) messages = say(other.caps, `${chatName(state, ctx, home.chat)}那边发不出去，改发在这里。\n\n`, other);
   let hintedBy: string | undefined;
+  let held = false;
   for (const p of messages) {
     const placed = place(q, to, other ? null : inbound);
     if (placed.hint) hintedBy = hint(d, ctx, to.chat.id, inbound!, trace);
+    held ||= placed.status === "held";
     outbound(d, ctx, { chat: to.chat.id, replyTo: placed.replyTo, trace, status: placed.status, ...(placed.status === "held" && { hintedBy }), ...p });
   }
-  return { chat: to.chat.id, forwarded: !!other };
+  return { chat: to.chat.id, held };
 }
 
 /** Tells you something that needs your say or went wrong (product §5.10), the way tell() finds, cut up by the platform's limit. */
@@ -2536,8 +2643,8 @@ function inform(state: State, ctx: Ctx, d: Decision, slot: Slot, trace: string, 
 
 /** Your chat with another bot that can send now, for when one bot can't: not faulted, paired, and on
  *  QQ with an active message left. One on another platform first (product §5.5), then the main chat's
- *  bot, with its main chat. Of another bot's owners, the private chat going to the slot, if any, else
- *  the one you wrote in last. */
+ *  bot, with its main chat. Of another bot's owners, the private chat going to the slot or its root, if
+ *  any, else the one you wrote in last (yours()). */
 function elsewhere(state: State, ctx: Ctx, d: Decision, q: Quotas, not: Bot, slot: Slot | undefined): To | undefined {
   const main = ctx.config.mainChat;
   const ready = (b: Bot) => {
@@ -2547,8 +2654,7 @@ function elsewhere(state: State, ctx: Ctx, d: Decision, q: Quotas, not: Bot, slo
   const rank = (b: Bot) => 2 * Number(b.platform !== not.platform) + Number(b.name === main?.bot);
   const bot = state.bots.filter(ready).sort((a, b) => rank(b) - rank(a))[0];
   if (!bot) return undefined;
-  const chats = state.chats.filter((c) => c.bot === bot.id && ownerChat(bot, c, ctx));
-  const there = latest(chats.filter((c) => slot && target(state, bot, c, ctx)?.id === slot.id)) ?? latest(chats);
+  const there = yours(state, ctx, (b) => b.id === bot.id, slot);
   // A private chat's id is your user id under the bot (docs/spec/v1.md "配置").
   const id = bot.name === main?.bot ? main.chat : (there?.platformChatId ?? owners(bot, ctx.config)[0]!);
   return { chat: chatRow(state, ctx, d, bot, id), bot, caps: ctx.capabilities(bot.id) };
@@ -3191,9 +3297,13 @@ function quotas(state: State, ctx: Ctx, d: Decision): Quotas {
 
 function quotaView(state: State, ctx: Ctx, d: Decision) {
   const rows = new Map(state.quotas.map((q) => [`${q.kind}\n${q.owner}`, { ...q }]));
+  const window = ctx.config.durations.qqActiveWindow;
   const live = (kind: Quota["kind"], owner: string) => {
     const q = rows.get(`${kind}\n${owner}`);
-    return q && (q.resetsAt === null || ctx.now < q.resetsAt) ? q : undefined;
+    // An active count resetting more than a configured period away began on a longer one: it is
+    // over, and the next message starts one as configured (architecture §7.6).
+    const over = q?.resetsAt != null && (ctx.now >= q.resetsAt || (kind === "qq_active" && q.resetsAt > ctx.now + window));
+    return q && !over ? q : undefined;
   };
   const { qqPassiveReplies, qqActive } = ctx.config.limits;
   return {
@@ -3208,7 +3318,7 @@ function quotaView(state: State, ctx: Ctx, d: Decision) {
         // with its inbound message (im()), and every caller checks passive() first.
         if (kind !== "qq_active") return;
         const old = rows.get(key);
-        const fresh = { kind, owner, used: 0, resetsAt: ctx.now + ctx.config.durations.qqActiveWindow };
+        const fresh = { kind, owner, used: 0, resetsAt: ctx.now + window };
         q = { ...(old ?? { id: ctx.newId(), machine: "" }), ...fresh };
         rows.set(key, q);
         d.writes.push(old ? { op: "update", table: "quota", where: { id: q.id }, patch: fresh } : { op: "insert", table: "quota", row: { id: q.id, ...fresh } });
@@ -3259,6 +3369,9 @@ export type Payload = {
   ask?: string; // it asks you this ask: once it is sent, the ask has reached you (pushedAt)
   buttons?: Button[]; // to press: an ask's, gone once it is settled, or ones that copy what a notice quotes
   secret?: true; // a pairing code (product §5.11): once sent, no text of it is kept for a quote
+  // rh send's from a slot (sendYou()): what it marked the slot's turn, begun at at, with; taken back
+  // should it fail in that turn (unsaid()).
+  said?: { slot: string; at?: number | null; toldYou?: true; sentMe?: true };
 };
 const payload = (o: Outbound) => JSON.parse(o.payload!) as Payload;
 
@@ -3297,22 +3410,24 @@ function send(state: State, q: Quotas, ctx: Ctx, d: Decision, to: To, inbound: s
 }
 
 /** QQ refused a passive reply for its quota: that message has none left, and the same message goes
- *  out as an active one, or waits for your next message (product §5.5). */
+ *  out as an active one, or waits for your next message. An active message refused goes through
+ *  another bot; for its quota, the bot has none left this period (product §5.5). */
 function refused(state: State, r: Extract<Input, { kind: "refused" }>, ctx: Ctx): Decision {
   const d = nothing();
   const to = toChat(state, r.chat, ctx);
   if (!to) return d;
   const qq = to.caps?.sendLimit.kind === "qq_quota";
   if (r.inbound === null || !qq) {
-    // An active message on QQ: the bot has none left. Or another platform out of its quota (Feishu's
-    // month). Another bot's chat with you takes it, led by where it was for; with none, it stays
-    // failed (product §5.5). So does one moved already: two Feishu bots share their organization's
-    // quota, and it would go back and forth.
-    if (qq) d.writes.push({ op: "update", table: "quota", where: { kind: "qq_active", owner: to.bot.id }, patch: { used: ctx.config.limits.qqActive } });
+    // An active message on QQ, refused for its quota: the bot has none left; for another reason
+    // (you turned them off, say), the next still tries QQ. Or another platform out of its quota
+    // (Feishu's month). Another bot's chat with you takes it, led by where it was for; with none, it
+    // stays failed (product §5.5). So does one moved already: two Feishu bots share their
+    // organization's quota, and it would go back and forth.
+    if (qq && r.quota) d.writes.push({ op: "update", table: "quota", where: { kind: "qq_active", owner: to.bot.id }, patch: { used: ctx.config.limits.qqActive } });
     const q = quotas(state, ctx, d);
     const p = JSON.parse(r.payload) as Payload;
     const other = !p.moved && elsewhere(state, ctx, d, q, to.bot, target(state, to.bot, to.chat, ctx));
-    if (!other) return d;
+    if (!other) return unsaid(state, ctx, d, p);
     place(q, other, null);
     // ponytail: the lead may take the text past the other platform's limit; cut it up once that bites.
     const lead = `${chatName(state, ctx, to.chat)}那边发不出去，改发在这里。`;
@@ -3335,6 +3450,19 @@ function refused(state: State, r: Extract<Input, { kind: "refused" }>, ctx: Ctx)
   const p = place(quotas(state, ctx, d), to, null);
   d.writes.push({ op: "update", table: "outbound", where: { id: r.outbound, status: "failed" }, patch: { status: p.status, replyTo: null } });
   if (p.status === "pending") d.effects.push({ kind: "send", outbound: r.outbound });
+  return d;
+}
+
+/** One of rh send's messages to you did not go out: the marks it set on its slot's turn go. A child's
+ *  report then says it told you nothing; the turn's chat gets what the agent says again (lift()).
+ *  One failing after its turn, say held for QQ's quota, leaves the next turn's marks alone. */
+function unsaid(state: State, ctx: Ctx, d: Decision, p: Payload): Decision {
+  const slot = p.said && state.slots.find((s) => s.id === p.said!.slot);
+  if (!slot || slot.turnStartedAt !== p.said!.at) return d;
+  // ponytail: clears the turn's marks even when an earlier rh send this turn went out, so you may get
+  // the agent's words twice; record which sends went out in each turn if that extra copy bites.
+  if (p.said!.toldYou && slot.turnToldYou) d.writes.push({ op: "update", table: "slot", where: { id: slot.id }, patch: { turnToldYou: null } });
+  if (p.said!.sentMe) lift(state, ctx, d, slot);
   return d;
 }
 
@@ -3662,6 +3790,8 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       const ref = slotView(state, s).ref;
       // Telegram's row has no 切回无头 (docs/im-style.md §6.3): here it is.
       if (s.herdrPane !== null) return { text: `${ref} 已经在 TUI 里了。`, buttons: [{ label: "切回无头", data: `/rh_release ${Buffer.byteLength(`/rh_release ${ref}`) <= 64 ? ref : s.id}` }] };
+      // Before anything stops: no switch can go through (product §4.2).
+      if (!ctx.herdr()) refuse(`没装 Herdr，${ref} 切不到 TUI。`);
       if (s.nextAgent !== null) refuse(`${ref} 在等这一回合结束换成 ${s.nextAgent}，换完再切到 TUI。`);
       const conv = state.conversations.find((c) => c.id === s.conversation)!;
       // A turn under way gets the session written before it ends; a slot with none yet starts one in
@@ -3767,6 +3897,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       if (pos.length < 2 || pos.length > 3) usage();
       const [name, platform, ref] = pos as [string, string, string?];
       if (!BOT_NAME.test(name)) refuse(`Bot 名字只能由英文字母、数字和 _ - 组成，不超过 64 个字符：${name}`);
+      if (TO_YOU.includes(name)) refuse(`Bot 不能叫 ${name}：rh send ${name} 另有用处。`);
       if (!Object.hasOwn(MADE, platform)) refuse(`平台只能是 ${series(Object.keys(MADE), "或")}：${platform}`);
       const how = MADE[platform as Made];
       if (state.bots.some((b) => b.name === name) || Object.hasOwn(ctx.config.bots, name)) refuse(`已经有 Bot ${name}。`);
@@ -3818,7 +3949,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
         d.writes.push({ op: "update", table: "bot", where: { id: bot.id }, patch: { owners: JSON.stringify(paired(bot).filter((o) => o !== rm)) } });
         d.events.push({ source: "rh", type: "bot_owner_removed", data: { bot: bot.name } });
         // No account: agreed to an unknown caller's request, this goes to IM (docs/im-style.md §2.6).
-        return `已去掉${amid(botName(state, ctx, bot))}的一个主人。`;
+        return `已去掉${amid(botName(ctx, bot))}的一个主人。`;
       }
       // A plain pairing replaces the paired owners, which can't stand in for the config's.
       if (!add && fixed.length) refuse(`Bot ${bot.name} 的配置里写了 owner，以配置为准。要换账号，改配置文件里的 owner。`);
@@ -3830,7 +3961,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       // astray might pass on (product §5.11). An unknown caller's, agreed, has no slot: the main chat.
       if (who.kind !== "you" || who.via !== undefined) {
         const from = who.kind === "slot" ? who.slot : undefined;
-        const name = amid(botName(state, ctx, bot));
+        const name = amid(botName(ctx, bot));
         const within = span(ctx.config.durations.pairCode);
         let to: Chat | undefined;
         const sent = tell(state, ctx, d, from, input.id, (caps, lead, at) => {
@@ -3854,51 +3985,26 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
     }
 
     case "send": {
-      // Any --file <path> come right after me; the rest is the text, as it is.
+      // To you (sendYou) by me, web, a platform's or a bot's name, any --file <path> right after it; to
+      // a slot by its w/name or id. The rest is the text, as it is.
       const [to, ...rest] = pos;
+      const you = to !== undefined && (TO_YOU.includes(to) || PLATFORM_WORDS.includes(to) || Object.hasOwn(ctx.config.bots, to));
       const paths: string[] = [];
-      while (to === "me" && rest[0] === "--file") {
+      while (you && rest[0] === "--file") {
         if (rest[1] === undefined) usage();
         paths.push(dir(rest.splice(0, 2)[1]!));
       }
       const text = rest.join(" ");
       if (to === undefined || (!text.trim() && !paths.length)) usage();
       const from = who.kind === "slot" ? who.slot : undefined;
-      if (to !== "me") return sendTo(state, ctx, d, findSlot(state, to!), who, text, input.id);
-      // From you at a terminal: the main chat.
-      const chat = contactChat(state, ctx, d, from);
-      if (!chat) refuse("找不到发给用户的窗口：没有聊天窗口指着这个槽位，配置里也没写主窗口（mainChat）。");
-      // The text first, cut up by the platform's limit, then each file in a message of its own; one the
-      // platform of the bot that sends it would not take is refused. It goes as a notice does (tell()).
-      // What goes out is a copy taken now: the agent may change or delete its file once rh returns.
-      let big: string | undefined;
-      const say = (caps: Capabilities | undefined, lead: string, to: To): Payload[] => {
-        big = undefined;
-        const files = paths.flatMap((path): Payload[] => {
-          const kind = fileKind(path);
-          const max = caps?.maxFileBytes[kind] ?? Infinity;
-          const kept = ctx.keepFile(path, max);
-          if (!kept) refuse(`找不到文件 ${path}。`);
-          if (kept.path) return [{ text: "", file: { kind, path: kept.path, name: basename(path) } }];
-          big ??= `${path} 有 ${formatMB(kept.size)}，超过了平台对${kind === "image" ? "图片" : "文件"}的上限 ${formatMB(max)}，发不出去。`;
-          return [];
-        });
-        // A slot's, to a chat that goes to another slot, says whose it is (product §5.9).
-        const whose = from && target(state, to.bot, to.chat, ctx)?.id !== from.id ? `〔${slotView(state, from).ref}〕\n` : "";
-        const body = lead + whose + text;
-        return [...(body.trim() ? chunkText(body, caps?.maxTextLength ?? Infinity).map((t) => ({ text: t, markdown: markdown(t, caps) })) : []), ...files];
-      };
-      const sent = tell(state, ctx, d, from, input.id, say)!;
-      if (big) refuse(big);
-      // Said where the turn began, what the agent says after it there is not forwarded, nor its final
-      // reply: you'd get it twice (product §5.5); its tool lines are. A file alone takes nothing over.
-      // On Telegram the turn's message stops as it is, and goes on under it (story 72).
-      if (from?.conversation && from.turnChat && from.turnChat === sent.chat) {
-        if (text.trim()) d.writes.push({ op: "update", table: "slot", where: { id: from.id }, patch: { turnSentMe: 1 } });
-        underIt(state, ctx, d, from);
-      }
-      d.events.push({ source: "rh", type: "send_me", trace: input.id, ...(from && { slot: from.id }) });
-      return "已交给 Bot 发送。";
+      if (!you) return sendTo(state, ctx, d, findSlot(state, to!), who, text, input.id);
+      // A child you are not talking to hands its result up by report alone, so you hear it once, from
+      // its parent (product §6.1); one sent where you asked for it goes. One in its terminal is talking
+      // to you there, and reports nothing.
+      if (to === "me" && from?.mode === "headless" && reportsUp(state, from))
+        refuse(`rh send me 被拒绝：用户没在直接和你说话，结果会随汇报交给父槽位 ${slotView(state, parentOf(state, from)!).ref}，由它决定告诉用户什么。把结果和文件路径写进最终回复，不用再 rh send 给父槽位。`);
+      if (to === "web" && !from) refuse("rh send web 只给槽位里的 agent 用：留在网页上的话显示在它的对话里。");
+      return sendYou(state, ctx, d, input.id, from, to!, text, paths);
     }
 
     case "read": {
@@ -4000,7 +4106,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       d.writes.push({ op: "delete", table: "outbound", where: { chat: chat.id } }, { op: "delete", table: "inbound", where: { chat: chat.id } }, { op: "delete", table: "chat", where: { id: chat.id } });
       d.events.push({ source: "rh", type: "chat_forgotten", data: { bot: bot.name } }); // no platform id (§11)
       d.effects.push({ kind: "forget_avatar", chat: chat.id });
-      return `已忘掉${amid(botName(state, ctx, bot))}的一个${ownerChat(bot, chat, ctx) ? "私聊" : "聊天窗口"}。`;
+      return `已忘掉${amid(botName(ctx, bot))}的一个${ownerChat(bot, chat, ctx) ? "私聊" : "聊天窗口"}。`;
     }
 
     // Architecture §9.8: Rhodium forgets its own records of the slot. Its children stay, their parent
@@ -4052,6 +4158,109 @@ function sendTo(state: State, ctx: Ctx, d: Decision, to: Slot, who: Caller, text
   d.events.push({ source: "rh", type: "send_slot", trace, slot: to.id, data: { from: from?.id ?? null } });
   if (waits === IN_TUI) return `已发给 ${ref}。它在 TUI 里，切回无头后再交给它。`;
   return waits === AFTER_ASKS ? `已发给 ${ref}。它有提问在等用户回答，答完再交给它。` : `已发给 ${ref}。`;
+}
+
+/** The words rh send takes for you before a bot's name (product §5.9): me, the default, and web; no bot
+ *  may be named so. */
+const TO_YOU = ["me", "web"];
+/** The platforms rh send names, ahead of a bot of the same name. */
+const PLATFORM_WORDS: string[] = ["qq", "telegram", "feishu"];
+
+/**
+ * rh send to you (product §5.9, architecture §8.7): to me by the default, where you last wrote to the
+ * slot, the board too; to web, a platform's or a bot's name, there, or by the default where that can't
+ * send now. Kept on the board it goes to no chat: its send_me event says web, with the files' copies.
+ * In a chat, the text first, cut up by the platform's limit, then each file in a message of its own;
+ * one the platform of the bot that sends it would not take is refused. It goes as a notice does
+ * (tell()). What goes out is a copy taken now: the agent may change or delete its file once rh
+ * returns. Returns the receipt, saying where it went.
+ */
+function sendYou(state: State, ctx: Ctx, d: Decision, trace: string, from: Slot | undefined, to: string, text: string, paths: string[]): string {
+  // It told you itself this turn: a child's report need not say it did not (architecture §9.3).
+  const toldYou = to !== "me" && !!from?.parent;
+  if (toldYou) d.writes.push({ op: "update", table: "slot", where: { id: from!.id }, patch: { turnToldYou: 1 } });
+  // Said where the turn began, it takes the turn over (post()).
+  const takesOver = (chat: string) => !!from?.conversation && from.turnChat === chat;
+  let big: string | undefined;
+  let at: Chat | undefined;
+  // It went led by the slot's name: a quote of it in that chat goes back to the slot (product §5.3).
+  let named = false;
+  // What went, by its copy's hash, for the board to show (spec web-images).
+  let went: Media[] = [];
+  const keep = (path: string, max: number) => {
+    const kept = ctx.keepFile(path, max) ?? refuse(`找不到文件 ${path}。`);
+    if (kept.path) went.push({ kind: fileKind(path), hash: basename(kept.path), name: basename(path) });
+    return kept;
+  };
+  const say = (caps: Capabilities | undefined, lead: string, to: To): Payload[] => {
+    [big, went] = [undefined, []];
+    at = to.chat;
+    const files = paths.flatMap((path): Payload[] => {
+      const kind = fileKind(path);
+      const max = caps?.maxFileBytes[kind] ?? Infinity;
+      const kept = keep(path, max);
+      if (kept.path) return [{ text: "", file: { kind, path: kept.path, name: basename(path) } }];
+      big ??= `${path} 有 ${formatMB(kept.size)}，超过了平台对${kind === "image" ? "图片" : "文件"}的上限 ${formatMB(max)}，发不出去。`;
+      return [];
+    });
+    // A slot's, to a chat that goes to another slot, says whose it is (product §5.9).
+    const whose = from && target(state, to.bot, to.chat, ctx)?.id !== from.id ? `〔${slotView(state, from).ref}〕\n` : "";
+    named = whose !== "";
+    const body = lead + whose + text;
+    const out = [...(body.trim() ? chunkText(body, caps?.maxTextLength ?? Infinity).map((t) => ({ text: t, markdown: markdown(t, caps) })) : []), ...files];
+    // Any of them failing takes back what it marks the turn with (unsaid()).
+    const sentMe = takesOver(to.chat.id) && !!text.trim();
+    return from && (toldYou || sentMe) ? out.map((p) => ({ ...p, said: { slot: from.id, at: from.turnStartedAt, ...(toldYou && { toldYou }), ...(sentMe && { sentMe }) } })) : out;
+  };
+  const sent = (web?: true) => {
+    const data = { ...(web && { web }), ...(went.length && { files: went }), ...(!web && named && { named }) };
+    d.events.push({ source: "rh", type: "send_me", trace, ...(from && { slot: from.id }), ...(Object.keys(data).length && { data }) });
+  };
+  // Kept on the board: the slot's chat there shows it (spec web-images), and it is unread there.
+  const board = () => {
+    went = [];
+    for (const path of paths) keep(path, Infinity);
+    sent(true);
+    return "留在网页上，没发 IM。";
+  };
+  const name = (c: Chat) => amid(chatName(state, ctx, c)).trimEnd();
+  // To the chat, unless strict and it can't send now (tell()): undefined then.
+  const post = (chat: Chat, strict?: true): string | undefined => {
+    const r = tell(state, ctx, d, from, trace, say, chat, strict);
+    if (!r) return undefined;
+    if (big) refuse(big);
+    // Said where the turn began, what the agent says after it there is not forwarded, nor its final
+    // reply: you'd get it twice (product §5.5); its tool lines are. A file alone takes nothing over.
+    // On Telegram the turn's message stops as it is, and goes on under it (story 72).
+    if (from && takesOver(r.chat)) {
+      if (text.trim()) d.writes.push({ op: "update", table: "slot", where: { id: from.id }, patch: { turnSentMe: 1 } });
+      underIt(state, ctx, d, from);
+    }
+    sent();
+    if (r.held) return `已交给${name(at!)}，那边额度用完了，在等用户回话，回了才发出。`;
+    return r.chat === chat.id ? `已发到${name(at!)}。` : `${chatName(state, ctx, chat)}发不出去，改发到了${name(at!)}。`;
+  };
+  // Where you last wrote to the slot: the chat it would go to, or the board, if later; there with a
+  // page in front, else the chat (product §5.9). From you at a terminal: the main chat.
+  const byDefault = (): string => {
+    const web = from?.webAt != null && from.webAt > (pointing(state, ctx, from)?.contactedAt ?? -Infinity);
+    if (web && ctx.front()) return board();
+    const chat = contactChat(state, ctx, d, from) ?? refuse("找不到发给用户的窗口：没有聊天窗口指着这个槽位，配置里也没写主窗口（mainChat）。");
+    return (web ? "网页没开在前台，" : "") + post(chat)!;
+  };
+  if (to === "me") return byDefault();
+  if (to === "web") return board();
+  // Your private chat on the platform, or with the bot: the one going to the slot or its root, else
+  // the one you used last, else the main chat if it is there. None, or one that can't send now: the default.
+  const bot = PLATFORM_WORDS.includes(to) ? undefined : state.bots.find((b) => b.name === to);
+  const on = (b: Bot) => (bot ? b.id === bot.id : b.platform === to) && Object.hasOwn(ctx.config.bots, b.name);
+  const what = bot ? `${PLATFORMS[bot.platform].label} Bot ${bot.name}` : (PLATFORMS[to as Made]?.label ?? `Bot ${to}`);
+  const main = state.bots.find((b) => b.name === ctx.config.mainChat?.bot);
+  const chat = yours(state, ctx, on, from) ?? (main && on(main) ? mainChat(state, ctx, d) : undefined);
+  const done = chat && post(chat, true);
+  if (done) return done;
+  const why = !chat ? "没有能发的私聊" : state.bots.find((b) => b.id === chat.bot)!.connState === "faulted" ? "Bot 故障" : "额度不够";
+  return `${amid(what).trimStart()}发不出去：${why}。改按默认规则发：${byDefault()}`;
 }
 
 /** rh ls <slot>: what the slot is, its state and its settings. */
@@ -4113,7 +4322,7 @@ function worded(state: State, ctx: Ctx, argv: string[], here: Chat | undefined):
   const [name, ...rest] = argv;
   if (name !== "use" && name !== "bind" && name !== "pair" && name !== "forget") return undefined;
   const ref = (s: Slot | undefined) => (s ? slotView(state, s).ref : "");
-  const named = (bot: Bot) => amid(botName(state, ctx, bot));
+  const named = (bot: Bot) => amid(botName(ctx, bot));
   /** The bot's chat with this id: whether it is h, its row if on record, and where it goes now. */
   const of = (bot: Bot, id: string, h: Chat | undefined) => {
     const c = state.chats.find((c) => c.bot === bot.id && c.platformChatId === id);
@@ -4193,9 +4402,11 @@ function confirm(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decisio
 }
 
 /** What an agent's decision asks of it once you agreed: in IM you heard 已回答：同意 alone; the board,
- *  where you agreed, shows the turn the decision begins, so its reply will do (product §5.8). */
+ *  where you agreed, shows the turn the decision begins, so its reply will do (product §5.8). A child
+ *  whose rh send me is refused by then hands the result up instead (product §6.1): one wording for
+ *  both, as whether it reports up may change before the decision reaches it. */
 const tellResult = (web?: boolean) =>
-  web ? "用户是在网页上同意的，网页上看得到你这一回合的回复。请把结果写在回复里，不用 rh send me。" : "用户在 IM 里只看到“已回答：同意”。请用 rh send me 把结果告诉用户。";
+  web ? "用户是在网页上同意的，网页上看得到你这一回合的回复。请把结果写在回复里，不用 rh send me。" : "用户在 IM 里只看到“已回答：同意”。请用 rh send me 把结果告诉用户；你有父槽位时，见 rh send me 的说明。";
 
 /** Your decision on a confirm request: the rh call runs as yours if you agreed, and its caller hears
  *  either way, in a message of Rhodium's own (wake). Agreed, the agent it wakes tells you what came of

@@ -177,10 +177,10 @@ test("story 508: /rh_import lists the directory's Codex threads with the rest, m
   await say("/rh_use proj/mine");
   await say("/rh_import");
   const listed = (await posted("导入哪一个？")).split("\n");
-  expect(listed.filter((l) => /^\d\. /.test(l))).toEqual([
-    expect.stringMatching(new RegExp(`^1\\. ${dir} \\d\\d:\\d\\d（codex）Run the …$`)),
-    expect.stringMatching(new RegExp(`^2\\. ${dir} \\d\\d:\\d\\d Use the …$`)),
-  ]);
+  // Most recently changed first: two files written within a tick of the clock may come either way (#575).
+  const numbered = listed.filter((l) => /^\d\. /.test(l));
+  expect(numbered.map((l) => l.slice(0, 3))).toEqual(["1. ", "2. "]);
+  expect(numbered.map((l) => l.slice(3).replace(/ \d\d:\d\d/, " 00:00")).sort()).toEqual([`${dir} 00:00 Use the …`, `${dir} 00:00（codex）Run the …`]);
 }, 30_000);
 
 test("importing a conversation from disk is refused while another process or a Herdr pane uses it, or a slot has it already", async () => {

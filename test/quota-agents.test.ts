@@ -27,6 +27,8 @@ const ctx: Ctx = {
   capabilities: () => undefined,
   keepFile: () => null,
   diskFree: () => Infinity,
+  front: () => false,
+  herdr: () => true,
   retarget: () => null,
   inboundOf: () => [],
 };

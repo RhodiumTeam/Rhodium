@@ -48,6 +48,23 @@ const prompts = () => rhodium.pi.runs().flatMap((r) => r.stdin.map((l) => JSON.p
 const posts = async () => (await rhodium.im.log("q", ME)).map((p) => p.text ?? "");
 const fromIm = (text: string) => rhodium.im.inject("q", { chat: ME, sender: ME, text });
 const becomes = (state: string) => until(async () => (await rhodium.state("w/a")) === state, 15_000);
+/** The event table's rows after seq, as the page's event stream brings them, each of which has the page ask afresh. */
+async function eventsAfter(seq: number): Promise<{ seq: number }[]> {
+  const ac = new AbortController();
+  const r = await fetch(`${base}/api/events`, { headers: { "Tailscale-User-Login": BOARD_LOGIN, "Last-Event-ID": String(seq) }, signal: ac.signal });
+  const seen: { seq: number }[] = [];
+  const reading = (async () => {
+    try {
+      for await (const chunk of r.body!.pipeThrough(new TextDecoderStream())) for (const m of chunk.matchAll(/^id: \d+\ndata: (\{.*\})$/gm)) seen.push(JSON.parse(m[1]!));
+    } catch {
+      // aborted
+    }
+  })();
+  await Bun.sleep(300);
+  ac.abort();
+  await reading;
+  return seen;
+}
 const web = (text: string) => `[来自 网页]\n${text}`;
 /** Each turn takes 1.5 s. */
 const long = { on, steps: [...startTurn, { sleep: 1500 }, ...endTurn("done"), { goto: 0 }] };
@@ -69,6 +86,22 @@ test("stories 283, 284: while a turn runs, what you send from the board waits in
   expect(await queue()).toEqual([]);
   await becomes("空闲");
   expect(await posts()).toEqual([]);
+}, 30_000);
+
+test("#580: one queued behind an internal turn, handed to the agent as that turn ends, leaves the queue with an event the page hears, the slot running all along", async () => {
+  // Each turn takes 3 s: the board's runs on past what the test reads.
+  await begin({ claude: { script: { on, steps: [...startTurn, { sleep: 3000 }, ...endTurn("done"), { goto: 0 }] } } });
+  await rhodium.ok("send", "w/a", "from the terminal");
+  await becomes("运行中");
+  expect(await say("排着的")).toEqual({ ok: true, text: "排队" });
+  const queued = (await eventsAfter(0)).at(-1)!.seq;
+  await until(() => frames().length === 2, 15_000);
+  expect(frames()[1]).toBe(web("排着的"));
+  expect(await queue()).toEqual([]);
+  const heard = await eventsAfter(queued);
+  // Still the board's turn: what the page heard was not its end.
+  expect(await rhodium.state("w/a")).toBe("运行中");
+  expect(heard).not.toEqual([]);
 }, 30_000);
 
 test("story 283: with the board's messages queued, a message from IM still joins the turn, and so does the second in the queue sent in now; the first waits for the turn's end", async () => {

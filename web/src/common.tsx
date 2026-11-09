@@ -1,7 +1,7 @@
 // What the board's pages share: the board's header, times as they show them, the agents' logos, the
-// way back, a slot's top bar, headings and text boxes.
+// way back, a slot's top bar, headings and text boxes, a file's row.
 import { cn } from "cn";
-import { Activity, ChevronLeft, Monitor, Moon, Plus, Sun } from "lucide-react";
+import { Activity, ChevronLeft, FileText, Plus, Settings } from "lucide-react";
 import { createContext, lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Link, useLocation } from "wouter";
 import type { AgentKind } from "../../src/contracts";
@@ -192,9 +192,6 @@ export function useBoardKey(name: BoardKey, run: (() => void) | undefined) {
 export const THEMES = ["system", "light", "dark"] as const;
 export type Theme = (typeof THEMES)[number];
 
-/** The theme the header's button goes to from t: 跟随系统, 浅色, 深色, and round again (#286). */
-export const nextTheme = (t: Theme): Theme => THEMES[(THEMES.indexOf(t) + 1) % THEMES.length]!;
-
 /** The theme chosen on this device, set on the page's root as data-theme, which index.css reads;
  *  跟随系统 sets none. public/theme.js sets it as the page loads, before it is drawn. Storage that
  *  cannot be used keeps none. */
@@ -221,18 +218,6 @@ const themed = new Set<() => void>();
 
 /** The theme chosen on this device, as it changes: the topology's canvas follows it too. */
 export const useTheme = () => useSyncExternalStore((f) => (themed.add(f), () => void themed.delete(f)), THEME.get);
-
-export const THEME_ICON = { system: [Monitor, "跟随系统"], light: [Sun, "浅色"], dark: [Moon, "深色"] } as const;
-
-function ThemeButton() {
-  const theme = useTheme();
-  const [Icon, label] = THEME_ICON[theme];
-  return (
-    <button aria-label={label} onClick={() => THEME.set(nextTheme(theme))} className="hover-round -mx-1 -my-2 grid size-9 shrink-0 place-items-center text-muted-foreground hover:text-foreground">
-      <Icon className="size-4.5" />
-    </button>
-  );
-}
 
 /** Above this round trip, in ms, the header's dot is amber. */
 const SLOW = 300;
@@ -265,6 +250,9 @@ function useLatency(live: boolean | null): number | null {
 // is idle: not to slow the list down (#356).
 const CreateMenu = lazy(() => settled().then(() => import("./create")).then((m) => ({ default: m.CreateMenu })));
 const PLUS = "hover-round -my-2 ml-auto grid size-11 shrink-0 place-items-center text-running";
+// The settings' gear (spec web-maximize "设置"), its card loaded as the + is, where the theme's button was, as wide.
+const SettingsMenu = lazy(() => settled().then(() => import("./settings")).then((m) => ({ default: m.SettingsMenu })));
+const GEAR = "hover-round -mx-1 -my-2 grid size-9 shrink-0 place-items-center text-muted-foreground hover:text-foreground";
 
 /** hash, as #/topology/slot/<id>?chat&full, with flag in its query or not. */
 export function flagged(hash: string, flag: string, on: boolean): string {
@@ -274,7 +262,7 @@ export function flagged(hash: string, flag: string, on: boolean): string {
 }
 
 /** The board's header: its name; whether the event stream is live and the round trip, the way to
- *  Rhodium's page, with an icon on a wide screen where there is room; the home's two views, the + that makes or imports a slot, and the theme. Switching views takes the place of the step
+ *  Rhodium's page, with an icon on a wide screen where there is room; the home's two views, the + that makes or imports a slot, and the settings' gear. Switching views takes the place of the step
  *  in history; on a wide screen a slot's chat beside one stays open beside the other (#285). */
 export function BoardHeader({ live }: { live: boolean | null }) {
   const [location] = useLocation();
@@ -289,16 +277,19 @@ export function BoardHeader({ live }: { live: boolean | null }) {
     <button
       aria-pressed={on === view}
       onClick={() => (HOME.set(view), on !== view && go(view))}
-      className={cn("h-8 px-2 text-sm transition-colors @min-[358px]:px-3", on === view ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-foreground/5 hover:text-foreground")}
+      // Its focus ring inside it, as the control's border and round corners clip what is outside.
+      className={cn("h-8 px-2 text-sm transition-colors focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring first:rounded-l-[calc(var(--radius-lg)-1px)] last:rounded-r-[calc(var(--radius-lg)-1px)] @min-[380px]:px-3", on === view ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-foreground/5 hover:text-foreground")}
     >
       {label}
     </button>
   );
   return (
-    // Laid out by its own width, not the screen's: as narrow beside a chat as on a phone (story 422).
+    // Laid out by its own width, not the screen's: as narrow beside a chat as on a phone (story 422). The
+    // roomier layout from 380px, where it fits a three-digit round trip, as on a 412px phone (#635).
     <div className="@container">
-      <header className="flex items-center gap-1 pt-4 pb-1 whitespace-nowrap @min-[358px]:gap-2.5 lg:pt-7">
-        <h1 className="text-lg font-semibold @min-[358px]:text-xl">
+      {/* On a wide screen as tall as a chat's top bar beside it, its middle level with the bar's (#617). */}
+      <header className="flex items-center gap-1 pt-4 pb-1 whitespace-nowrap @min-[380px]:gap-2.5 lg:h-14 lg:py-0">
+        <h1 className="text-lg font-semibold @min-[380px]:text-xl">
           <Link href="/" className="transition-opacity hover:opacity-70">
             Rhodium
           </Link>
@@ -325,7 +316,17 @@ export function BoardHeader({ live }: { live: boolean | null }) {
             <Plus className="size-5" />
           </CreateMenu>
         </Suspense>
-        <ThemeButton />
+        <Suspense
+          fallback={
+            <span aria-hidden className={GEAR}>
+              <Settings className="size-4.5" />
+            </span>
+          }
+        >
+          <SettingsMenu side="bottom" className={GEAR}>
+            <Settings className="size-4.5" />
+          </SettingsMenu>
+        </Suspense>
       </header>
     </div>
   );
@@ -347,8 +348,8 @@ const TAP = "hover-round -my-0.5 -ml-2 grid size-11 shrink-0 place-items-center 
  *  the chat comes. */
 export function TopBar({ title, sub, live, back, lead, children }: { title?: ReactNode; sub?: string; live: boolean | null; back?: () => void; lead?: ReactNode; children?: ReactNode }) {
   return (
-    // Over the chat's info card's tap catcher (card.tsx).
-    <header className="relative z-10 flex items-center gap-1 border-b bg-background px-2 pt-[calc(0.5rem+env(safe-area-inset-top))] pb-2">
+    // Over the chat's info card's tap catcher (card.tsx). Its right edge, 详情's, is the chat's: px-4.
+    <header className="relative z-10 flex items-center gap-1 border-b bg-background pr-4 pl-2 pt-[calc(0.5rem+env(safe-area-inset-top))] pb-2">
       {/* back: where the chat was opened from, the topology, rather than the list. A 44px target, the
           arrow where it would be with none, the bar no taller. */}
       {lead ?? (back ? (
@@ -387,10 +388,28 @@ export const Heading = ({ children }: { children: ReactNode }) => <h3 className=
 
 /** Text as written, such as a log, in a box that scrolls. */
 export const Box = ({ children, className }: { children: ReactNode; className?: string }) => (
-  <pre className={cn("max-h-[60vh] overflow-auto rounded-lg border bg-card px-2.5 py-2 font-mono text-xs/relaxed whitespace-pre-wrap wrap-anywhere", className)}>{children}</pre>
+  <pre className={cn("card-scroll max-h-[60vh] overflow-auto rounded-lg border bg-card px-2.5 py-2 font-mono text-xs/relaxed whitespace-pre-wrap wrap-anywhere", className)}>{children}</pre>
 );
 
 /** Your words, each run of 24 or more ASCII characters with no space (a path, a hash, a URL) set to
  *  break anywhere: else it breaks only at its few hyphens, leaving a line of a few characters (#512).
  *  24 is longer than an English word, which stays whole, and shorter than a phone's line. */
 export const breakLong = (text: string) => text.split(/([!-~]{24,})/).map((s, i) => (i % 2 ? <span key={i} className="break-all">{s}</span> : s));
+
+/** A file's row: its icon and name; with href, a link that downloads it under that name. */
+export function FileRow({ name, href, className }: { name: string; href?: string; className?: string | false }) {
+  const look = cn("flex min-h-11 max-w-full items-center gap-2 rounded-xl border bg-muted px-3 text-sm", className);
+  const inner = (
+    <>
+      <FileText className="size-4 shrink-0 text-muted-foreground" />
+      <span className="truncate">{name}</span>
+    </>
+  );
+  return href ? (
+    <a href={href} download={name} className={cn(look, "transition-colors hover:bg-foreground/5")}>
+      {inner}
+    </a>
+  ) : (
+    <div className={look}>{inner}</div>
+  );
+}

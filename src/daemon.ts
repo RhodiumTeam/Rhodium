@@ -6,18 +6,19 @@ import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { AGENT_KINDS, AGENTS } from "./agents";
 import { avatarDir, errorKind, refreshAvatars } from "./avatars";
-import { serveBoard, type Hear } from "./board";
+import { inFront, serveBoard, type Fronts, type Hear } from "./board";
 import { version } from "../package.json";
-import { addBot, BUILD, COMMIT, fixedOwners, loadConfig, owners, paired, renameTarget, type BotConfig, type Config } from "./config";
+import { addBot, BUILD, COMMIT, fixedOwners, hasHerdr, loadConfig, owners, paired, renameTarget, type BotConfig, type Config } from "./config";
 import type { AdapterDeps, BoardAct, Connected, ImAdapter, InboundMessage, Input, Kept, OutboundMessage, Platform, RhCaller, SendResult } from "./contracts";
 import { createDoctor } from "./doctor";
 import { fakeBotFromConfig } from "./fake-im";
 import { makeFeishu } from "./feishu";
 import { keepFile, mediaLine, storeAttachments } from "./media";
 import { freeDisk, trace, upkeep } from "./ops";
+import { amid } from "./platforms";
 import { makeQQ, msgSeq } from "./qq";
 import { clip } from "./render";
-import { BOARD, menus, route, type Ctx, type Decision, type Effect, type Payload, type RhReply, type Write } from "./router";
+import { BOARD, chatName, menus, route, type Ctx, type Decision, type Effect, type Payload, type RhReply, type State, type Write } from "./router";
 import { createRunner } from "./runner";
 import { B32, MODEL_INFO, namesOf, openStore, setMeta, ulid, untaken, type EventSource, type Outbound, type Store, type Tx } from "./store";
 import { makeTelegram } from "./telegram";
@@ -27,6 +28,8 @@ import { ancestors, createTui } from "./tui";
 // rh read shows this many of the slot's last messages, each cut to this many characters.
 const READ_COUNT = 10;
 const READ_MAX = 500;
+/** The most rh send waits for its messages to you to be tried, to say where they went (architecture §8.7). */
+const SEND_WAIT = 15_000;
 
 /** One JSON object per line on stderr, which journald keeps. */
 export function log(msg: string, fields: Record<string, unknown> = {}): void {
@@ -58,10 +61,11 @@ export function createLoop(opts: {
   config: Config;
   perform: (effect: Exclude<Effect, { kind: "timer" }>) => void;
   capabilities?: Ctx["capabilities"]; // the adapters' capability tables, by bot row id
+  front?: Ctx["front"]; // whether a page of the board is in front (board.ts's serveBoard)
   retarget?: Ctx["retarget"];
   stepped?: () => void; // after each batch of inputs has committed and its effects are handed off
 }): Loop {
-  const { store, config, perform, capabilities = () => undefined, stepped = () => {}, retarget = () => null } = opts;
+  const { store, config, perform, capabilities = () => undefined, stepped = () => {}, retarget = () => null, front = () => false } = opts;
   const queue: Batch[] = [];
   let draining = false;
 
@@ -134,15 +138,16 @@ export function createLoop(opts: {
                 return chat ? [[i.id, chat]] : [];
               }),
             ),
-            quoted: input.kind === "im" ? quotedText(tx, input.message) : null,
+            quoted: input.kind === "im" ? quoted(tx, store, input.message) : null,
             begun: input.kind === "agent" && input.event.type === "turn_start" && input.event.input ? begunBy(tx, input.event.input) : null,
             models: Object.fromEntries(AGENT_KINDS.filter((a) => AGENTS[a].modelNames).map((a) => [a, namesOf(tx, a)])),
             modelInfo: JSON.parse(tx.get("meta", MODEL_INFO)?.value ?? "{}"),
           };
           const keep = (path: string, max: number) => keepFile(join(config.stateDir, "media"), path, max);
           const diskFree = () => freeDisk(config.stateDir);
+          const herdr = () => hasHerdr(config);
           const inboundOf = (chat: string) => tx.find("inbound", { chat }).map((i) => i.id);
-          const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, retarget, inboundOf });
+          const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, herdr, front, retarget, inboundOf });
           for (const w of d.writes) apply(tx, w);
           for (const e of d.events) tx.append(e);
           // Every change of a slot's state or mode goes on the event table, which the board's live
@@ -153,6 +158,11 @@ export function createLoop(opts: {
             const web = (s.turnChat ?? was?.turnChat) === BOARD;
             if (was && (was.state !== s.state || was.mode !== s.mode)) tx.append({ source: input.kind, type: "slot_state", slot: s.id, data: { state: s.state, mode: s.mode, ...(web && { web }) } });
           }
+          // So does each change of the board's queue (spec web-write "待发队列"): a turn's end may hand
+          // what you queued to the agent, or hold it, with the slot's state as it was (#580). Of no
+          // slot, as 详情 has nothing to say of it.
+          const board = (rows: typeof queued) => rows.flatMap((i) => (i.queueReason && i.source === "human" && i.trace && !tx.get("inbound", i.trace) ? [`${i.id} ${i.conversation} ${i.queueReason}`] : [])).join();
+          if (board(queued) !== board(tx.find("agentInput", { status: "queued" }))) tx.append({ source: input.kind, type: "board_queue" });
           effects.push(...d.effects);
         }
         for (const w of writes) apply(tx, w);
@@ -191,13 +201,15 @@ export function createLoop(opts: {
   return { enqueue: (input) => batch([input], []), batch };
 }
 
-/** The stored text of the message m quotes, when the platform gave none: your message or
- *  Rhodium's, in the same chat (architecture §8.3). */
-function quotedText(tx: Tx, m: InboundMessage): string | null {
-  if (!m.quote || m.quote.text !== undefined) return null;
-  const chat = tx.find("chat", { bot: m.bot, platformChatId: m.chat })[0];
-  const where = chat && { chat: chat.id, ref: m.quote.ref };
-  return (where && (tx.find("inbound", where)[0] ?? tx.find("outbound", where)[0])?.text) ?? null;
+/** The message m quotes, your message or Rhodium's in the same chat (architecture §8.3): its stored
+ *  text, and the slot whose rh send to you it was, if that went led by the slot's name (product §5.3). */
+function quoted(tx: Tx, store: Store, m: InboundMessage): State["quoted"] {
+  const chat = m.quote && tx.find("chat", { bot: m.bot, platformChatId: m.chat })[0];
+  if (!chat) return null;
+  const where = { chat: chat.id, ref: m.quote!.ref };
+  const sent = tx.find("outbound", where)[0];
+  const e = sent?.trace ? store.traced(sent.trace).find((e) => e.type === "send_me") : undefined;
+  return { text: (tx.find("inbound", where)[0] ?? sent)?.text ?? null, slot: (e?.data as { named?: true } | null)?.named ? e!.slot : null };
 }
 
 /** The IM message of yours the agent input carried, and its chat (the inbound id doubles as its trace);
@@ -376,9 +388,16 @@ async function send(store: Store, adapters: Map<string, ImAdapter>, id: string, 
   log("send failed", { outbound: id, status: r.status, error: r.error });
   // The router sends it some other way (product §5.5). A hint that can't go out has nothing to wait
   // for; nor has a held message refused again on a fresh passive reply, likely for good (moderation).
-  if (r.status === "failed" && r.quota && !job.payload.hint && !job.payload.released) {
-    loop.enqueue({ kind: "refused", outbound: id, chat: chat.id, inbound: job.row.replyTo, payload: job.row.payload! });
-  }
+  if (r.status === "failed" && (r.quota || r.refused) && !job.payload.hint && !job.payload.released) {
+    loop.enqueue({ kind: "refused", outbound: id, chat: chat.id, inbound: job.row.replyTo, payload: job.row.payload!, quota: !!r.quota });
+  } else if (r.status === "failed") loop.enqueue({ kind: "send_failed", payload: job.row.payload! });
+}
+
+/** rh send's receipt where n of its total messages went to another chat than from, to, their
+ *  platform having refused them; a space between Chinese and a name in Latin (docs/im-style.md). */
+export function movedTo(n: number, total: number, from: string, to: string): string {
+  const some = n === total ? "" : `有 ${n} 条在`;
+  return `${`${some}${amid(from)}`.trimStart()}发不出去，改发到了${amid(to).trimEnd()}。`;
 }
 
 /** How the daemon makes each platform's adapter for a [bots.<name>] table (architecture §8.1): id is
@@ -457,8 +476,45 @@ export async function runDaemon(args: string[]): Promise<void> {
   // Telegram chat's spacing holds up other chats' sends too; per chat if sends pile up.
   let sending = Promise.resolve();
   const queueSend = (id: string) => {
-    sending = sending.then(() => send(store, adapters, id, loop, pace, config.limits.quoteMaxChars, touched)).catch((err) => log("send failed", { outbound: id, error: String(err) }));
+    sending = sending
+      .then(() => send(store, adapters, id, loop, pace, config.limits.quoteMaxChars, touched))
+      .catch((err) => log("send failed", { outbound: id, error: String(err) }))
+      .then(() => tried(id));
   };
+  // rh send's messages to you, as each has been tried (architecture §8.7): what waits, by outbound id.
+  const trying = new Map<string, (() => void)[]>();
+  const tried = (id: string) => {
+    // One refused() moved to another bot goes again: that try is the one waited for.
+    if (store.tx((tx) => tx.get("outbound", id)?.status) === "pending") return;
+    for (const f of trying.get(id) ?? []) f();
+    trying.delete(id);
+  };
+  /** rh send's receipt once its messages to you have been tried, or SEND_WAIT has passed: one another
+   *  bot took, its platform having refused it, says so; one that did not go, or may not have, says so. */
+  async function receipt(e: Extract<Effect, { kind: "rh_reply" }>, sent: string[]): Promise<RhReply> {
+    const rows = () => store.tx((tx) => sent.map((id) => tx.get("outbound", id)));
+    const was = rows().map((r) => r?.chat);
+    const each = sent.map((id) => new Promise<void>((r) => trying.set(id, [...(trying.get(id) ?? []), r])));
+    await Promise.race([Promise.all(each), Bun.sleep(SEND_WAIT)]);
+    const now = rows();
+    const name = (chat: string) => store.tx((tx) => chatName({ bots: tx.find("bot", {}) }, { config }, tx.get("chat", chat)!));
+    // One that did not go, or may not have, says so first, moved to another bot or not; not all of
+    // them, how many of each, lest the agent tell you none went, or send again what may have.
+    const count = (status: Outbound["status"], said: string) => {
+      const n = now.filter((r) => r?.status === status).length;
+      return n === 0 ? [] : [n === now.length ? said : `有 ${n} 条${said}`];
+    };
+    const lost = [...count("failed", "没发出去"), ...count("unknown", "不知道发出去没有")];
+    const at = now.find((r) => r?.status === "failed" || r?.status === "unknown");
+    if (at) return { ok: true, text: `${lost.join("，")}：发到${amid(name(at.chat)).trimEnd()}时出错。` };
+    // Not all of them moved: how many, lest the agent send you to the other bot for all of them.
+    const moved = now.flatMap((r, i) => (r && r.chat !== was[i] ? [i] : []));
+    if (moved.length) {
+      const i = moved[0]!;
+      return { ok: true, text: movedTo(moved.length, now.length, name(was[i]!), name(now[i]!.chat)) };
+    }
+    return e.reply;
+  }
   const adapters = new Map<string, ImAdapter>(); // by bot row id
   const capabilities: Ctx["capabilities"] = (bot) => adapters.get(bot)?.capabilities;
 
@@ -522,10 +578,13 @@ export async function runDaemon(args: string[]): Promise<void> {
     });
   }
 
+  // The board's pages open, and whether each is in front, which rh send me asks (product §5.9).
+  const fronts: Fronts = new Map();
   const loop = createLoop({
     store,
     config,
     capabilities,
+    front: () => inFront(fronts),
     stepped: () => syncMenus(),
     retarget(from, to) {
       const done = renameTarget(configPath, from, to);
@@ -537,6 +596,7 @@ export async function runDaemon(args: string[]): Promise<void> {
     perform(e) {
       switch (e.kind) {
         case "rh_reply":
+          if (e.sent) return void receipt(e, e.sent).then((r) => answer(e.id, r));
           return answer(e.id, e.reply);
         case "add_bot": {
           let bot: BotConfig;
@@ -880,7 +940,7 @@ export async function runDaemon(args: string[]): Promise<void> {
         waiting.set(id, reply);
         loop.enqueue({ kind: "board", id, act: a });
       });
-    const server = serveBoard(store, config, hearing, undefined, act);
+    const server = serveBoard(store, config, hearing, undefined, act, fronts);
     board = `${server.hostname}:${server.port}`;
   } catch (err) {
     log("cannot start the board", { port: config.board.port, error: String(err) });

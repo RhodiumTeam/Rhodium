@@ -14,6 +14,7 @@ import { CardFrame } from "./card";
 import { buttonVariants } from "./components/ui/button";
 import type { Command } from "./data";
 import { toast } from "./toast";
+import { useEdges } from "./write";
 
 /** The commands for what you typed after the /: those whose name starts with it first, then those
  *  whose name has it, then those whose summary does (story 296), each in the order given. */
@@ -42,30 +43,38 @@ const ICON: Record<string, LucideIcon> = {
 
 /** The commands, over where you type and as wide (story 294): a row each, its icon, name, arguments and
  *  what it does, cut to one line (story 295). at: the one ↑↓ are on, and the mouse once it moves onto
- *  one (point), as the jump box has it. Tapped, a command is picked; where you type keeps the keyboard. */
+ *  one (point), as the jump box has it. Tapped, a command is picked; where you type keeps the keyboard.
+ *  Past its height the rows scroll inside its box, faded where cut (#577). ↑↓ scroll theirs clear of the
+ *  fade; the mouse's stays where it is, as scrolled it would bring the next one under the mouse. */
 export function Palette({ list, at, pick, point }: { list: Command[]; at: number; pick: (c: Command) => void; point: (at: number) => void }) {
+  const scroller = useEdges<HTMLDivElement>();
+  const pointed = useRef(-1);
   return (
-    <div role="listbox" aria-label="命令" className="absolute -inset-x-px bottom-full z-10 mb-2 max-h-72 overflow-y-auto rounded-2xl border bg-popover p-1 text-popover-foreground shadow-md">
-      {list.map((c, i) => {
-        const Icon = ICON[c.name] ?? Slash;
-        return (
-          <button
-            key={c.name}
-            role="option"
-            aria-selected={i === at}
-            ref={(el) => void (i === at && el?.scrollIntoView({ block: "nearest" }))}
-            onPointerDown={(e) => e.preventDefault()}
-            onPointerMove={() => i === at || point(i)}
-            onClick={() => pick(c)}
-            className={cn("flex h-11 w-full items-center gap-2.5 rounded-xl px-3 text-left", i === at && "bg-accent")}
-          >
-            <Icon className="size-4 shrink-0 text-muted-foreground" />
-            <span className="shrink-0 font-medium">/{c.name}</span>
-            {c.usage && <span className="max-w-[33%] min-w-0 shrink truncate font-mono text-xs text-muted-foreground">{c.usage}</span>}
-            <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">{c.summary}</span>
-          </button>
-        );
-      })}
+    <div role="listbox" aria-label="命令" className="absolute -inset-x-px bottom-full z-10 mb-2 overflow-hidden rounded-2xl border bg-popover text-popover-foreground shadow-md">
+      <div {...scroller} className="card-scroll edge-fade-y max-h-72 scroll-py-8 overflow-y-auto">
+        <div className="p-1">
+          {list.map((c, i) => {
+            const Icon = ICON[c.name] ?? Slash;
+            return (
+              <button
+                key={c.name}
+                role="option"
+                aria-selected={i === at}
+                ref={(el) => void (el && i === at && i !== pointed.current && ((pointed.current = -1), el.scrollIntoView({ block: "nearest" })))}
+                onPointerDown={(e) => e.preventDefault()}
+                onPointerMove={() => i === at || ((pointed.current = i), point(i))}
+                onClick={() => pick(c)}
+                className={cn("flex h-11 w-full items-center gap-2.5 rounded-xl px-3 text-left", i === at && "bg-accent")}
+              >
+                <Icon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="shrink-0 font-medium">/{c.name}</span>
+                {c.usage && <span className="max-w-[33%] min-w-0 shrink truncate font-mono text-xs text-muted-foreground">{c.usage}</span>}
+                <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">{c.summary}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }

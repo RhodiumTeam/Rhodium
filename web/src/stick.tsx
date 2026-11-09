@@ -6,6 +6,7 @@ import { ArrowDown } from "lucide-react";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { Button } from "./components/ui/button";
+import { useEdges } from "./write";
 
 const NEAR = 400; // px from the top where the page before is brought
 const END = 40; // px from the bottom that count as at the newest
@@ -18,9 +19,11 @@ export type Place = { top: number | null; fresh: boolean; tail?: unknown; reset?
 /** label: what screen readers call it. reset: changed, it starts over at the newest, as for another
  *  conversation. tail: changed, something new came below. older: brings the page before, and says
  *  whether there may be more. place: where it was scrolled to as it went, null at the newest, and
- *  whether 新消息 showed; it opens so. children: what it shows, drawn again as pages come. */
-export function Stick({ label, reset, tail, older, place, className, children }: { label: string; reset: unknown; tail: unknown; older: () => Promise<boolean>; place?: Place; className?: string; children: () => ReactNode }) {
+ *  whether 新消息 showed; it opens so. fade: its cut ends fade. children: what it shows, drawn again
+ *  as pages come. */
+export function Stick({ label, reset, tail, older, place, fade, className, children }: { label: string; reset: unknown; tail: unknown; older: () => Promise<boolean>; place?: Place; fade?: boolean; className?: string; children: () => ReactNode }) {
   const list = useRef<HTMLDivElement>(null);
+  const edged = useEdges(list);
   const atEnd = useRef(true);
   const drawn = useRef<{ reset: unknown; tail: unknown }>(undefined);
   const paging = useRef(false);
@@ -89,7 +92,7 @@ export function Stick({ label, reset, tail, older, place, className, children }:
   return (
     <div className={cn("relative min-h-0 flex-1", className)}>
       {/* A call opened at the bottom grows it with no scroll: React passes up its details' toggle. */}
-      <div ref={list} role="log" aria-label={label} onScroll={scrolled} onToggle={scrolled} className="absolute inset-0 overflow-y-auto [overflow-anchor:none]">
+      <div ref={fade ? edged.ref : list} role="log" aria-label={label} onScroll={(e) => (fade && edged.onScroll(e), scrolled())} onToggle={scrolled} className={cn("absolute inset-0 overflow-y-auto [overflow-anchor:none]", fade && "edge-fade-y")}>
         {children()}
       </div>
       {fresh && (

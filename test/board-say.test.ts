@@ -9,6 +9,8 @@ import { dirname, join } from "node:path";
 import { installFakeAgent, type Script } from "./fake-agent/fake-agent";
 import { asking, builtins, endTurn, joinBetweenTools, on, rateLimited, state as session, startTurn, toolResult, toolUse } from "./fake-agent/scripts";
 import { BOARD_LOGIN, boardAct, newInstance, until, type Instance, type InstanceOptions } from "./instance";
+import { unread, type Block, type Sent } from "../web/src/data";
+import { withQuote } from "../web/src/write";
 
 const ME = "you-openid";
 let rhodium: Instance;
@@ -148,7 +150,7 @@ test("a message from the board's queue sent in now that reaches the agent just a
   expect(await posts()).toEqual(["reply to first"]);
 }, 30_000);
 
-test("a message from the board that waited longer than durations.sentAtAfter says when you sent it, as one from IM does", async () => {
+test("a message from the board that waited longer than durations.sentAtAfter says when you sent it, as one from IM does; the transcript's takes its faint bubble's place all the same (#604)", async () => {
   await begin({ toml: '[durations]\nprogramWait = "10s"\nsentAtAfter = "1s"', env: { TZ: "UTC" } });
   const claude = rhodium.claude.path;
   renameSync(claude, `${claude}.updating`);
@@ -158,6 +160,9 @@ test("a message from the board that waited longer than durations.sentAtAfter say
   renameSync(`${claude}.updating`, claude);
   await until(() => frames().length === 1, 15_000);
   expect(frames()).toEqual([`[来自 网页，发送于 ${new Date(sent).toISOString().slice(11, 16)}]\nhi`]);
+  const blocks = async () => (await get(`/api/messages?slot=${await slotId("a")}`)).blocks as Block[];
+  await until(async () => (await blocks()).some((b) => b.kind === "user"), 15_000);
+  expect(unread([{ id: "x", text: "hi", words: "hi", files: [], from: 0 }], await blocks())).toEqual([]);
 }, 30_000);
 
 test("story 279: ! and the commands Rhodium knows work as in IM: a bare ! stops the turn, ! before words interrupts and sends them; a / command it does not know goes to the agent as typed", async () => {
@@ -255,19 +260,59 @@ test("#493: each change of state in a turn the board began says so, from any pag
 /** A PNG of one pixel. */
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
-test("story 276: a message with a picture and a file goes as one from IM does: each kept under media/, a line each, and the picture shown to the agent", async () => {
+test("story 276: a message with a picture and a file goes as one from IM does: each kept under media/, a line each, and the picture shown to the agent; its line breaks as you typed them (#581)", async () => {
   await begin();
   const form = new FormData();
   form.set("id", crypto.randomUUID());
   form.set("slot", await slotId("a"));
-  form.set("text", "看看这张图");
+  // A browser sends a line break in a multipart field as CRLF; the box you typed in had LF.
+  form.set("text", "看看这张图\r\n和这个文件");
   form.append("file", new File([PNG], "shot.png", { type: "image/png" }));
   form.append("file", new File(["notes"], "notes.txt", { type: "text/plain" }));
   const r = await fetch(`${base}/api/send`, { method: "POST", headers: { "Tailscale-User-Login": BOARD_LOGIN, "sec-fetch-site": "same-origin" }, body: form });
   expect(await r.json()).toEqual({ ok: true, text: "起进程，开始新回合" });
   await until(() => frames().length === 1, 15_000);
   const media = `${rhodium.dir}/state/media/`;
-  expect(frames()[0]).toMatch(new RegExp(`^\\[来自 网页\\]\\n看看这张图\\n\\[图片\\] ${media}[0-9a-f]{64}\\n\\[文件\\] notes\\.txt：${media}[0-9a-f]{64}$`));
+  expect(frames()[0]).toMatch(new RegExp(`^\\[来自 网页\\]\\n看看这张图\\n和这个文件\\n\\[图片\\] ${media}[0-9a-f]{64}\\n\\[文件\\] notes\\.txt：${media}[0-9a-f]{64}$`));
   const frame = rhodium.claude.runs()[0]!.stdin.map((l) => JSON.parse(l)).find((m) => m.type === "user");
   expect(frame.message.content[0]).toEqual({ type: "image", source: { type: "base64", media_type: "image/png", data: PNG.toString("base64") } });
+}, 30_000);
+
+test("stories 573, 574: a reply quoted on the board reaches the agent as one quoted in IM does, only its first 100 characters and …; the faint bubble gives way to the transcript's", async () => {
+  await begin();
+  const long = Array.from({ length: 300 }, (_, i) => "一二三四五六七八九十"[i % 10]).join("");
+  const text = withQuote(long, "第二处呢");
+  const sent: Sent = { id: crypto.randomUUID(), text, words: text, files: [], from: 0 };
+  expect(await say(text, "a", sent.id)).toEqual({ ok: true, text: "起进程，开始新回合" });
+  await until(() => frames().length === 1, 15_000);
+  expect(frames()).toEqual([`[来自 网页]\n> ${long.slice(0, 100)}…\n\n第二处呢`]);
+  await becomes("空闲");
+  const { blocks } = await get(`/api/messages?slot=${await slotId("a")}`);
+  expect(unread([sent], blocks)).toEqual([]);
+}, 30_000);
+
+test("story 575: after your message on the board, rh send me stays there while a page of the board is in front; with none, it goes to IM", async () => {
+  const obey: Script = { on, steps: [...startTurn, { rhFrom: "in.message.content.0.text" }, ...endTurn("done"), { goto: 0 }] };
+  await begin({ claude: { script: obey } });
+  await fromIm("[]"); // q's chat goes to w/a, and wrote to it
+  await until(async () => (await posts()).length === 1, 15_000);
+  // A page opens, and says it is in front.
+  const ac = new AbortController();
+  const r = await fetch(`${base}/api/events`, { headers: { "Tailscale-User-Login": BOARD_LOGIN }, signal: ac.signal });
+  const reader = r.body!.pipeThrough(new TextDecoderStream()).getReader();
+  let first = "";
+  while (!first.includes("\n\n")) first += (await reader.read()).value;
+  const { stream } = JSON.parse(/^data: (.*)$/m.exec(first)![1]!);
+  await fetch(`${base}/api/front`, { method: "POST", headers: { "Tailscale-User-Login": BOARD_LOGIN, "sec-fetch-site": "same-origin" }, body: new URLSearchParams({ stream, front: "1" }) });
+  const receipts = () => rhodium.claude.runs().flatMap((r) => r.rh.map((c) => c.out));
+  await say(JSON.stringify([["send", "me", "on the board"]]));
+  await until(() => receipts().length === 1, 15_000);
+  expect(receipts()).toEqual(["留在网页上，没发 IM。\n"]);
+  // The page goes.
+  ac.abort();
+  await becomes("空闲");
+  await say(JSON.stringify([["send", "me", "in IM"]]));
+  await until(() => receipts().length === 2, 15_000);
+  expect(receipts()[1]).toBe("网页没开在前台，已发到假 IM 私聊。\n");
+  expect((await posts()).slice(1)).toEqual(["in IM"]);
 }, 30_000);

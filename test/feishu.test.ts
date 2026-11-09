@@ -980,8 +980,8 @@ test("story 466: restarted, the bot backfills nothing rhodium took in before; no
   }
   api.say("二");
   await until(() => asked().length === 2, 15_000);
-  // Under its new name rhodium has two Feishu bots, so the source line names it.
-  expect(asked()).toEqual(["[来自 飞书私聊]\n一", "[来自 飞书 Bot fs2 的私聊]\n二"]);
+  // Under its new name it is still the config's one Feishu bot: the old name's row counts for nothing (#598).
+  expect(asked()).toEqual(["[来自 飞书私聊]\n一", "[来自 飞书私聊]\n二"]);
 }, 30_000);
 
 const TG_ME = "you-tg";

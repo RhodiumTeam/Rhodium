@@ -148,14 +148,11 @@
 
 /* An info card's scroller (story 523), a code block's or table's sideways one (#498, #502), and the
    message box's, the row of attachments', the palette's, the queue's and the jump box's (#579), and a
-   timeline's, its preview's and the topology's details card's (#636): the board's bar (below), on a
-   phone too, clear of the box's round corners. A track's margins count only along its bar: the block
-   ones an upright bar's, the inline ones, --track-x, a sideways one's. */
+   timeline's, its preview's and the topology's details card's (#636): the board's bar with a mouse
+   (below), clear of the box's round corners; a phone's floats over the text, as the page's (#646). A
+   track's margins count only along its bar: the block ones an upright bar's, the inline ones,
+   --track-x, a sideways one's. */
 @utility card-scroll {
-  @supports selector(::-webkit-scrollbar) {
-    scrollbar-width: auto;
-    scrollbar-color: auto;
-  }
   &::-webkit-scrollbar-track {
     margin: 0.75rem var(--track-x, 0.5rem);
   }

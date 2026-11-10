@@ -242,7 +242,8 @@ export function BoardView({ data }: { data: BoardData }) {
       {!needs.length && !pinned.length && !cards.length && <p className="my-10 text-center text-muted-foreground">没有在用的槽位。</p>}
       {archived.length > 0 && (
         <Collapsible className="mt-7" open={arcOpen} onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}>
-          <CollapsibleTrigger className="group flex items-center gap-1 py-1.5 pr-1 pl-3 text-sm text-muted-foreground transition-colors hover:text-foreground">
+          {/* Its focus ring round its arrow and words, as far from them left as right, as the workspace name's; the arrow where it was. */}
+          <CollapsibleTrigger className="group ml-1.5 flex items-center gap-1 rounded-md px-1.5 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
             <ChevronRight className="size-4 transition-transform group-data-panel-open:rotate-90" />
             已归档 {archived.length}
           </CollapsibleTrigger>
@@ -590,7 +591,7 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
         // Its ground, which the Bots' marks ring themselves in, and a rename box covers it with. Its chat open, a
         // step deeper than a pointed row, as in the sidebar: in light mode --accent is as light as the pointed
         // row's ground, so the two looked alike (#587). Pointed or pressed, it stays.
-        "relative [--av:40px] @min-[40rem]:[--av:34px]",
+        "group/row relative [--av:40px] @min-[40rem]:[--av:34px]",
         open ? "[--row:color-mix(in_oklab,var(--foreground)_7%,var(--card))]" : "[--row:var(--card)]",
         // Its padding, a child's further in at the left, which a rename box over it keeps too (#647).
         "[--pl:calc(14px+var(--d)*52px)] [--pr:14px] @min-[40rem]:[--pl:calc(20px+var(--d)*42px)] @min-[40rem]:[--pr:20px]",
@@ -615,8 +616,8 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
           "scroll-mb-[calc(1.5rem+env(safe-area-inset-bottom))]",
           "bg-(--row)",
           !open && "hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--card))] active:[--row:var(--accent)]",
-          // Inside the row: the card's rounded corners cut off what sticks out.
-          "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+          // Inside the row; the card's first and last rows round as its corners inside its border, which clip the rest.
+          "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring group-first/row:rounded-t-[17px] group-last/row:rounded-b-[17px]",
           "@min-[40rem]:grid-cols-[var(--av)_calc(250px-var(--d)*42px-var(--av)+var(--bw))_minmax(0,1fr)_auto] @min-[40rem]:gap-x-3.5",
           kid && "py-[9px] @min-[40rem]:py-2",
           // Room at the right for its restore button.
@@ -674,7 +675,7 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
       </Link>
       {archived && (
         <Suspense>
-          <Restore slot={c.id} className="absolute top-1/2 right-1.5 grid size-11 -translate-y-1/2 place-items-center rounded-lg text-muted-foreground active:bg-accent @min-[40rem]:right-2.5" />
+          <Restore slot={c.id} className="absolute top-1/2 right-1.5 size-11 -translate-y-1/2 active:bg-accent @min-[40rem]:right-2.5" />
         </Suspense>
       )}
       {menu}
@@ -773,122 +774,131 @@ export function SideList({ from, wide }: { from: "list" | "topology"; wide?: boo
   // 新建槽位 picks the open slot's workspace, as an agent's app starts a session in the project open.
   const ws = data.workspaces.find((w) => [...Object.values(w.groups).flat(), ...w.archived].some((c) => c.id === current))?.name;
   const rowsOf = (rows: Row[], under?: boolean) => rows.map((r) => <SideRow key={r.c.id} r={r} from={from} under={under} />);
+  // The buttons on top as tall as they are now, and the line under them, inked as the chat's top bar's where
+  // they meet: dark's border is see-through, so on the sidebar's lighter ground it takes less of it.
+  const head = { style: { height: icons ? HEAD.shut : HEAD.open }, line: cn("border-b border-border dark:border-border/70 transition-[height] duration-200 ease-out motion-reduce:transition-none", icons && "delay-75") };
   return (
-    // --head: how far down the buttons reach now, under which a tab sticks. The scroll padding keeps a
-    // row scrolled or paged to clear of them and a stuck tab (a row's scroll margin takes the tab back
-    // off where there is none). Its scroll bar shows only under the pointer or the focus (index.css).
-    <div
-      ref={scroller}
-      data-wide={wide || undefined}
-      data-shut={shut || undefined}
-      data-quiet-scroll=""
-      onScroll={(e) => {
-        const top = e.currentTarget.scrollTop;
-        setShut((was) => shrunk(was, top));
-        clearTimeout(peekAt.current);
-        setPeeking(false);
-      }}
-      onKeyDown={(e) => {
-        const t = e.target as HTMLElement;
-        const down = ({ PageDown: true, PageUp: false, " ": !e.shiftKey } as Record<string, boolean>)[e.key];
-        // Space on a button presses it, in a row's name box types it. A key in a sheet, out of the list in the page, is not the list's.
-        if (down === undefined || e.altKey || e.ctrlKey || e.metaKey || !e.currentTarget.contains(t) || (e.key === " " && t.closest("button, input"))) return;
-        if (turnPage(e.currentTarget, down)) e.preventDefault();
-      }}
-      style={{ "--head": `${shut ? HEAD.shut : HEAD.open}px` } as CSSProperties}
-      className="group/side h-full scroll-pt-[calc(var(--head)+2rem)] overflow-y-auto"
-    >
-      <nav aria-label="槽位">
-        <div className="sticky top-0 z-10 h-0">
-          {/* Shrinking, all moves once the names are gone (Tab's fade). */}
-          <div
-            onPointerMove={(e) => {
-              if (e.pointerType !== "mouse") return;
-              clearTimeout(peekAt.current);
-              if (shut && !peeking && onBlank(e)) peekAt.current = setTimeout(() => setPeeking(true), 300);
-            }}
-            onPointerLeave={(e) => {
-              if (e.pointerType !== "mouse") return;
-              clearTimeout(peekAt.current);
-              if (peeking) peekAt.current = setTimeout(() => setPeeking(false), 1000);
-            }}
-            onClick={(e) => {
-              const blank = onBlank(e);
-              if (!blank || (e.nativeEvent as globalThis.PointerEvent).pointerType !== "mouse") setPeeking((p) => blank && shut && !p);
-            }}
-            style={{ height: icons ? HEAD.shut : HEAD.open }}
-            className={cn("relative border-b border-border/70 bg-sidebar transition-[height] duration-200 ease-out motion-reduce:transition-none", icons && "delay-75")}
-          >
-            {/* Grown for a while, each as wide as what it says: the blank tapped stays blank, to tap again. */}
-            <Tab i={0} shut={icons} fit={peeking} icon={SquarePen} onClick={() => setSheet("new")}>
-              新建槽位
-            </Tab>
-            <Tab i={1} shut={icons} fit={peeking} icon={Search} onClick={openJump} hint={MAC ? "⌘K" : "Ctrl+K"}>
-              跳转
-            </Tab>
-            <Tab i={2} shut={icons} fit={peeking} icon={Import} onClick={() => setSheet("import")}>
-              导入
-            </Tab>
-            {above && (
-              <button
-                // It goes as they come in sight: the focus, with them.
-                onClick={() => (scroller.current?.scrollTo({ top: 0, behavior: "smooth" }), needsRef.current?.querySelector("a")?.focus({ preventScroll: true }))}
-                className="absolute top-[15px] right-2 flex items-center gap-1 rounded-full bg-[color-mix(in_oklab,var(--needs)_15%,var(--sidebar))] py-1 pr-2.5 pl-2 text-[13px] font-semibold text-needs ring-1 ring-needs/30 transition-colors hover:bg-[color-mix(in_oklab,var(--needs)_25%,var(--sidebar))] focus-visible:outline-2 focus-visible:outline-ring"
+    // The buttons stay in the list's scroller, so the wheel, a finger and the keys on them scroll it. Their
+    // line runs on behind it, under its bar, across the sidebar to the chat's top bar's (#645).
+    <div className="relative isolate h-full">
+      <div style={head.style} className={cn("pointer-events-none absolute inset-x-0 top-0 -z-10", head.line)} />
+      {/* --head: how far down the buttons reach now, under which a tab sticks and the bar starts. The
+          scroll padding keeps a row scrolled or paged to clear of them and a stuck tab (a row's scroll
+          margin takes the tab back off where there is none). Its bar shows only under the pointer or the
+          focus (index.css). */}
+      <div
+        ref={scroller}
+        data-wide={wide || undefined}
+        data-shut={shut || undefined}
+        data-quiet-scroll=""
+        onScroll={(e) => {
+          const top = e.currentTarget.scrollTop;
+          setShut((was) => shrunk(was, top));
+          clearTimeout(peekAt.current);
+          setPeeking(false);
+        }}
+        onKeyDown={(e) => {
+          const t = e.target as HTMLElement;
+          const down = ({ PageDown: true, PageUp: false, " ": !e.shiftKey } as Record<string, boolean>)[e.key];
+          // Space on a button presses it, in a row's name box types it. A key in a sheet, out of the list in the page, is not the list's.
+          if (down === undefined || e.altKey || e.ctrlKey || e.metaKey || !e.currentTarget.contains(t) || (e.key === " " && t.closest("button, input"))) return;
+          if (turnPage(e.currentTarget, down)) e.preventDefault();
+        }}
+        style={{ "--head": `${shut ? HEAD.shut : HEAD.open}px` } as CSSProperties}
+        className="group/side h-full scroll-pt-[calc(var(--head)+2rem)] overflow-y-auto [&::-webkit-scrollbar-track]:mt-(--head)"
+      >
+        <nav aria-label="槽位">
+          <div className="sticky top-0 z-10 h-0">
+            {/* Shrinking, all moves once the names are gone (Tab's fade). */}
+            <div
+              onPointerMove={(e) => {
+                if (e.pointerType !== "mouse") return;
+                clearTimeout(peekAt.current);
+                if (shut && !peeking && onBlank(e)) peekAt.current = setTimeout(() => setPeeking(true), 300);
+              }}
+              onPointerLeave={(e) => {
+                if (e.pointerType !== "mouse") return;
+                clearTimeout(peekAt.current);
+                if (peeking) peekAt.current = setTimeout(() => setPeeking(false), 1000);
+              }}
+              onClick={(e) => {
+                const blank = onBlank(e);
+                if (!blank || (e.nativeEvent as globalThis.PointerEvent).pointerType !== "mouse") setPeeking((p) => blank && shut && !p);
+              }}
+              style={head.style}
+              className={cn("relative bg-sidebar", head.line)}
+            >
+              {/* Grown for a while, each as wide as what it says: the blank tapped stays blank, to tap again. */}
+              <Tab i={0} shut={icons} fit={peeking} icon={SquarePen} onClick={() => setSheet("new")}>
+                新建槽位
+              </Tab>
+              <Tab i={1} shut={icons} fit={peeking} icon={Search} onClick={openJump} hint={MAC ? "⌘K" : "Ctrl+K"}>
+                跳转
+              </Tab>
+              <Tab i={2} shut={icons} fit={peeking} icon={Import} onClick={() => setSheet("import")}>
+                导入
+              </Tab>
+              {above && (
+                <button
+                  // It goes as they come in sight: the focus, with them.
+                  onClick={() => (scroller.current?.scrollTo({ top: 0, behavior: "smooth" }), needsRef.current?.querySelector("a")?.focus({ preventScroll: true }))}
+                  className="absolute top-[15px] right-2 flex items-center gap-1 rounded-full bg-[color-mix(in_oklab,var(--needs)_15%,var(--sidebar))] py-1 pr-2.5 pl-2 text-[13px] font-semibold text-needs ring-1 ring-needs/30 transition-colors hover:bg-[color-mix(in_oklab,var(--needs)_25%,var(--sidebar))] focus-visible:outline-2 focus-visible:outline-ring"
+                >
+                  <ArrowUp className="size-3.5" />
+                  需要你
+                </button>
+              )}
+            </div>
+          </div>
+          <div ref={list} style={{ paddingTop: HEAD.open }} className="px-2 pb-6" {...hover}>
+            {needs.length > 0 && (
+              <div ref={needsRef} className="mt-1 grid gap-px">
+                {rowsOf(needs)}
+              </div>
+            )}
+            {pinned.length > 0 && (
+              <div className="mt-2 grid gap-px">
+                <Pinned className="h-8 px-2" />
+                {rowsOf(pinned)}
+              </div>
+            )}
+            {/* 置顶 ends with a line, as the buttons on top do: the next block may have no name over it. */}
+            {pinned.length > 0 && (cards.length > 0 || archived.length > 0) && <hr className="-mx-2 mt-2 border-border/70" />}
+            {cards.map((x) =>
+              x.name ? (
+                <SideWorkspace key={x.name} name={x.name} rows={x.rows} row={(r) => <SideRow key={r.c.id} r={r} from={from} under />} />
+              ) : (
+                <div key={x.rows[0]!.c.id} className="mt-2 grid gap-px">
+                  {rowsOf(x.rows)}
+                </div>
+              ),
+            )}
+            {!needs.length && !pinned.length && !cards.length && <p className="my-6 px-2 text-sm text-muted-foreground">没有在用的槽位。</p>}
+            {archived.length > 0 && (
+              <SideFold
+                className="mt-3"
+                open={arcOpen}
+                onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}
+                tab={
+                  <>
+                    已归档
+                    <span className="ml-auto tabular-nums">{archived.length}</span>
+                  </>
+                }
+                peek={rowsOf(peek(archived, at))}
               >
-                <ArrowUp className="size-3.5" />
-                需要你
-              </button>
+                {rowsOf(archived)}
+              </SideFold>
             )}
           </div>
-        </div>
-        <div ref={list} style={{ paddingTop: HEAD.open }} className="px-2 pb-6" {...hover}>
-          {needs.length > 0 && (
-            <div ref={needsRef} className="mt-1 grid gap-px">
-              {rowsOf(needs)}
-            </div>
-          )}
-          {pinned.length > 0 && (
-            <div className="mt-2 grid gap-px">
-              <Pinned className="h-8 px-2" />
-              {rowsOf(pinned)}
-            </div>
-          )}
-          {/* 置顶 ends with a line, as the buttons on top do: the next block may have no name over it. */}
-          {pinned.length > 0 && (cards.length > 0 || archived.length > 0) && <hr className="-mx-2 mt-2 border-border/70" />}
-          {cards.map((x) =>
-            x.name ? (
-              <SideWorkspace key={x.name} name={x.name} rows={x.rows} row={(r) => <SideRow key={r.c.id} r={r} from={from} under />} />
-            ) : (
-              <div key={x.rows[0]!.c.id} className="mt-2 grid gap-px">
-                {rowsOf(x.rows)}
-              </div>
-            ),
-          )}
-          {!needs.length && !pinned.length && !cards.length && <p className="my-6 px-2 text-sm text-muted-foreground">没有在用的槽位。</p>}
-          {archived.length > 0 && (
-            <SideFold
-              className="mt-3"
-              open={arcOpen}
-              onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}
-              tab={
-                <>
-                  已归档
-                  <span className="ml-auto tabular-nums">{archived.length}</span>
-                </>
-              }
-              peek={rowsOf(peek(archived, at))}
-            >
-              {rowsOf(archived)}
-            </SideFold>
-          )}
-        </div>
-        <div ref={end} />
-      </nav>
-      {sheet && (
-        <Suspense>
-          <SideSheets open={sheet} close={() => setSheet(null)} ws={ws} done={(id) => goHash(maxHash(id, from))} />
-        </Suspense>
-      )}
+          <div ref={end} />
+        </nav>
+        {sheet && (
+          <Suspense>
+            <SideSheets open={sheet} close={() => setSheet(null)} ws={ws} done={(id) => goHash(maxHash(id, from))} />
+          </Suspense>
+        )}
+      </div>
     </div>
   );
 }
@@ -1057,7 +1067,7 @@ function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Ro
       </a>
       {archived && (
         <Suspense>
-          <Restore slot={c.id} className="absolute top-1/2 right-0 grid size-9 -translate-y-1/2 place-items-center rounded-lg text-muted-foreground hover:bg-foreground/[0.05]" />
+          <Restore slot={c.id} className="absolute top-1/2 right-0 size-9 -translate-y-1/2" />
         </Suspense>
       )}
       {menu}

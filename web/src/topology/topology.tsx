@@ -1098,7 +1098,7 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
     setDragging(false);
     const h = SHEET.settle(d.to, innerHeight);
     setSheetH(h);
-    aside.current!.style.maxHeight = h ? `${h}px` : ""; // as React will write it, in case it doesn't
+    aside.current!.style.maxHeight = h ? SHEET.css(h) : ""; // as React will write it, in case it doesn't
   };
   // The tap opens or folds it on click, not on the finger's lift: the click then lands on the bar, not
   // on what slides under the finger as the sheet moves. What a menu opened from it does is the menu's:
@@ -1282,7 +1282,7 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
           hidden={wide && route.chat}
           ref={aside}
           aria-label="详情"
-          style={wide || !sheetH || !body ? undefined : { maxHeight: Math.min(sheetH, SHEET.max(innerHeight)) }}
+          style={wide || !sheetH || !body ? undefined : { maxHeight: SHEET.css(sheetH) }}
           className="flex shrink-0 flex-col overflow-hidden border-t bg-card pb-[env(safe-area-inset-bottom)] lg:my-3 lg:mr-4 lg:ml-3 lg:max-h-[calc(100%-1.5rem)] lg:w-80 lg:self-start lg:rounded-xl lg:border lg:pb-0 lg:shadow-sm xl:w-96"
         >
           <div {...bar} className={cn("relative flex min-h-[66px] shrink-0 items-center gap-2.5 pt-2.5 pr-1 pb-3 pl-4 select-none lg:min-h-0 lg:pt-3 lg:pr-4 lg:pb-3", body && "cursor-grab touch-none lg:cursor-auto lg:touch-auto")}>

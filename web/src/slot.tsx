@@ -333,11 +333,21 @@ export function Split({ from, full, board, chat }: { from: "list" | "topology"; 
             // The window's width as it is now: it may have changed since this was drawn.
             if (by) (e.preventDefault(), to((full ? shown : Math.max((pct / 100) * innerWidth, SPLIT.min)) + by));
           }}
-          // A finger's drag moves the line, not the page.
-          className={cn("group relative z-10 -mx-1 flex w-2 flex-none cursor-col-resize touch-none items-center justify-center outline-none motion-reduce:transition-none", ease, gone)}
+          // A finger's drag moves the line, not the page. Over the chat's top bar (z-10), so the line
+          // runs whole down beside it. 3px each side of it: the left's bar's thumb, drawn 3px in from
+          // its edge, stays the bar's to drag.
+          className={cn("group relative z-20 -mr-1 -ml-0.75 flex w-1.75 flex-none cursor-col-resize touch-none items-center justify-center outline-none motion-reduce:transition-none", ease, gone)}
         >
-          <div className="h-full w-px bg-border transition-colors group-hover:bg-ring/60 group-focus-visible:w-0.5 group-focus-visible:bg-ring" />
-          {!full && <div className="absolute h-6 w-1 rounded-lg bg-border transition-colors group-hover:bg-ring/60" />}
+          {/* Odd wide focused too, so it centers on its 1px in whole pixels; over the grip then, both
+              solid, so the grip's round ends leave no notch in it. */}
+          <div className="h-full w-px bg-border transition-colors group-hover:bg-ring/60 group-focus-visible:z-1 group-focus-visible:w-0.75 group-focus-visible:bg-ring" />
+          {/* Odd wide, as the line's area is, so it centers on the line in whole pixels. Its colour on
+              the page's ground, so the line, see-through in dark and hovered, never shows through. */}
+          {!full && (
+            <div className="absolute h-6 w-1.25 rounded-lg bg-background">
+              <div className="size-full rounded-lg bg-border transition-colors group-hover:bg-ring/60 group-focus-visible:bg-ring" />
+            </div>
+          )}
         </div>
         {/* The jump box goes over it. */}
         <div data-chat ref={right} className="relative min-w-0 flex-1">

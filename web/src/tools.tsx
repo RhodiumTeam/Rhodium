@@ -108,7 +108,8 @@ function CodeBlock({ className, children }: ComponentProps<"code"> & ExtraProps)
         </button>
         <CopyKey text={code} className={KEY} icon="size-3.5" />
       </div>
-      <pre {...scroller} className={cn("card-scroll overflow-x-auto pb-2.5 font-mono text-sm", on ? "@container whitespace-pre-wrap wrap-anywhere" : "edge-fade whitespace-pre")}>
+      {/* A phone's floating bar is drawn square over the box's round corners: clipped to them (#646). */}
+      <pre {...scroller} className={cn("card-scroll overflow-x-auto rounded-b-[inherit] pb-2.5 font-mono text-sm [clip-path:border-box]", on ? "@container whitespace-pre-wrap wrap-anywhere" : "edge-fade whitespace-pre")}>
         {/* The padding on the code, not the scroller: scrolled to its end, a long line keeps it. */}
         <code className={cn("block px-3", !on && "w-max min-w-full")}>{on ? code.split("\n").map(hanging) : code}</code>
       </pre>

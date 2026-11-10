@@ -386,9 +386,10 @@ export function Title({ children, sub }: { children: ReactNode; sub: string }) {
 
 export const Heading = ({ children }: { children: ReactNode }) => <h3 className="mt-5 mb-1.5 text-sm font-semibold text-muted-foreground">{children}</h3>;
 
-/** Text as written, such as a log, in a box that scrolls. */
+/** Text as written, such as a log, in a box that scrolls; a phone's floating bar, which Chromium draws
+ *  over a scroller's own round corners, clipped to them (#646). */
 export const Box = ({ children, className }: { children: ReactNode; className?: string }) => (
-  <pre className={cn("card-scroll max-h-[60vh] overflow-auto rounded-lg border bg-card px-2.5 py-2 font-mono text-xs/relaxed whitespace-pre-wrap wrap-anywhere", className)}>{children}</pre>
+  <pre className={cn("card-scroll max-h-[60vh] overflow-auto rounded-lg border bg-card px-2.5 py-2 font-mono text-xs/relaxed whitespace-pre-wrap wrap-anywhere [clip-path:border-box]", className)}>{children}</pre>
 );
 
 /** Your words, each run of 24 or more ASCII characters with no space (a path, a hash, a URL) set to

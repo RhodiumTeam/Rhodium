@@ -494,11 +494,12 @@ function Asks({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-/** An archived slot's restore button on the board (story 269): it is back, no chat pointing at it again. */
+/** An archived slot's restore button on the board (story 269): it is back, no chat pointing at it again.
+ *  A grey key with no ground: a mouse on it shows its hover round, a key rings that round (#503). */
 export function Restore({ slot, className }: { slot: string; className?: string }) {
   const [busy, run] = useAct();
   return (
-    <button aria-label="恢复" disabled={busy} onClick={() => void run({ kind: "rh", argv: ["unarchive", slot] })} className={className}>
+    <button aria-label="恢复" disabled={busy} onClick={() => void run({ kind: "rh", argv: ["unarchive", slot] })} className={cn("hover-round grid place-items-center text-muted-foreground hover:text-foreground", className)}>
       {busy ? <Spin /> : <ArchiveRestore className="size-4.5" />}
     </button>
   );
@@ -787,7 +788,9 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
             else return;
             e.preventDefault();
           }}
-          className="card-scroll edge-fade-y block max-h-[40dvh] scroll-py-8 min-h-11 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground"
+          // A phone's floating bar is drawn square over the box's round corners: clipped to them, where it
+          // has them, with nothing over it (#646).
+          className={cn("card-scroll edge-fade-y block max-h-[40dvh] scroll-py-8 min-h-11 w-full resize-none [clip-path:border-box] bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground", quoted === null && !files.length && "rounded-t-[inherit]")}
         />
         <div className="flex min-w-0 items-center px-1 pb-1">
           {agent && !archived && (
@@ -875,8 +878,9 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
           <span className="tabular-nums">{queue.length}</span>
           {paused && <span className="ml-auto">{button("go", "继续", <Play className="size-4" />, () => void run("go", { op: "now" }))}</span>}
         </div>
-        {/* The line over it is the head's: the fade would take it. */}
-        <div {...scroller} className="card-scroll edge-fade-y max-h-[8.25rem] scroll-py-8 overflow-y-auto">
+        {/* The line over it is the head's: the fade would take it. A phone's floating bar keeps inside
+            the box's round corners, as the message box's does. */}
+        <div {...scroller} className="card-scroll edge-fade-y max-h-[8.25rem] scroll-py-8 overflow-y-auto rounded-b-[inherit] [clip-path:border-box]">
           <ul>
             {queue.map((q) => {
               const held = HELD[q.reason];

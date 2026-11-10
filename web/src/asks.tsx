@@ -177,7 +177,7 @@ function Decide({ c, busy, send }: { c: YesNo; busy: boolean; send: (text: strin
         (c.markdown ? (
           <Plan body={c.body} />
         ) : (
-          <pre className="card-scroll max-h-40 overflow-auto rounded-md bg-muted px-2.5 py-1.5 font-mono text-xs whitespace-pre-wrap wrap-anywhere">{c.body}</pre>
+          <pre className="card-scroll max-h-40 overflow-auto rounded-md bg-muted px-2.5 py-1.5 font-mono text-xs whitespace-pre-wrap wrap-anywhere [clip-path:border-box]">{c.body}</pre>
         ))}
       {c.told && <input value={why} onChange={(e) => setWhy(e.target.value)} placeholder="理由" aria-label="理由" disabled={busy} className={field} />}
       <div className="flex gap-2">

@@ -232,7 +232,7 @@ IM 里，Claude 槽位的 `/usage`（两边都是这份 Markdown）：
   - 卡片的最高，取 70dvh 和“顶栏下沿到底部块上沿”之间空间里小的那个。底部块是输入框连同上面的待发队列，卡片从它的上沿往上长。空间用 `ResizeObserver` 量出来，写进一个 CSS 变量。
     - 只按 70dvh 算，顶栏会盖住卡片顶上的把手、标题行和搜索框：屏幕在 480 到约 515px 高时，或者手机上排着消息时。
   - 触屏（`pointer: coarse`）上打开模型或 agent 的单子，先让输入框失焦，键盘收起来。查询结果的卡片不收键盘：故事 389 要连着查。
-  - 滚动条：设了 `scrollbar-width`、`scrollbar-color` 的元素，Chromium 不认 `::-webkit-scrollbar`，而它的细滚动条（`scrollbar-width: thin`）两头带箭头。所以卡片的滚动区在认 `::-webkit-scrollbar` 的浏览器里把这两项设回 `auto`，用它画细的圆角滚动条（Chromium 上试过管用），轨道两头各空出一截，不被圆角切掉。2026-11-09 起，电脑上（`pointer: fine`）整页的滚动区也这样画（#630）；手机上整页的照旧用细滚动条，浮在字上。不用 ScrollArea 组件。
+  - 滚动条：设了 `scrollbar-width`、`scrollbar-color` 的元素，Chromium 不认 `::-webkit-scrollbar`，而它的细滚动条（`scrollbar-width: thin`）两头带箭头。所以电脑上（`pointer: fine`），认 `::-webkit-scrollbar` 的浏览器里，滚动区把这两项设回 `auto`，用它画细的圆角滚动条（Chromium 上试过管用）。卡片的轨道两头各空出一截，不被圆角切掉。2026-11-09 起整页的滚动区也这样画（#630）。手机上，卡片的和整页的都用细滚动条，浮在字上（#646）。矮于 480px、整张卡片自己滚时，卡片裁在自己的圆角里，浮着的滚动条不伸出去，阴影也一起裁掉。不用 ScrollArea 组件。
 - 进度条：80% 起琥珀色，95% 起红色，不写“快满了”这类字。`/usage`、`/context`、`/status` 里的都一样。
 - 重置时间写成“↻ 1 小时 46 分”；24 小时以外写时刻“↻ 10/27 06:00”；已经过了写“已重置”。
 - `/usage`：

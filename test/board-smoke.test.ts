@@ -258,7 +258,7 @@ smoke("#644: 改名 opens with the name all picked, shown from its start, the fo
   }
 });
 
-smoke("story 252: 详情 opens at the newest event, its top fading under the board's thin bar; scrolled to the top it brings the ones before without moving, back to the first", async () => {
+smoke("story 252, #646: 详情 opens at the newest event, its top fading under a phone's floating bar; scrolled to the top it brings the ones before without moving, back to the first", async () => {
   // 60 events, more than a page: the first ten come only once you scroll up.
   store.tx((tx) => {
     for (let i = 0; i < 60; i++) tx.append({ source: "rh", type: "slot_renamed", slot: talks, data: { n: i } });
@@ -276,8 +276,8 @@ smoke("story 252: 详情 opens at the newest event, its top fading under the boa
   await nth(59).waitFor({ state: "attached" });
   await until(async () => (await toEnd()) < 1);
   expect(await nth(0).count()).toBe(0);
-  // As the timeline's above it: no arrows on its bar, and its top fades while there is more above.
-  expect(await log.evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("auto");
+  // As the timeline's above it: the phone's thin bar, floating over the text (#646), and its top fades while there is more above.
+  expect(await log.evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("thin");
   await until(async () => (await fadesY(log)).join() === "32,0");
   // In one go: the page before may come in as soon as the scroll is told.
   const [top, first] = await log.evaluate((el) => ((el.scrollTop = 0), [el.querySelectorAll("li")[0]!.getBoundingClientRect().top, el.querySelectorAll("li")[0]!.textContent] as const));
@@ -297,8 +297,8 @@ smoke("story 588: a conversation previewed in the timeline brings the pages befo
   await log.getByText("a59", { exact: true }).waitFor();
   const first = log.getByText("q0", { exact: true });
   expect(await first.count()).toBe(0);
-  // In the chat's 详情 too, the timeline's scroller has the board's round bar with no arrows.
-  expect(await log.locator("xpath=ancestor::details").evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("auto");
+  // In the chat's 详情 too, the timeline's scroller keeps the phone's thin bar, floating over the text (#646).
+  expect(await log.locator("xpath=ancestor::details").evaluate((el) => getComputedStyle(el).scrollbarWidth)).toBe("thin");
   await until(async () => (await log.evaluate((el) => void (el.scrollTop = 0)), (await first.count()) > 0));
 });
 
@@ -321,6 +321,21 @@ smoke("story 231, #637: on a phone, a preview opened in the half-height sheet is
   expect(box.y + box.height).toBeLessThanOrEqual(page.viewportSize()!.height);
   // Its row whole above it, in the sheet (#637).
   expect(await shownIn(sheet.getByRole("button", { name: /q0/ }), page.locator("[data-body]"))).toBe(true);
+});
+
+smoke("#648: a phone's sheet turned on its side keeps two thirds of the graph's room at most, the page not scrolled, and turned back has its own height again", async () => {
+  const page = await open(`/topology/slot/${talks}`);
+  const sheet = sheetOf(page);
+  await sheet.getByRole("button", { name: "展开详情" }).click();
+  await sheet.getByRole("button", { name: /q0/ }).click();
+  await sheet.getByRole("log", { name: "预览" }).getByText("a59", { exact: true }).waitFor();
+  await page.setViewportSize({ width: 915, height: 412 });
+  // As a reload there has it: (412 - 92) * 2 / 3.
+  await until(async () => Math.round((await sheet.boundingBox())!.height) === 213);
+  expect(await page.evaluate(() => [scrollY, document.documentElement.scrollHeight])).toEqual([0, 412]);
+  // Its stored height untouched: as it opened upright, 839 * 0.46.
+  await page.setViewportSize({ width: 412, height: 839 });
+  await until(async () => Math.round((await sheet.boundingBox())!.height) === 386);
 });
 
 smoke("#637: a preview with room in the details but not with its row above it is made shorter, the two whole in view, in the topology's details and in the chat's", async () => {
@@ -370,9 +385,11 @@ smoke("#637: an open preview follows the details as they change size, scrolled b
   await page.setViewportSize({ width: 1280, height: 555 });
   await until(async () => (await shownIn(log, body)) && (await shownIn(row, body)));
   // Back to the top, then too short for the preview: its row, left in the bottom fade, goes to the top.
+  // As short as at 470px high, a scroll told before the observer sees them shrink, as the browser may
+  // tell one: theirs, not yours, so the preview is still followed.
   await page.setViewportSize({ width: 1280, height: 900 });
   await until(() => body.evaluate((el) => el.scrollTop === 0));
-  await page.setViewportSize({ width: 1280, height: 470 });
+  await body.evaluate((el) => ((el.style.maxHeight = "275px"), el.dispatchEvent(new Event("scroll"))));
   await until(() => shownIn(row, body));
 });
 
@@ -1943,6 +1960,14 @@ const fades = (l: Locator) =>
     return [/^linear-gradient\(to right, rgba\(0, 0, 0, 0\) ([\d.]+)px/, /rgba\(0, 0, 0, 0\) calc\(100% - ([\d.]+)px\)\)/].map((re) => Number(re.exec(mask)?.[1] ?? 0));
   });
 
+/** Whether a scroller clips what it draws, a phone's floating bar too, to round corners as its box's at
+ *  its end, the top or the bottom (#646): Chromium draws that bar over a scroller's own round corners. */
+const cornered = (l: Locator, end: "top" | "bottom") =>
+  l.evaluate((el, end) => {
+    const radii = (e: Element) => ["left", "right"].map((side) => getComputedStyle(e).getPropertyValue(`border-${end}-${side}-radius`)).join();
+    return getComputedStyle(el).clipPath === "border-box" && radii(el) === radii(el.parentElement!) && radii(el) !== "0px,0px";
+  }, end);
+
 smoke("#507: 自动换行 off, a code block fades its text out 12px inside an edge only while there is more to scroll that way, its end clear of the border, and one that fits not at all", async () => {
   const line = "kjj.wuhan.gov.cn/wmfw/tzgg/".repeat(8) + "end";
   const page = await open(`/slot/${saying("fades", `\`\`\`\n${line}\n\`\`\`\n\n\`\`\`\nshort\n\`\`\``)}`);
@@ -1963,6 +1988,8 @@ smoke("#507: 自动换行 off, a code block fades its text out 12px inside an ed
     return el.parentElement!.getBoundingClientRect().right - last.getBoundingClientRect().right;
   });
   expect(gap).toBeGreaterThanOrEqual(12);
+  // On a phone its bar floats, kept inside the box's round corners (#646).
+  expect(await cornered(long, "bottom")).toBe(true);
 });
 
 smoke("#507: wrapped, a line keeps its indent as far as the box goes, and its continuation starts under it, a tab counted as shown, but never past a third of the box; 复制 copies the block as written", async () => {
@@ -2160,7 +2187,9 @@ smoke("#503: a small control reached by Tab rings what you see along its edge, n
   expect(await rung(home)).toEqual({ style: "solid", inset: 2 });
 });
 
-smoke("#503: a workspace's name reached by Tab rings its name and arrow, as far from them above as below, clear of its card under it", async () => {
+smoke("#503: a workspace's name reached by Tab rings its name and arrow, as far from them above as below, clear of its card under it; 已归档 its arrow and words, as far from them left as right; a card's first and last rows round as its corners inside its border; an archived row's 恢复 on its hover round", async () => {
+  const gone = binned("ringed");
+  onTestFinished(() => store.tx((tx) => tx.delete("slot", { id: gone })));
   const page = await open("", undefined, wide());
   const w = page.getByRole("button", { name: "w", exact: true });
   await page.keyboard.press("Tab");
@@ -2175,6 +2204,21 @@ smoke("#503: a workspace's name reached by Tab rings its name and arrow, as far 
   });
   expect(Math.abs(above - below)).toBeLessThanOrEqual(1);
   expect(clear).toBeGreaterThanOrEqual(2);
+  expect(await w.evaluate((el) => ((r) => [r[0], r.at(-1)])([...el.parentElement!.querySelectorAll('a[href^="#/slot/"]')].map((a) => getComputedStyle(a).borderRadius)))).toEqual(["17px 17px 0px 0px", "0px 0px 17px 17px"]);
+  const archived = page.getByRole("button", { name: /^已归档/ });
+  await archived.focus();
+  expect(await rung(archived)).toEqual({ style: "solid", inset: 0 });
+  const [left, right] = await archived.evaluate((el) => {
+    const what = document.createRange();
+    what.selectNodeContents(el);
+    const [r, inner] = [el.getBoundingClientRect(), what.getBoundingClientRect()];
+    return [inner.left - r.left, r.right - inner.right];
+  });
+  expect(Math.abs(left - right)).toBeLessThanOrEqual(1);
+  await page.keyboard.press("Enter");
+  const restore = page.getByRole("button", { name: "恢复" });
+  await restore.focus();
+  expect(await rung(restore)).toEqual({ style: "solid", inset: 4 });
 });
 
 smoke("#560, #595: on a wide screen the topology sheet's 操作 under a mouse grounds its three dots, as a key rings them, not its 44px; a long name in the path ends in an ellipsis; the card's right edge is the header's, as the settings' card's", async () => {
@@ -2210,7 +2254,7 @@ smoke("#560: on a phone, 打开槽位 and 新槽位 last in the details' top row
   }
 });
 
-smoke("#502: a table in the agent's message is one box, none around it, narrow or wide; a wide one scrolls inside it with the board's thin round bar, the chat no wider", async () => {
+smoke("#502, #646: a table in the agent's message is one box, none around it, narrow or wide; a wide one scrolls inside it with the phone's thin bar, the chat no wider", async () => {
   const narrow = "| a | b |\n|---|---|\n| 1 | 2 |";
   const broad = `|${" column |".repeat(30)}\n|${"---|".repeat(30)}`;
   const page = await open(`/slot/${saying("tables", `${narrow}\n\n${broad}\n\n\`\`\`\ncode\n\`\`\``)}`);
@@ -2226,7 +2270,7 @@ smoke("#502: a table in the agent's message is one box, none around it, narrow o
     });
   expect([await boxes(small), await boxes(big)]).toEqual([1, 1]);
   const box = big.locator("..");
-  expect([await over(log), (await over(box)) > 0, await box.evaluate((el) => getComputedStyle(el).scrollbarWidth)]).toEqual([0, true, "auto"]);
+  expect([await over(log), (await over(box)) > 0, await box.evaluate((el) => getComputedStyle(el).scrollbarWidth)]).toEqual([0, true, "thin"]);
   // A cell's words start as far inside its box as a code block's do.
   const inset = (l: Locator) => l.evaluate((el) => getComputedStyle(el).paddingLeft);
   expect([await inset(small.locator("th").first()), await inset(small.locator("td").first())]).toEqual(Array(2).fill(await inset(log.locator("pre code"))));
@@ -2412,8 +2456,8 @@ smoke("story 209: the split's line, moved by the arrow keys after the window wid
   const line = page.getByRole("separator");
   await line.focus();
   await page.keyboard.press("ArrowRight");
-  const at = (await line.boundingBox())!;
-  expect(at.x + at.width / 2).toBeCloseTo(1600 * 0.4 + 16, 0);
+  // The left side's edge, where the line is.
+  expect(await line.evaluate((e) => e.previousElementSibling!.getBoundingClientRect().right)).toBeCloseTo(1600 * 0.4 + 16, 0);
   await page.context().close();
 });
 
@@ -2734,6 +2778,118 @@ smoke("stories 425, 429: scrolled past a little, the sidebar's buttons shrink to
   expect(await side.evaluate((e) => document.activeElement === e.querySelector("a") && document.activeElement!.textContent!.includes("需要你"))).toBe(true);
   await settled(false);
   await up.waitFor({ state: "detached" });
+  await page.context().close();
+});
+
+smoke("#645: the line under the sidebar's buttons runs on under its list's bar to the chat's top bar's, the bar starts under them, the line down between them runs beside the top bar, and leaves the bar's thumb whole", async () => {
+  // Bars drawn as Chrome draws them on Windows or Linux, which playwright hides.
+  const drawn = await chromium.launch({ ignoreDefaultArgs: ["--hide-scrollbars"], handleSIGTERM: false });
+  onTestFinished(() => drawn.close());
+  const page = await drawn.newPage({ viewport: { width: 1440, height: 900 }, extraHTTPHeaders: { "Tailscale-User-Login": BOARD_LOGIN } });
+  page.setDefaultTimeout(5_000);
+  await page.goto(`http://127.0.0.1:${server!.port}/#/slot/${finished}?full`);
+  const made = page.getByRole("button", { name: "新建槽位", exact: true });
+  await page.getByRole("navigation", { name: "槽位" }).locator("a").first().waitFor();
+  const chat = (await page.locator("header").filter({ has: page.getByRole("heading", { name: "w/finished" }) }).boundingBox())!.x;
+  /** The list's bar, how tall the buttons on top are, and how far right of the chat's line and below
+   *  their bottom the line drawn across the sidebar and the bar's track reach. */
+  const at = () =>
+    made.evaluate((b, chat) => {
+      const list = b.closest("nav")!.parentElement!;
+      const [head, line] = [b.parentElement!.getBoundingClientRect(), list.previousElementSibling!.getBoundingClientRect()];
+      const track = parseFloat(getComputedStyle(list, "::-webkit-scrollbar-track").marginTop) + list.getBoundingClientRect().top;
+      return { bar: list.offsetWidth - list.clientWidth, head: head.height, line: [line.right - chat, line.bottom - head.bottom], track: track - head.bottom };
+    }, chat);
+  await settles(at, { bar: 10, head: 128, line: [0, 0], track: 0 });
+  // A press on the bar's thumb where it is drawn furthest right, 3px in from the edge, drags it, not
+  // the line beside it.
+  await page.mouse.move(chat - 4, 133);
+  await page.mouse.down();
+  await page.mouse.move(chat - 4, 233, { steps: 5 });
+  await page.mouse.up();
+  expect(await made.evaluate((b) => b.closest("nav")!.parentElement!.scrollTop)).toBeGreaterThan(0);
+  await made.evaluate((b) => b.closest("nav")!.parentElement!.scrollTo(0, 300));
+  await settles(at, { bar: 10, head: 57, line: [0, 0], track: 0 });
+  /** The line's red as drawn under the buttons, under the list's bar, and under the chat's top bar;
+   *  and the one between the sidebar and the chat's, beside the top bar and below it. */
+  const inks = async () => {
+    const src = `data:image/png;base64,${(await page.screenshot()).toString("base64")}`;
+    return made.evaluate(
+      async (b, [chat, src]) => {
+        const img = Object.assign(new Image(), { src });
+        await img.decode();
+        const g = Object.assign(document.createElement("canvas"), { width: img.width, height: img.height }).getContext("2d")!;
+        g.drawImage(img, 0, 0);
+        const red = (x: number, y: number) => g.getImageData(x, y, 1, 1).data[0]!;
+        const y = Math.floor(b.parentElement!.getBoundingClientRect().bottom - 1);
+        const x = Math.floor(document.querySelector('[role="separator"] > div')!.getBoundingClientRect().left + 0.5);
+        return { across: [chat - 40, chat - 5, chat + 40].map((x) => red(x, y)), down: [20, 400].map((y) => red(x, y)) };
+      },
+      [chat, src] as const,
+    );
+  };
+  // One line across the seam, light and dark, though the sidebar's ground is not the chat's; and one
+  // down it, whole beside the chat's top bar too.
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    for (const red of Object.values(await inks())) expect(Math.max(...red) - Math.min(...red), `${scheme} ${red}`).toBeLessThanOrEqual(1);
+  }
+});
+
+smoke("#645: the wheel on the sidebar's buttons on top, and the keys with the focus on one, scroll its list", async () => {
+  const { page, buttons, settled, top, scroll } = await sidebar(sideBoard(10));
+  const [made, jump] = buttons;
+  await page.mouse.move(250, 30);
+  await page.mouse.wheel(0, 300);
+  await until(async () => (await top()) === 300);
+  await settled(true);
+  await page.mouse.wheel(0, -200);
+  await until(async () => (await top()) === 100);
+  await scroll(0);
+  await made.focus();
+  await page.keyboard.press("PageDown");
+  await until(async () => (await top()) > 300);
+  await jump.focus();
+  await page.keyboard.press("End");
+  const end = await made.evaluate((b) => b.closest("nav")!.parentElement!.scrollHeight - b.closest("nav")!.parentElement!.clientHeight);
+  await until(async () => (await top()) === end);
+  await page.keyboard.press("ArrowUp");
+  await until(async () => (await top()) < end);
+  await page.context().close();
+});
+
+smoke("#650: the split's grip is its line's colour at rest, hovered and focused, light and dark, the line not showing through it, and the focus line is centred on the line", async () => {
+  const page = await open(`/slot/${finished}`, undefined, wide());
+  await page.getByRole("log", { name: "对话" }).waitFor();
+  const line = page.getByRole("separator");
+  /** The reds 2px each side of the line's middle: through the grip's middle, and 100px below it. */
+  const reds = async () => {
+    await line.evaluate((s) => Promise.all(s.getAnimations({ subtree: true }).map((a) => a.finished)));
+    const src = `data:image/png;base64,${(await page.screenshot()).toString("base64")}`;
+    return line.evaluate(async (s, src) => {
+      const img = Object.assign(new Image(), { src });
+      await img.decode();
+      const g = Object.assign(document.createElement("canvas"), { width: img.width, height: img.height }).getContext("2d")!;
+      g.drawImage(img, 0, 0);
+      const [l, grip] = [s.firstElementChild!.getBoundingClientRect(), s.lastElementChild!.getBoundingClientRect()];
+      const x = Math.floor(l.left + l.width / 2);
+      const row = (y: number) => [-2, -1, 0, 1, 2].map((d) => g.getImageData(x + d, Math.floor(y), 1, 1).data[0]!);
+      return [row(grip.top + grip.height / 2), row(grip.bottom + 100)] as const;
+    }, src);
+  };
+  const box = (await line.boundingBox())!;
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    for (const state of ["rest", "hover", "focus"] as const) {
+      await page.mouse.move(state === "hover" ? box.x + box.width / 2 : 900, 800);
+      if (state === "focus") (await line.focus(), await page.keyboard.press("Shift"));
+      const [grip, below] = await reds();
+      const off = (a: number[], b: number[]) => Math.max(...a.map((c, i) => Math.abs(c - b[i]!)));
+      expect(off(grip, grip.map(() => below[2]!)), `${scheme} ${state} grip ${grip} line ${below}`).toBeLessThanOrEqual(1);
+      expect(off(below, below.toReversed()), `${scheme} ${state} line ${below}`).toBeLessThanOrEqual(1);
+      if (state === "focus") await line.blur();
+    }
+  }
   await page.context().close();
 });
 
@@ -3275,9 +3431,10 @@ smoke("#617: on a wide screen the board's header beside a chat is level with the
         return { mid: first.y + up + first.height / 2, line: line && ([line.left, line.right, line.bottom + up] as const) };
       }),
     );
-    const side = (await page.getByRole("separator").boundingBox())!;
+    // Up to the line drawn between the sides.
+    const side = (await page.getByRole("separator").locator("> div").first().boundingBox())!;
     expect(board!.mid).toBe(chat!.mid);
-    expect(board!.line).toEqual([0, side.x + side.width / 2, chat!.line![2]]);
+    expect(board!.line).toEqual([0, side.x, chat!.line![2]]);
   }
 });
 
@@ -5134,6 +5291,8 @@ smoke("story 520: with many models the sheet's title and its levels stay in sigh
     const level = sheet.getByRole("group", { name: "思考强度" });
     await level.getByRole("slider").waitFor();
     const card = (await sheet.boundingBox())!;
+    const clip = () => sheet.evaluate((el) => getComputedStyle(el).clipPath);
+    expect(await clip()).toBe("none"); // its shadow whole
     // The list at its top, m0 in sight: the levels are in sight too.
     const l = (await level.boundingBox())!;
     expect(l.y + l.height).toBeLessThanOrEqual(card.y + card.height);
@@ -5144,6 +5303,8 @@ smoke("story 520: with many models the sheet's title and its levels stay in sigh
     await sheet.getByRole("button", { name: "m0" }).scrollIntoViewIfNeeded();
     await sheet.getByRole("button", { name: "m29" }).scrollIntoViewIfNeeded();
     expect((await sheet.getByRole("button", { name: "关闭" }).boundingBox())!.y).toBeLessThan((await sheet.boundingBox())!.y);
+    // Its floating bar, drawn square, kept inside its round corners (#646).
+    expect(await clip()).toBe("border-box");
   } finally {
     reset();
   }
@@ -5623,6 +5784,12 @@ smoke("story 272: as what you type grows over lines, the chat above stays at the
   await until(async () => (await toEnd()) < 1);
 });
 
+smoke("#646: on a phone, a box round itself that scrolls, as Rhodium's log, clips its floating bar to its corners", async () => {
+  const log = (await open("/rhodium")).locator("pre").first();
+  await log.waitFor();
+  expect(await log.evaluate((el) => getComputedStyle(el).clipPath)).toBe("border-box");
+});
+
 smoke("stories 282, 283, 287, 288: on a phone, what you type while a turn runs goes with the key, now 排队, into the queue above where you type; 插话 sends it in from there, 编辑 takes it back where you type, and so does Rhodium giving it back; on a keyboard Esc stops the turn", async () => {
   const { slot, conversation } = store.tx((tx) => {
     const slot = tx.insert("slot", { workspace: ws, name: "queues", dir: "/w", mode: "headless", state: "running", lifetime: "longterm" }).id;
@@ -5650,6 +5817,7 @@ smoke("stories 282, 283, 287, 288: on a phone, what you type while a turn runs g
     const queue = page.getByRole("region", { name: "待发队列" });
     await queue.getByText("顺便看看日志").waitFor();
     expect(await page.locator(".opacity-60", { hasText: "顺便看看日志" }).count()).toBe(0);
+    expect(await cornered(queue.locator("ul").locator(".."), "bottom")).toBe(true);
     const sent = acted.at(-1)!.id;
     const cut = queue.getByRole("button", { name: "插话" });
     const tap = (await cut.boundingBox())!;
@@ -5863,14 +6031,31 @@ smoke("#638: the topology's details, the chat's timeline and a preview fade wher
   await until(async () => (await fadesY(timeline)).join() === "0,0");
 });
 
+/** Whether a scroller has the browser's thin bar, not the board's round one with no arrows (card-scroll). */
+const thin = (l: Locator) => l.evaluate((el) => getComputedStyle(el).scrollbarWidth === "thin");
+
+smoke("#579, #646: with a mouse, the row of attachments has the board's round bar, its thumb, inside a clear border, starting where the files and the typed text do", async () => {
+  const slot = store.tx((tx) => tx.insert("slot", { workspace: ws, name: "cut-wide", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id);
+  const page = await open(`/slot/${slot}`, undefined, wide());
+  await page.locator('input[type="file"]').setInputFiles({ name: "a.txt", mimeType: "text/plain", buffer: Buffer.from("x") });
+  const row = page.getByRole("list", { name: "附件" }).locator("..");
+  await row.waitFor();
+  expect(await thin(row)).toBe(false);
+  const [track, rim, pad] = await row.evaluate((el) => [getComputedStyle(el, "::-webkit-scrollbar-track").marginLeft, getComputedStyle(el, "::-webkit-scrollbar-thumb").borderLeftWidth, getComputedStyle(el.firstElementChild!).paddingLeft].map(parseFloat));
+  expect(track! + rim!).toBe(pad!);
+});
+
 smoke("#577, #579: on a phone, files attached past the box's edge, commands past the palette's height and lines past the message box's fade out where they are cut, only while there is more that way; ↑↓ scroll their command clear of the fade, the mouse scrolls nothing", async () => {
   const slot = store.tx((tx) => tx.insert("slot", { workspace: ws, name: "cut", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id);
   const page = await open(`/slot/${slot}`);
   const box = page.getByRole("textbox", { name: "消息" });
   const attach = (...names: string[]) => page.locator('input[type="file"]').setInputFiles(names.map((name) => ({ name, mimeType: "text/plain", buffer: Buffer.from("x") })));
   const row = page.getByRole("list", { name: "附件" }).locator("..");
+  // Its floating bar kept inside the box's round corners, where it has them: none with files over it (#646).
+  expect(await cornered(box, "top")).toBe(true);
   await attach("a.txt");
   await row.waitFor();
+  expect(await cornered(box, "top")).toBe(false);
   expect(await fades(row)).toEqual([0, 0]);
   await attach("b.txt", "c.txt", "d.txt");
   await settles(() => fades(row), [0, 12]); // as the row fills (#575)
@@ -5879,12 +6064,8 @@ smoke("#577, #579: on a phone, files attached past the box's edge, commands past
   await row.evaluate((el) => (el.scrollLeft = el.scrollWidth));
   await until(async () => (await fades(row))[0]! > 0);
   expect(await fades(row)).toEqual([12, 0]);
-  /** Whether a scroller has the board's thin round bar with no arrows (card-scroll), not the browser's (#579). */
-  const round = (l: Locator) => l.evaluate((el) => getComputedStyle(el).scrollbarWidth === "auto");
-  expect([await round(row), await round(box)]).toEqual([true, true]);
-  // Its thumb, inside a clear border, starts where the files and the typed text do.
-  const [track, rim, pad] = await row.evaluate((el) => [getComputedStyle(el, "::-webkit-scrollbar-track").marginLeft, getComputedStyle(el, "::-webkit-scrollbar-thumb").borderLeftWidth, getComputedStyle(el.firstElementChild!).paddingLeft].map(parseFloat));
-  expect(track! + rim!).toBe(pad!);
+  // Their bars are the phone's thin ones, floating over what scrolls as the page's do (#646).
+  expect([await thin(row), await thin(box)]).toEqual([true, true]);
   // Written past its height, the message box fades at its cut ends too (#579), and reads them again as
   // what is written changes with the box no taller and not scrolled.
   await box.fill(Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n"));
@@ -5903,7 +6084,7 @@ smoke("#577, #579: on a phone, files attached past the box's edge, commands past
   const commands = list.locator("> div");
   // Each fade follows the list as it fills, and its scroll a frame after it (#575).
   await settles(() => fadesY(commands), [0, 32]);
-  expect(await round(commands)).toBe(true);
+  expect(await thin(commands)).toBe(true);
   // Down to the 7th, cut in half at first: scrolled till it ends where the fade starts.
   for (let i = 0; i < 6; i++) await box.press("ArrowDown");
   await settles(() => fadesY(commands), [32, 32]);

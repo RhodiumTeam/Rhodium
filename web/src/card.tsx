@@ -22,7 +22,8 @@ const TONE_TEXT = { "": "", warn: "text-needs", bad: "text-destructive" };
  *  whole card scrolling on a lower one. With a top, as a search box, it grows but never shrinks while
  *  open, so the top stays put as what is under it filters. Tapping the transcript, Esc or ✕ closes it, and so does its
  *  handle dragged down past a third of it, which a shorter drag springs back from (story 521); where you
- *  type keeps the keyboard. Every answer, sheet and picker the chat shows is one. */
+ *  type keeps the keyboard. Every answer, sheet and picker the chat shows is one. Scrolling whole, it
+ *  clips a phone's floating bar, drawn square over its round corners, to them, its shadow too (#646). */
 export function CardFrame({ icon: Icon, logo, title, sub, close, top, foot, children }: { icon: LucideIcon; logo?: ReactNode; title: string; sub?: string; close: () => void; top?: ReactNode; foot?: ReactNode; children: ReactNode }) {
   useEffect(() => {
     // Esc where you type is its own: it closes this too, first.
@@ -69,7 +70,7 @@ export function CardFrame({ icon: Icon, logo, title, sub, close, top, foot, chil
           role="dialog"
           aria-label={title}
           style={drag ? { transform: `translateY(${drag.by}px)` } : undefined}
-          className={cn("card-scroll pointer-events-auto mx-auto flex max-h-(--card) max-w-3xl flex-col overflow-y-auto rounded-2xl border bg-popover text-popover-foreground shadow-lg tall:overflow-hidden", !drag && "transition-transform")}
+          className={cn("card-scroll pointer-events-auto mx-auto flex max-h-(--card) max-w-3xl flex-col overflow-y-auto rounded-2xl border bg-popover text-popover-foreground shadow-lg tall:overflow-hidden not-tall:[clip-path:border-box]", !drag && "transition-transform")}
         >
           <div className="shrink-0">
             {/* Held, it keeps the caret where you type, and takes no text along. A finger's reach, over the

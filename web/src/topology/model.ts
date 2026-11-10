@@ -836,11 +836,13 @@ export const union = (rs: Rect[]): Rect => {
 };
 
 /** The phone's sheet: its one row's height; how tall it may be on a screen (a third of the graph, under
- *  its 48px header and 44px path, stays above it); how tall a tap opens it; and where a drag let go
+ *  its 48px header and 44px path, stays above it); the same as CSS for a sheet of height h, following
+ *  the window as it turns or changes size (#648); how tall a tap opens it; and where a drag let go
  *  of at h leaves it: null, its row alone, when within two rows. */
 export const SHEET = {
   bar: 66,
   max: (screen: number) => Math.round(((screen - 92) * 2) / 3),
+  css: (h: number) => `min(${h}px, calc((100dvh - 92px) * 2 / 3))`,
   open: (screen: number) => Math.min(SHEET.max(screen), Math.round(screen * 0.46)),
   settle: (h: number, screen: number): number | null => (h < 2 * SHEET.bar ? null : Math.min(Math.round(h), SHEET.max(screen))),
 };

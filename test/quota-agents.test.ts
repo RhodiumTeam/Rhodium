@@ -1,8 +1,8 @@
 // Each agent's quota is its own (#419): a refusal staggers only the slots waiting on the same agent,
 // and you hear of it by that agent's name. pi reports no quota, so its refusal is made up here and
 // given to the router as is. Codex's comes from its driver, end to end (story 502).
-import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -15,6 +15,7 @@ import { codexQuota, rateLimited } from "./fake-agent/scripts";
 import { BOARD_LOGIN, newInstance, until, withoutSource, type Instance } from "./instance";
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-quota-agents-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const ctx: Ctx = {
   now: Date.parse("2026-10-27T12:00:00Z"),

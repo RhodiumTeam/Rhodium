@@ -77,6 +77,16 @@ export function packageVersion(program: string): string | null {
   }
 }
 
+/** pi's version. A managed install's bin/pi is a launcher script, not a link into the package: it runs
+ *  install/releases/<install/current-version>/node_modules/.bin/pi beside bin, whose package is read.
+ *  null when the version file is bad or names no release. */
+export function piVersion(pi: string): string | null {
+  const install = join(dirname(dirname(realpathSync(pi))), "install");
+  if (!existsSync(join(install, "current-version"))) return packageVersion(pi);
+  const current = readFileSync(join(install, "current-version"), "utf8").trim();
+  const release = join(install, "releases", current, "node_modules/.bin/pi");
+  return /^[\w.+-]+$/.test(current) && existsSync(release) ? packageVersion(release) : null;
+}
 
 /** Every key path in v, with [] for array elements: {a: [{b: 1}]} gives a, a[].b. */
 function fieldsOf(v: unknown, at: string, out = new Set<string>()): Set<string> {
@@ -193,6 +203,9 @@ async function end(proc: Subprocess<"pipe", "pipe", "ignore">) {
 const CODEX_RECORDED = "0.162.1";
 const CODEX_META = "doctorCodex"; // the codex version rh doctor checked last
 
+/** An error codex answered once it had taken initialize: its own, as when it cannot reach its backend (#733). */
+class CodexAnswer extends Error {}
+
 /**
  * Asks a codex app-server, started as a slot's is (architecture §6.4), what rh doctor checks (§12),
  * none of it calling a model: its login; with none needed, its config, for the provider of yours; its
@@ -220,7 +233,7 @@ async function askCodex(cfg: Config) {
   };
   const result = async (method: string, params: object) => {
     const m = await ask(method, params);
-    if (m.error) throw new Error(`${method} 应答出错：${m.error.message}`);
+    if (m.error) throw method === "initialize" ? new Error(`${method} 应答出错：${m.error.message}`) : new CodexAnswer(`Codex 的 ${method} 应答出错：${m.error.message}`);
     return m.result;
   };
   const exchange = (async () => {
@@ -260,8 +273,9 @@ function codexLogin(account: Record<string, any> | null, config: Record<string, 
 /** rh doctor's Codex part (architecture §12): its version against the last check's; its login, or a
  *  provider of yours and whether the service has the variable its key comes from; whether it still
  *  takes untrusted; and its models, kept for naming a remembered one. Each error of your codex's
- *  begins Codex: upgrade.sh goes back on none of them, as going back fixes none; a failed handshake
- *  it does go back on, as the new version may have launched Codex wrong. */
+ *  begins Codex, an error codex answers after initialize among them: upgrade.sh goes back on none of
+ *  them, as going back fixes none; a failed handshake (initialize refused, no answer, codex gone) it
+ *  does go back on, as the new version may have launched Codex wrong. */
 async function checkCodex(cfg: Config, store: Store, codex: string, info: string[], error: (text: string) => void, warn: (text: string) => void) {
   const said = Bun.spawn([codex, "--version"], { env: headlessEnv("codex", agentBaseEnv(cfg)), stdout: "pipe", stderr: "ignore", timeout: 10_000 });
   const version = (await new Response(said.stdout).text()).trim().split(/\s+/).at(-1) || null; // codex-cli 0.162.1
@@ -288,7 +302,7 @@ async function checkCodex(cfg: Config, store: Store, codex: string, info: string
           "关掉这些槽位的审批，或者换回旧版 codex",
       );
   } catch (err) {
-    error(`和 codex 握手失败：${(err as Error).message}`);
+    error(err instanceof CodexAnswer ? err.message : `和 codex 握手失败：${(err as Error).message}`);
   }
 }
 
@@ -490,15 +504,14 @@ async function check(cfg: Config, store: Store): Promise<{ text: string; notify:
     if (Date.now() - newest > 2 * cfg.durations.backupEvery) warn(`数据库备份不新鲜：最近一份是 ${hours} 小时前`);
   }
 
-  // pi's version, read the way claude's is.
   const pi = locate(cfg.programs.pi, cfg.agentPath);
-  let piVersion: string | null = null;
+  let piSays: string | null = null;
   try {
-    piVersion = pi && packageVersion(pi);
+    piSays = pi && piVersion(pi);
   } catch {}
   if (!pi) warn(`找不到 pi：${cfg.programs.pi}`);
-  else if (!piVersion) warn(`读不到 pi 的版本号（${pi}）`);
-  else info.push(`pi ${piVersion}`);
+  else if (!piSays) warn(`读不到 pi 的版本号（${pi}）`);
+  else info.push(`pi ${piSays}`);
 
   // Codex, only when installed.
   const codex = locate(cfg.programs.codex, cfg.agentPath);

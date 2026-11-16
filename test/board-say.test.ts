@@ -192,7 +192,7 @@ test("story 279: the Rhodium commands the board does elsewhere only say where; n
     ["/rh_verbose on", "工具行的写法在拓扑图上改：点开那个窗口的详情。"],
     ["/rh_ls", "槽位都在首页和拓扑图上。"],
     ["/rh_help", "打 / 看命令面板。"],
-    ["/rh_release", "点横幅上的“收回终端”把它切回无头。"],
+    ["/rh_release", "点顶栏“⋯”里的“收回终端”把它切回无头。"],
   ];
   for (const [typed, said] of where) expect([typed, await say(typed)]).toEqual([typed, { ok: true, text: said }]);
   expect(await rhodium.ok("ls")).toBe(before);
@@ -307,12 +307,12 @@ test("story 575: after your message on the board, rh send me stays there while a
   const receipts = () => rhodium.claude.runs().flatMap((r) => r.rh.map((c) => c.out));
   await say(JSON.stringify([["send", "me", "on the board"]]));
   await until(() => receipts().length === 1, 15_000);
-  expect(receipts()).toEqual(["留在网页上，没发 IM。\n"]);
+  expect(receipts()).toEqual(["用户正在网页上看，没推送到 IM。这次发的内容网页上看得到；之后要说的话写在回复里就行。\n"]);
   // The page goes.
   ac.abort();
   await becomes("空闲");
   await say(JSON.stringify([["send", "me", "in IM"]]));
   await until(() => receipts().length === 2, 15_000);
-  expect(receipts()[1]).toBe("网页没开在前台，已发到假 IM 私聊。\n");
+  expect(receipts()[1]).toBe("已发到假 IM 私聊。\n");
   expect((await posts()).slice(1)).toEqual(["in IM"]);
 }, 30_000);

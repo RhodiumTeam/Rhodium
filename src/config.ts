@@ -32,6 +32,9 @@ export const durations = {
   stopGrace: "5s", // architecture §6.2, each step of eof -> TERM -> KILL
   releaseGrace: "10s", // architecture §10.1, /rh_release before SIGTERM
   herdrRestartWait: "5m", // architecture §10.2
+  tuiHeld: "10m", // product §4.2, how long what waits for a slot in the terminal waits before you hear of it; also what was typed there and is not known to have got there
+  memoryLook: "10s", // architecture §4.2, how often each running holder unit's memory pressure is read
+  tuiConfirm: "30s", // product §4.2, how long what was typed into a slot's terminal has to show in its transcript before it is not known to have got there
   menuRetry: "1m", // architecture §8.4, before a menu push that failed is tried again
   feishuEdit: "3s", // architecture §8.2, the least time between two edits of a turn's Feishu card
   // The longest each is kept; limits.stateMaxMB may see them go sooner (architecture §7.8).
@@ -62,7 +65,8 @@ const limits = {
 };
 
 // Global defaults for the per-slot settings that `rh set` overrides.
-const defaults = { approval: false, crashResume: true, autoContinue: true };
+// typeIn: your messages typed into a slot's terminal (architecture §10.5), their replies sent back (§10.6).
+const defaults = { approval: false, crashResume: true, autoContinue: true, typeIn: true };
 
 // The agents' executables and Herdr's CLI: an absolute path, or a bare name looked up on PATH.
 // Tests point them at the fake agent and the fake Herdr.
@@ -171,6 +175,12 @@ export function formatDuration(ms: number): string {
 export const formatGB = (bytes: number): string => `${(bytes / 2 ** 30).toFixed(1)}GB`;
 export const formatMB = (bytes: number): string => `${(bytes / 2 ** 20).toFixed(1)}MB`;
 
+/** Bytes as the notice and 详情 say them: G to one decimal, 4G not 4.0G; under 0.1G, whole M. */
+export const gb = (bytes: number): string => (bytes < 0.1 * 2 ** 30 ? `${Math.round(bytes / 2 ** 20)}M` : `${(bytes / 2 ** 30).toFixed(1).replace(/\.0$/, "")}G`);
+
+/** What a blocked unit uses and its limit, as rh ls and 详情 say it: 3.9G / 4G. */
+export const memoryText = (m: { current: number; high: number | null }): string => (m.high === null ? gb(m.current) : `${gb(m.current)} / ${gb(m.high)}`);
+
 function toMs(key: string, v: string): number {
   const ms = parseDuration(v);
   if (ms === null) throw new Error(`config: durations.${key} must look like "30s", "10m", "1h" or "7d"`);
@@ -209,7 +219,7 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
 
   const paths = overlay(
     "",
-    { stateDir: "", socketDir: "", lockDir: "", unitPrefix: "rh-", unit: "rhodium", agentPath: "", memoryHigh: "3G", holdBin: "", mainChat: "" },
+    { stateDir: "", socketDir: "", lockDir: "", unitPrefix: "rh-", unit: "rhodium", agentPath: "", memoryHigh: "4G", holdBin: "", mainChat: "" },
     top,
   );
   if (!paths.stateDir && !env.HOME) throw new Error("config: HOME is not set, so stateDir must be given");
@@ -229,8 +239,9 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
   if (b !== undefined && !isTable(b)) throw new Error("config: bots must be a table");
   for (const [name, bot] of Object.entries(b ?? {})) {
     if (!isTable(bot)) throw new Error(`config: bots.${name} must be a table`);
-    // rh send me and rh send web are to you, by the default and on the board (product §5.9).
-    if (name === "me" || name === "web") throw new Error(`config: bots.${name}: a bot may not be named me or web, which rh send takes for you; rename it`);
+    // rh send me is to you; rh send web was, and an agent still running may write it (product §5.9).
+    if (name === "me") throw new Error("config: bots.me: a bot may not be named me: rh send me is to you; rename it");
+    if (name === "web") throw new Error("config: bots.web: a bot may not be named web: an agent still running may write rh send web, which is gone; rename it");
     if (!platforms.includes((bot as BotConfig).platform)) {
       throw new Error(`config: bots.${name}.platform must be one of ${platforms.join(", ")}`);
     }

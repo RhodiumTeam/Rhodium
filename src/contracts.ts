@@ -399,7 +399,7 @@ export type Profile = { bot?: Uint8Array; you?: Uint8Array; name?: string };
 
 // herdr_wait: how long a slot in the terminal waits for Herdr to come back (architecture §10.2).
 // tool_running: a minute more of the tool call a turn's message shows running (key: the conversation).
-export type TimerKind = "ask_timeout" | "idle_reap" | "quota_reset" | "quota_notice" | "oneoff_archive" | "herdr_wait" | "tool_running";
+export type TimerKind = "ask_timeout" | "idle_reap" | "quota_reset" | "quota_notice" | "oneoff_archive" | "herdr_wait" | "tool_running" | "tui_held" | "tui_unconfirmed";
 
 /** What rhodium knows about an rh caller (docs/spec/v1.md "rh 怎么认出调用者"). rh reports its own
  *  pid; unit is the systemd unit rhodium finds that pid in, and ancestors that pid and the ones up its
@@ -420,7 +420,8 @@ export type BoardAct =
   | { kind: "answer"; ask: string; text: string }
   | { kind: "say"; slot: string; text: string; attachments?: { kind: "image" | "file"; name: string; path: string; mimeType?: string }[] }
   // The queue (spec web-write "待发队列"): input, the request id it was sent under; now with none lets the paused go on.
-  | { kind: "queued"; slot: string; op: "now" | "drop"; input?: string }
+  // resend: one typed into the slot's terminal and not known to have got there, by its own id (product §4.2).
+  | { kind: "queued"; slot: string; op: "now" | "drop" | "resend"; input?: string }
   | { kind: "verbose"; chat: string; on: boolean }
   | { kind: "pin"; slot: string; on: boolean };
 
@@ -442,6 +443,10 @@ export type ImportFound = { agent: AgentKind; session: string; dir: string; pane
  *  last active and what was said first. */
 export type Importable = { agent: AgentKind; session: string; dir: string; pane?: string; at?: number; said?: string };
 
+/** What a holder unit held up over its MemoryHigh uses and its limit, in bytes, high null for none
+ *  ("max"); top: its biggest programs by anonymous memory, by name, for the notice (architecture §4.2). */
+export type Blocked = { current: number; high: number | null; top: { name: string; bytes: number }[] };
+
 export type Input =
   | { kind: "im"; message: InboundMessage }
   // credentials: what rh bot's scan or paste gave, kept out of argv so that nothing which records
@@ -455,10 +460,12 @@ export type Input =
   | { kind: "recovery" }
   // The platform refused this outbound record, a passive reply to inbound in chat or an active message
   // (null): for its quota, or not (an active message only). payload: its message, as the record keeps it.
-  | { kind: "refused"; outbound: string; chat: string; inbound: string | null; payload: string; quota: boolean }
+  | { kind: "refused"; outbound: string; chat: string; inbound: string | null; payload: string; quota: boolean; trace?: string | null }
   // An outbound record failed for good, not to go another way (refused): payload, its message, as the
-  // record keeps it. What rh send's message marked its slot's turn with goes (architecture §8.7).
-  | { kind: "send_failed"; payload: string }
+  // record keeps it, the chat it was for, the inbound message it replied to and its trace. What rh
+  // send's message marked its slot's turn with goes (architecture §8.7); a final reply's picture gets a
+  // line saying so (§8.3).
+  | { kind: "send_failed"; payload: string; chat: string; inbound: string | null; trace: string | null }
   // An edit to show text did not take: the platform turned it down, or the message (this outbound
   // record, with its chat and trace) never went out. final: text is the turn's last. markdown: the
   // same in the platform's Markdown.
@@ -469,6 +476,9 @@ export type Input =
   // The bot (row id) failed to reach its platform limits.botFailures times in a row, error the last
   // failure; or it got through, for the first time since it failed (architecture §8.6).
   | { kind: "connection"; bot: string; up: boolean; error?: string }
+  // The slot's holder unit is held up over its MemoryHigh, with what it uses, its limit and its biggest
+  // programs; or no longer (null) (architecture §4.2).
+  | { kind: "memory"; slot: string; blocked: Blocked | null }
   // The Herdr bridge opened the slot's pane for its switch to the terminal, or could not, and why.
   // session: the one it opened there, a new one's id, or null for a new Codex thread, whose id comes
   // at its first turn (architecture §10.3).
@@ -485,6 +495,23 @@ export type Input =
   | { kind: "tui_back"; slot: string; back: { session: string | null; elsewhere?: true; restarted?: true; used?: Used; before?: Used } | { error: string; running?: true } }
   // The Herdr bridge lost Herdr's socket, or has it again (architecture §10.2). resumed: the slots
   // whose agent Herdr resumed itself meanwhile, with that agent's pid and start time.
+  // Whether the slot's input box held just what was typed for the input, read for the notice that it
+  // is not known to have got there (architecture §10.5).
+  | { kind: "tui_peeked"; input: string; inBox: boolean }
+  // A turn in the slot's terminal, as the Herdr bridge read it off the transcript (architecture §10.6),
+  // which has already moved the slot's turn fields on. joined: your message from chat (inbound) went
+  // into the turn another chat (into) began, whose reply goes there. end: the turn of conversation conv
+  // is over: its chat, inbound and send me mark as they were, and progress its conversation's then;
+  // reply, its final reply; cut, cut short (an interrupt, a switch, the session or the agent changed),
+  // no final reply then. step: what the turn of conversation conv did on the transcript's line ending
+  // at byte at, for its message as it goes (architecture §10.6 第 3 条). dialog: a dialog opened in the
+  // terminal while chat waits for the turn's reply. lift: yours came into a turn rh send me took over,
+  // and lifts its hold (router's lift()).
+  | { kind: "tui_turn"; slot: string; lift: true }
+  | { kind: "tui_turn"; slot: string; joined: { chat: string; inbound: string; into: string } }
+  | { kind: "tui_turn"; slot: string; step: { conv: string; at: number; event: { type: "item"; item: Extract<AgentEvent, { type: "item" }>["item"] } | { type: "tool_start"; id: string; name: string; input: unknown } } }
+  | { kind: "tui_turn"; slot: string; dialog: { chat: string; inbound: string | null } }
+  | { kind: "tui_turn"; slot: string; end: { conv: string; chat: string | null; inbound: string | null; sentMe: 0 | 1 | null; progress: string | null; reply?: string; cut?: true } }
   | { kind: "herdr"; up: false }
   | { kind: "herdr"; up: true; resumed: Record<string, { pid: number; start: number }> }
   // What rh import (call id, or /rh_import in chat) looked up, with no one else using it; or why not;

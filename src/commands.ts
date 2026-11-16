@@ -26,6 +26,8 @@ export type CommandDef = {
    *  always: an agent's call does on any slot, and so does your /rh_ in chat (rh release, architecture §10.1).
    *  some: an agent's call does in the cases its summary names, which the router knows (product §5.11). */
   confirm?: true | "always" | "some";
+  /** What a child slot's agent reads in place of usage and summary (architecture §6.1). */
+  child?: { usage: string; summary: string };
 };
 
 /** Per-slot settings for `rh set`: key on the command line -> what it is. */
@@ -36,6 +38,7 @@ export const SETTINGS = {
   "ask-timeout": { label: "提问超时", kind: "duration" },
   "crash-resume": { label: "崩溃续跑", kind: "flag" },
   "auto-continue": { label: "额度续跑", kind: "flag" },
+  "type-in": { label: "你的消息打进终端", kind: "flag" },
 } as const;
 export type SettingKey = keyof typeof SETTINGS;
 
@@ -126,7 +129,7 @@ export const COMMANDS: CommandDef[] = [
     usage: "<工作区/槽位> [!]",
     summary:
       "切到 TUI 模式：停掉无头进程，在 Herdr 里这个工作区的 workspace 开一个 tab，接着同一段对话。默认等当前回合结束再切；加 ! 先打断当前回合。" +
-      "TUI 模式期间，从 IM 发给它的消息不交给它",
+      "TUI 模式期间，从 IM、网页发给它的消息，type-in 开着时打进终端，关着时不交给它",
     who: "both",
     confirm: true,
   },
@@ -152,16 +155,22 @@ export const COMMANDS: CommandDef[] = [
   },
   {
     name: "send",
-    usage: "me|web|<平台>|<Bot 名> [--file <路径>]... [<文字>] | <工作区/槽位> <文字>",
+    usage: "me|<平台>|<Bot 名> [--file <路径>]... [<文字>] | <工作区/槽位> <文字>",
     summary:
-      "给用户发消息。rh send me 按默认规则发：用户最后在哪给你说话就发到哪，网页也算。在 IM 里是现在指着你的聊天窗口，有几个时取用户最近用的那个；没有窗口指着你时，子槽位用指着根槽位的窗口，再没有就发主窗口。落在网页上而没有网页开在前台时，改发 IM。" +
-      "也可以指定去处：qq、telegram、feishu 发到用户在那个平台上的私聊，web 留在网页上，写配置里的 Bot 名就从那个 Bot 发；指定的地方发不出去，改按默认规则发。回执写明发到了哪、有没有改发，照回执告诉用户。Rhodium 不记去处，用户要你定期往某处推，每次都带上。" +
-      "只用来发文件、图片，以及内部回合（汇报、rh send 等没有人在等回复的回合）里要告诉用户的话；用户从 IM 开始的回合，或者用户从 IM 发的消息并进来的回合，进度直接写在回复里，不要往同一个窗口用 rh send me 发文字。" +
-      "你有父槽位、用户又没在直接和你说话（没有窗口用 /rh_use 指着你，这一回合也不是用户从 IM 或网页发起或插过话的）时，rh send me 会被拒：把结果和文件路径写进最终回复，它会随汇报交给父槽位，不用再 rh send 给父槽位。用户要你往某处推时，带上去处就能发。" +
+      "给用户发消息。rh send me 是往用户的 IM 推一条通知：推到现在指着你的聊天窗口，有几个时取用户最近用的那个，都没有就推到主窗口。用户最后是在网页上给你说话、网页又开在前台时不推，回执会写明；这一次发的内容网页上看得到，之后要说的话写在回复里就行。" +
+      "也可以指定去处：qq、telegram、feishu 发到用户在那个平台上的私聊，写配置里的 Bot 名就从那个 Bot 发；指定的地方发不出去，改照 rh send me 的规则发。回执写明推到了哪、有没有改发、有没有推，照回执告诉用户。Rhodium 不记去处，也不替你定时：用户要你定期汇报时，你自己定时，到点用 rh send 发，每次都带上去处。" +
+      "只用来发文件，以及内部回合（汇报、rh send 等没有人在等回复的回合）里要告诉用户的话；用户从 IM 开始的回合，或者用户从 IM 发的消息并进来的回合，进度直接写在回复里，不要往同一个窗口用 rh send me 发文字。" +
       "文字原样发出，以 - 开头也行；那个窗口的目标不是你时，开头加一行〔工作区/槽位〕标明是你发的。--file 要紧跟在 me 或去处后面，可以给几个：" +
       ".png .jpg .jpeg .gif .webp 按图片发，其他按文件发，每个一条消息，跟在文字后面；超过平台的大小上限就报错，什么都不发。" +
       "在一个回合里用它发到了这个回合的窗口，Rhodium 就不再代发这个回合的最终回复；之后用户又发来消息、并进这个回合，或者在 IM 里回答了你的提问的，照常代发。" +
-      "给槽位发：它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
+      "给槽位发：要写全名“工作区/槽位”。它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
+    child: {
+      usage: "me --file <路径>... | <工作区/槽位> <文字>",
+      summary:
+        "给用户发文件，或者给别的槽位发消息。你是子槽位，不能给用户发文字：要说的话写在最终回复里。" +
+        "用户直接找你要文件时，用 rh send me --file <路径> 发，不带文字，可以给几个：.png .jpg .jpeg .gif .webp 按图片发，其他按文件发，每个一条消息；超过平台的大小上限就报错，什么都不发。用户没有直接找你时发不出去，把文件的路径写在最终回复里。" +
+        "给槽位发：要写全名“工作区/槽位”，父槽位也行。它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
+    },
     who: "both",
   },
   {
@@ -473,11 +482,13 @@ function oneoff(ms?: number): string {
   const said = (t: number) => (t % 3_600_000 ? span(t) : `${t / 3_600_000} 小时`);
   return ms === undefined ? `最后一个回合结束一段时间后自动归档（默认 ${said(parseDuration(durations.oneoffArchive)!)}）` : `最后一个回合结束 ${said(ms)}后自动归档`;
 }
+/** The command as the caller reads it: a child slot's agent, its own usage and summary where it has them. */
+const forChild = (c: CommandDef, child?: boolean): CommandDef => (child && c.child ? { ...c, ...c.child } : c);
 const summary = (c: CommandDef, archive?: number) => (typeof c.summary === "string" ? c.summary : c.summary(oneoff(archive)));
 
-/** rh --help, printed with no rhodium to ask. */
-export function helpText(): string {
-  const lines = COMMANDS.map((c) => `  rh ${c.name} ${c.usage}\n      ${summary(c)}。（${WHO_FOR_USER[c.who]}）`);
+/** rh --help, printed with no rhodium to ask. child: for a child slot's agent (RHODIUM_CHILD). */
+export function helpText(child?: boolean): string {
+  const lines = COMMANDS.map((c) => forChild(c, child)).map((c) => `  rh ${c.name} ${c.usage}\n      ${summary(c)}。（${WHO_FOR_USER[c.who]}）`);
   return [
     "用法：rh <命令> [参数]",
     "",
@@ -490,10 +501,11 @@ export function helpText(): string {
   ].join("\n");
 }
 
-/** What agents read of rh: rh --skill, and in the system prompt with oneoffArchive from the config. */
-export function skillText(oneoffArchive?: number): string {
+/** What agents read of rh: rh --skill, and in the system prompt with oneoffArchive from the config.
+ *  child: for a child slot's agent (RHODIUM_CHILD). */
+export function skillText(oneoffArchive?: number, child?: boolean): string {
   const asked =
-    "rh 立刻返回“已请用户确认”，不用等；用户的决定之后作为一条消息发给你，超时没确认就不执行。用户同意时只看到“已回答：同意”，执行结果写在那条消息里，由你用 rh send me 告诉用户（你有父槽位时，见 rh send me 的说明）；用户在网页上同意的，写在你的回复里";
+    "rh 立刻返回“已请用户确认”，不用等；用户的决定之后作为一条消息发给你，超时没确认就不执行。用户同意时只看到“已回答：同意”，执行结果写在那条消息里，由你用 rh send me 告诉用户（你是子槽位时，写在最终回复里）；用户在网页上同意的，写在你的回复里";
   const confirm = (c: CommandDef) =>
     c.confirm === "always"
       ? `。${asked}`
@@ -502,7 +514,7 @@ export function skillText(oneoffArchive?: number): string {
         : c.confirm
         ? `。对你自己的槽位和你的后代（你派生的子槽位，以及它们派生的）直接执行；对别的槽位要用户确认：${asked}`
         : "";
-  const lines = COMMANDS.map((c) => `- \`rh ${c.name} ${c.usage}\`：${summary(c, oneoffArchive)}。${WHO_FOR_AGENT[c.who]}${confirm(c)}。`);
+  const lines = COMMANDS.map((c) => forChild(c, child)).map((c) => `- \`rh ${c.name} ${c.usage}\`：${summary(c, oneoffArchive)}。${WHO_FOR_AGENT[c.who]}${confirm(c)}。`);
   return [
     "# rh：Rhodium 的命令行",
     "",

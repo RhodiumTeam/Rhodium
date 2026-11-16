@@ -1,7 +1,7 @@
 // A command that starts the agent of a slot not running (product §5.6) is no turn's end (#489): the
 // board's 完成 and a one-off slot's archive clock go by the last turn's end; the reap clock by the start.
-import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -9,6 +9,7 @@ import { route, type Ctx, type Decision, type State } from "../src/router";
 import type { Slot } from "../src/store";
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-command-start-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const config = loadConfig(join(dir, "config.toml"));
 const HOUR = 3_600_000;

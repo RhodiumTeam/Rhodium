@@ -106,6 +106,7 @@ export class PiDriver implements AgentDriver {
   private tools = new Map<string, { id: string; name: string; input: unknown }>();
   private asks = new Map<string, AgentAsk>();
   private reply: string | undefined; // the run's last assistant message so far
+  private failed: string | undefined; // why the turn's last model call failed, if it did
   private run: Required<TokenUsage> | null = null; // the run's usage so far
   // The level /effort set on this process: a model switch resets pi's to your settings' default.
   private effort: string | null = null;
@@ -238,6 +239,7 @@ export class PiDriver implements AgentDriver {
         this.startedBy = undefined;
         if (this.state !== "idle") return;
         this.reply = undefined;
+        this.failed = undefined;
         this.run = null;
         this.emit({ type: "turn_start", ...(input !== undefined && { input }) });
         return this.setState("running");
@@ -260,7 +262,7 @@ export class PiDriver implements AgentDriver {
         return this.emit({ type: "item", item: { kind: "tool", ...tool } });
       }
       case "agent_settled":
-        return this.settled();
+        return this.settled(m.aborted === true);
       case "extension_error":
         // Say, the approval extension threw: the tool call may have gone ahead unasked.
         return this.emit({ type: "protocol_error", reason: "unexpected", detail: `pi extension ${m.extensionPath}: ${m.error}` });
@@ -507,6 +509,9 @@ export class PiDriver implements AgentDriver {
 
   private message(msg: Json) {
     if (msg.role !== "assistant") return; // the system prompt, your messages, tool results
+    // The model call failed, as one refused for the provider's quota once pi's own retries gave up:
+    // the turn's last one failing is told at its end (settled). A later call that got through clears it.
+    this.failed = msg.stopReason === "error" ? String(msg.errorMessage ?? "the model call failed") : undefined;
     if (msg.usage) {
       const input = inputTokens(msg.usage);
       const run = (this.run ??= { inputTokens: 0, outputTokens: 0, contextTokens: 0 });
@@ -524,7 +529,7 @@ export class PiDriver implements AgentDriver {
   }
 
   /** The turn ends only here (architecture §6.1). */
-  private settled() {
+  private settled(aborted: boolean) {
     // pi withdraws nothing when a run is aborted (architecture §6.3): what it still asks is void.
     for (const requestId of this.asks.keys()) this.emit({ type: "ask_cancel", requestId });
     this.asks.clear();
@@ -534,6 +539,11 @@ export class PiDriver implements AgentDriver {
       this.emit({ type: "usage", ...this.run });
       this.run = null;
     }
+    // pi reports no quota to wait for (architecture §7.6): out of it, the turn failed as any other, and
+    // you hear why, or it would end with no word at all (product §4.6). Not so for a run you stopped:
+    // pi says which it was (architecture §6.3), and its error may be one left from before the stop.
+    if (this.failed !== undefined && !aborted) this.emit({ type: "protocol_error", reason: "unexpected", detail: `pi: ${this.failed}` });
+    this.failed = undefined;
     this.setState("idle");
     this.emit({ type: "turn_end", ...(this.reply !== undefined && { reply: this.reply }) });
     this.reply = undefined;

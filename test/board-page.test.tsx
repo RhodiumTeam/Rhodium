@@ -16,7 +16,8 @@ import { RhodiumView } from "../web/src/rhodium";
 import { ahead, behind, ChatView, fullEsc, inTerminal, KEPT_BLOCKS, keepCollapsed, keepTerminalFont, sideCollapsed, sideWidth, SlotPage, terminalFont, visit, visits, type EscKey } from "../web/src/slot";
 import { Details, EventRow, look } from "../web/src/details";
 import { afterClose, retryIn } from "../web/src/terminal";
-import { folded, kindOf } from "../web/src/tools";
+import { folded, kindOf, MARKDOWN, SaidOf } from "../web/src/tools";
+import { Streamdown } from "streamdown";
 import { shortText } from "../src/tool-line";
 import { sendOf } from "../src/transcript";
 import { toast } from "../web/src/toast";
@@ -700,6 +701,29 @@ test("story 97: a child slot is right under its parent, indented, by its own nam
     workspaces: [ws("d", { done: [card({ name: "main", turnEndedAt: ago(1) }, "d"), card({ name: "k1", parent: "d/main" }, "d")] }), ws("e", { idle: [card({ name: "k2", parent: "d/main" }, "e")] })],
   };
   expect(flat(<BoardView data={shared} />)).toBe("d/main1分钟前结束k1e/k2");
+});
+
+test("#664: a slot in the terminal whose agent rests is not said to run, and still says TUI 模式 under its name, in place of the last thing said", () => {
+  const data = boardWith({ done: [card({ name: "term", state: "TUI 模式（pane w1:p2）", turnEndedAt: ago(18), activeAt: ago(18), last: { role: "assistant", text: "改好了", at: ago(18) } })] });
+  expect(flat(<BoardView data={data} />)).toBe("w/term18分钟前结束TUI模式（panew1:p2）");
+});
+
+test("story 607: a slot whose terminal has a dialog open says 被弹框挡住 under its name in place of the last thing said, resting or running", () => {
+  const last = { role: "assistant" as const, text: "改好了", at: ago(18) };
+  const data = boardWith({ running: [card({ name: "perm", state: "被弹框挡住", activeAt: ago(1), last })], done: [card({ name: "stat", state: "被弹框挡住", turnEndedAt: ago(18), activeAt: ago(18), last })] });
+  expect(flat(<BoardView data={data} />)).toBe("wperm运行中被弹框挡住stat18分钟前结束被弹框挡住");
+});
+
+test("#692: a slot whose holder unit is held up over its memory limit says 内存阻塞 under its name in place of the last thing said, resting or running", () => {
+  const last = { role: "assistant" as const, text: "改好了", at: ago(18) };
+  const data = boardWith({ running: [card({ name: "big", state: "内存阻塞", activeAt: ago(1), last })], done: [card({ name: "bg", state: "内存阻塞", turnEndedAt: ago(18), activeAt: ago(18), last })] });
+  expect(flat(<BoardView data={data} />)).toBe("wbig运行中内存阻塞bg18分钟前结束内存阻塞");
+});
+
+test("#692: 详情 of a slot held up over its memory limit has a line with what its unit uses and its limit; one not held up has none", () => {
+  const process = { unit: "rh-hold-C1", activeState: "active", subState: "running", pid: 42, exitStatus: 0, stderr: [] };
+  expect(flat(<Details d={slot({ process, memory: "3.9G / 4G" })} />)).toContain("内存3.9G/4G");
+  expect(flat(<Details d={slot({ process })} />)).not.toContain("内存");
 });
 
 test("#209: each slot says its state in a word, and under it the last thing said, yours after 你：; one running but not in a turn says why there", () => {
@@ -1955,7 +1979,9 @@ test("stories 289, 290, 291: each ask waiting on you is a card in place of the b
   expect(new Set(icons).size).toBe(4);
   for (const label of ["staging", "production", "允许", "拒绝", "批准", "不批准", "切到 TUI", "取消"]) expect(html).toMatch(new RegExp(`<button[^>]*>(<[^>]+>)*${label}`));
   // A command, on the board's thin bar.
-  expect(html.match(/<pre class="([^"]*)"[^>]*>git push<\/pre>/)![1]!.split(" ")).toContain("card-scroll");
+  // Its ground on a box round it, so its ends fade where it is cut and the ground does not (#656).
+  const [ground, excerpt] = html.match(/<div class="([^"]*)"><pre class="([^"]*)"[^>]*>git push<\/pre>/)!.slice(1).map((c) => c!.split(" "));
+  expect([ground!.includes("bg-muted"), excerpt!.includes("bg-muted"), excerpt!.includes("card-scroll"), excerpt!.includes("edge-fade-y")]).toEqual([true, false, true, true]);
   // The plan as Markdown.
   expect(html).toMatch(/<h2[^>]*>步骤<\/h2>/);
   expect(html).toMatch(/<span [^>]*data-streamdown="strong"[^>]*>先<\/span>/);
@@ -2627,4 +2653,139 @@ test("#286: the theme chosen is kept on this device and set on the page, 跟随�
 
 test("#286: the header's dot is green while the stream is open and the round trip is quick, amber over 300ms, grey while connecting or reconnecting", () => {
   expect([dotOf(true, null), dotOf(true, 38), dotOf(true, 300), dotOf(true, 301), dotOf(false, 38), dotOf(null, null)]).toEqual(["bg-done", "bg-done", "bg-done", "bg-needs", "bg-idle", "bg-idle"]);
+});
+
+test("stories 600, 601, 603: what the agent said draws a local picture by the board's check, never as an <img> of its path: a preview, a box with its words, path and why, or, not checked yet, its words; a local link the board says gives a file downloads it, any other is its words and path; a link elsewhere but http is its words, a picture elsewhere the browser's", () => {
+  const said = "![图](/tmp/截图.png) ![旧图](/tmp/none.png) ![新](/tmp/new.png) [笔记](notes.md) [入口](src/auth.ts) [`auth.ts`](src/auth.ts) [a.ts:12](a.ts:12) [邮件](mailto:a@b.c) [站](https://a.example/x) ![d](data:image/png;base64,AAAA) [half](src/";
+  const local = { images: { "/tmp/截图.png": { kind: "image" as const, hash: "ab".repeat(32), name: "截图.png", w: 600, h: 400 }, "/tmp/none.png": { why: "找不到文件" }, "/tmp/new.png": { pending: true as const } }, links: { "notes.md": "file" as const, "src/auth.ts": "none" as const, "a.ts:12": "code" as const } };
+  const html = renderToStaticMarkup(
+    <SaidOf value={{ local, conversation: "C 1" }}>
+      <Streamdown {...MARKDOWN}>{said}</Streamdown>
+    </SaidOf>,
+  );
+  expect(html.match(/<img[^>]*src="([^"]*)"/g)).toEqual([`<img src="api/media?h=${"ab".repeat(32)}&amp;v=preview"`, expect.stringContaining('src="data:image/png;base64,AAAA"')]);
+  expect(html).toMatch(/旧图<\/span><\/span><span[^>]*>\/tmp\/none\.png<\/span><span[^>]*>找不到文件</);
+  expect(html.match(/<a [^>]*href="([^"]*)"/g)!.map((a) => a.match(/href="([^"]*)"/)![1])).toEqual(["api/file?conversation=C%201&amp;path=notes.md", "https://a.example/x"]);
+  expect(html).toContain('download="notes.md"');
+  for (const words of ["入口（src/auth.ts）", " src/auth.ts ", " a.ts:12 ", " 邮件 "]) expect(html).toContain(words);
+  expect(html).not.toContain("streamdown:");
+  // What it still writes has no check yet: a local picture is its words, a local link its words and path.
+  const draft = renderToStaticMarkup(<Streamdown {...MARKDOWN}>{said}</Streamdown>);
+  expect(draft.match(/<img/g)).toHaveLength(1);
+  expect(draft).toContain("笔记（notes.md）");
+  // Its words wrap, cut nowhere: in a thought or a plan there is never a check, and nowhere else to read them.
+  expect(draft).not.toContain("truncate");
+});
+
+test("#677: a task list item has the board's own box in place of its dot and the browser's checkbox, not a key; an item's second paragraph is on its own line; a picture in a line adds no room above it and sits on the middle of the words; the box scrolls with its item in any scroll box", () => {
+  const html = renderToStaticMarkup(<Streamdown {...MARKDOWN}>{"- [ ] 没做的\n- [x] 做完的\n\n- 第一段\n\n  第二段\n\n字 ![b](https://a.example/b.png) 字"}</Streamdown>);
+  expect(html).not.toContain("<input");
+  expect(html.match(/role="checkbox"[^>]*/g)!.map((b) => b.match(/aria-checked="(\w+)"/)![1])).toEqual(["false", "true"]);
+  const root = MARKDOWN.className!.split(" ");
+  expect(root).toEqual(expect.arrayContaining(["[&_.task-list-item]:list-none", "[&_.task-list-item]:relative", "[&_li>p+p]:block", "[&_[data-streamdown=image-wrapper]]:my-0", "[&_[data-streamdown=image-wrapper]]:align-middle"]));
+});
+
+test("#669: a local picture inside a link is drawn as the picture alone, no link round it, whatever the link is to; a link to a # target, a footnote's too, is its words alone", () => {
+  const image = { kind: "image" as const, hash: "cd".repeat(32), name: "a.png", w: 600, h: 400 };
+  const draw = (said: string, links: Record<string, "file" | "none">) =>
+    renderToStaticMarkup(
+      <SaidOf value={{ local: { images: { "/tmp/a.png": image }, links }, conversation: "C1" }}>
+        <Streamdown {...MARKDOWN}>{said}</Streamdown>
+      </SaidOf>,
+    );
+  for (const [to, links] of [["/tmp/a.png", { "/tmp/a.png": "none" }], ["/tmp/a.png", { "/tmp/a.png": "file" }], ["https://a.example/x", {}]] as const) {
+    const html = draw(`[![首页](/tmp/a.png)](${to})`, links);
+    expect(html).toContain(`<img src="api/media?h=${"cd".repeat(32)}&amp;v=preview"`);
+    expect(html).not.toMatch(/<a |\/tmp\/a\.png/);
+  }
+  // A picture elsewhere in a link is as ever, a badge say.
+  expect(draw("[![b](https://a.example/b.png)](https://a.example/x)", {})).toMatch(/<a [^>]*href="https:\/\/a\.example\/x"/);
+  // One in a link to a local path keeps the picture, the link gone: never the path in its place.
+  const badge = draw("[![徽章](https://a.example/b.png)](LICENSE)", {});
+  expect(badge).toContain('src="https://a.example/b.png"');
+  expect(badge).not.toMatch(/<a |LICENSE/);
+  const html = draw("脚注[^1]，[见上文](#安装)。\n\n[^1]: 注。", {});
+  expect(html).toContain("见上文。");
+  expect(html).not.toMatch(/<a |（#/);
+});
+
+test("stories 600, 602: a thing said whose local picture waits for its check is read again as the board says the check is in, and once by itself 61 s after it came, counted from then; still waiting, it is not asked for again", async () => {
+  const block = (image: object): Block => ({ kind: "assistant", at: "10.0", time: 0, text: "![a](/tmp/a.png)", local: { images: { "/tmp/a.png": image as never }, links: {} } });
+  let answer = block({ pending: true });
+  const asked: string[] = [];
+  const log = new Messages("S1", async (url) => (asked.push(url), { conversation: "C1", blocks: [answer], start: 0, end: 20 }));
+  await log.newer();
+  let changed = 0;
+  // The chat drawn again, left and come back to say, is the one told: the one before it is gone.
+  log.settle(() => (changed += 10));
+  log.settle(() => changed++);
+  jest.advanceTimersByTime(60_000);
+  expect(asked).toHaveLength(1);
+  jest.advanceTimersByTime(1_000);
+  await Promise.resolve().then(() => Promise.resolve());
+  expect(asked.slice(1)).toEqual(["api/messages?slot=S1&after=10"]);
+  expect([changed, log.waiting().length]).toEqual([1, 1]);
+  log.settle(() => changed++);
+  jest.advanceTimersByTime(600_000);
+  expect(asked).toHaveLength(2);
+  // The board says the check is in.
+  answer = block({ kind: "image", hash: "ab".repeat(32) });
+  await log.reread();
+  expect([log.waiting().length, log.blocks]).toEqual([0, [answer]]);
+  // Another conversation's block at the same place is timed anew, and so is one an older page brings.
+  const pages: Record<string, object> = { "api/messages?slot=S2": { conversation: "C1", blocks: [block({ pending: true })], start: 10, end: 20 } };
+  const next = new Messages("S2", async (url) => (asked.push(url), (pages[url] ?? { conversation: "C2", blocks: [{ ...block({ pending: true }), at: url.includes("before") ? "5.0" : "10.0" }], start: url.includes("before") ? 0 : 10, end: 20 }) as never));
+  await next.newer();
+  next.settle(() => {});
+  delete pages["api/messages?slot=S2"];
+  await next.newer();
+  next.settle(() => {});
+  await next.older();
+  asked.length = 0;
+  jest.advanceTimersByTime(61_000);
+  await Promise.resolve().then(() => Promise.resolve());
+  expect(asked.sort()).toEqual(["api/messages?slot=S2&after=10", "api/messages?slot=S2&after=10", "api/messages?slot=S2&after=5"]);
+});
+
+test("#669: a picture's reread that comes back from another conversation, the slot's new one say, changes nothing: its blocks may sit at the same place", async () => {
+  const block = (image: object): Block => ({ kind: "assistant", at: "10.0", time: 0, text: "![a](/tmp/a.png)", local: { images: { "/tmp/a.png": image as never }, links: {} } });
+  const waiting = block({ pending: true });
+  let page: MessagesData = { conversation: "C1", blocks: [waiting], start: 0, end: 20 };
+  const log = new Messages("S1", async () => page);
+  await log.newer();
+  page = { conversation: "C2", blocks: [block({ kind: "image", hash: "ab".repeat(32) })], start: 0, end: 20 };
+  await log.reread();
+  expect(log.blocks).toEqual([waiting]);
+});
+
+test("#669: a numbered list leaves its numbers the room their digits take, so a long list's are not cut off at its left", () => {
+  const pad = (said: string) => Number(/<ol[^>]*padding-left:([\d.]+)ch/.exec(renderToStaticMarkup(<Streamdown {...MARKDOWN}>{said}</Streamdown>))?.[1]);
+  const items = (n: number, from = 1) => Array.from({ length: n }, (_, i) => `${from + i}. 步骤`).join("\n");
+  expect(pad(items(12))).toBeGreaterThan(pad(items(2)));
+  // By the last number, not the count: one that starts at a year.
+  expect(pad(items(2, 2024))).toBeGreaterThan(pad(items(12)));
+});
+
+test("story 605: a slot in the terminal has what waits for the switch back over the terminal, each by its first line, who sent it and why it waits, a click away from its whole text, with only 删除; the chat side has it where you would type", () => {
+  const queue: SlotData["queue"] = [{ id: "I1", text: "w/c 完成了", files: 0, reason: "tui", from: "Rhodium：子槽位汇报" }];
+  const html = render(<ChatView d={slot({ mode: "tui", pane: "w4Q:p2", queue })} log={chat()} live />);
+  const at = html.indexOf('aria-label="待发队列"');
+  expect(at).toBeGreaterThan(-1);
+  expect(at).toBeLessThan(html.indexOf('aria-label="终端"'));
+  const box = html.slice(at, html.indexOf('aria-label="终端"'));
+  expect(box.replace(/<[^>]+>/g, "|")).toMatch(/w\/c 完成了\|+Rhodium：子槽位汇报\|+切回无头才交给它/);
+  expect(box).toMatch(/<button aria-expanded="false"/);
+  expect([box.includes('aria-label="删除"'), box.includes('aria-label="插话"'), box.includes('aria-label="编辑"')]).toEqual([true, false, false]);
+  // Herdr restarting, the chat shows, the queue under it.
+  const lost = render(<ChatView d={slot({ mode: "tui", pane: "w4Q:p2", herdrLost: true, queue })} log={chat()} live />);
+  expect(lost.indexOf('aria-label="对话"')).toBeLessThan(lost.indexOf('aria-label="待发队列"'));
+  expect(lost.match(/aria-label="待发队列"/g)).toHaveLength(1);
+});
+
+test("story 623: your own message waiting to be typed into the terminal shows 你, then the chat it came from, then what it waits for, each its own element", () => {
+  const queue: SlotData["queue"] = [{ id: "I1", text: "看下测试为什么挂了", files: 0, reason: "tui", from: "你", via: "QQ 私聊", wait: "等输入框空出来" }];
+  const html = render(<ChatView d={slot({ mode: "tui", pane: "w4Q:p2", queue })} log={chat()} live />);
+  const box = html.slice(html.indexOf('aria-label="待发队列"'), html.indexOf('aria-label="终端"'));
+  expect(box).toMatch(/>你<\/span><span[^>]*>QQ 私聊<\/span><span[^>]*>等输入框空出来<\/span>/);
+  expect(box).toContain(">看下测试为什么挂了<");
 });

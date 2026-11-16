@@ -203,6 +203,11 @@ const replyWith = (line: string, splitAt?: number): Step[] => [
 ];
 const halfHan = Buffer.from(split).indexOf(Buffer.from("汉")) + 1;
 
+/** Claude's word that a request was refused for quota until resetsAt, in epoch seconds; with
+ *  another `status`, as "allowed_warning", its word of a limit not reached yet. */
+export const rejected = (resetsAt: number, status = "rejected") =>
+  j({ type: "rate_limit_event", rate_limit_info: { status, resetsAt, rateLimitType: "five_hour", isUsingOverage: false }, ...ids });
+
 /** Every turn ends with Claude's rate limit refusal, or with `once` only the first, the turns after
  *  it going through; `resetsAt` is in epoch seconds. With `wake`, ms after the refusal Claude starts
  *  a turn by itself, as when a background task ends, and replies "woke". A refused turn takes the
@@ -213,7 +218,7 @@ export const rateLimited = (resetsAt: number, once = false, wake?: number, first
     ...first,
     {
       emit: [
-        j({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt, rateLimitType: "five_hour", isUsingOverage: false }, ...ids }),
+        rejected(resetsAt),
       ],
     },
     ...endTurn("You've hit your limit", { error: "rate_limit" }),
@@ -543,6 +548,11 @@ export const builtins: Record<string, Script> = {
    *  an ephemeral thread. */
   "codex-no-untrusted": {
     on: [{ match: { method: "thread/start", params: { approvalPolicy: "untrusted" } }, emit: [cxError("Invalid request: unknown variant `untrusted`, expected one of `never`, `on-request`, `on-failure`")] }, ...(codexOn ?? [])],
+    steps: [...codexStart, ...codexEnd("fake reply"), { goto: 0 }],
+  },
+  /** A Codex that cannot reach its own backend, as on 2026-11-16 (#733): account/read answers an error. */
+  "codex-backend-down": {
+    on: [{ match: { method: "account/read" }, emit: [cxError("workspace routing discovery timed out")] }, ...(codexOn ?? [])],
     steps: [...codexStart, ...codexEnd("fake reply"), { goto: 0 }],
   },
   /** Codex with the thread open in another process: its writer lock refuses the resume. */

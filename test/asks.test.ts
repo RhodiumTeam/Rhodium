@@ -255,7 +255,7 @@ test("story 80: unanswered, a question gets 'answer by your best judgement', an 
   expect(question).toEqual(["q-1", "allow", { ...TEA, answers: { "Tea or coffee?": BEST_JUDGEMENT } }]);
   expect(approval).toEqual(["p-1", "deny", BEST_JUDGEMENT]);
   expect(plan!.slice(0, 2)).toEqual(["plan-1", "deny"]);
-  expect(plan![2]).toContain("用 rh send me 把计划摘要发给用户（你有父槽位时，见 rh send me 的说明），然后停下来，等用户回复");
+  expect(plan![2]).toContain("用 rh send me 把计划摘要发给用户（你是子槽位时，写在最终回复里），然后停下来，等用户回复");
   // The three asks went out, then the turn's reply; nothing was said about the timeouts.
   expect((await posts(4)).map((p) => p.text.split("\n")[0])).toEqual(["Tea or coffee?", "要运行这条命令，允许吗？", "写好了计划，批准后才动手：", "answered"]);
 }, 30_000);

@@ -463,6 +463,21 @@ describe("messagePage", () => {
     ]);
   });
 
+  test("story 612: a long message Rhodium typed into the terminal, which Claude wrapped whole in its paste tag, is the sender's by the source line inside, as a user line or taken in mid-turn; a paste of yours that only holds such a line further down stays yours", async () => {
+    const long = "[来自 槽位 w/fix，经 rh send]\n第二行\n第三行\n第四行";
+    const wrapped = `\n\n<pasted_content id="2dd9">\n${long}\n</pasted_content id="2dd9">\n`;
+    const file = transcript("typed-paste.jsonl", [
+      { type: "user", timestamp: T(1), message: { role: "user", content: wrapped } },
+      { type: "attachment", uuid: "a1", timestamp: T(2), attachment: { type: "queued_command", prompt: wrapped.trim(), source_uuid: "u1", commandMode: "prompt" } },
+      { type: "user", timestamp: T(3), message: { role: "user", content: `<pasted_content id="3">\nlook:\n${long}\n</pasted_content id="3">` } },
+    ]);
+    expect((await latest(file)).blocks.map(said)).toEqual([
+      ["user", "槽位 w/fix，经 rh send", "第二行\n第三行\n第四行"],
+      ["user", "槽位 w/fix，经 rh send", "第二行\n第三行\n第四行"],
+      ["user", null, `<pasted_content id="3">\nlook:\n${long}\n</pasted_content id="3">`],
+    ]);
+  });
+
   // #228: what you send while a turn runs, as Claude records it once it takes it in: an attachment, beside
   // the queue's own lines; a task's notice and another session's message come the same way. Sanitised
   // from real transcripts; the image's data is cut short.

@@ -26,7 +26,21 @@ RHODIUM_SOCKET=$XDG_RUNTIME_DIR/rhodium-dev/rh.sock ~/.local/opt/rhodium-dev/cur
 
 ## 查数据库
 
-`rhodium` 在跑时，不要直接打开 `rh.db`。先把 `rh.db*`（连同 `-wal`、`-shm`）拷出来，只读打开拷贝：
+维护者的检出里有 `scripts/agents/db.ts`（不随公开版发布），用它一步查完：
+
+```sh
+scripts/agents/db.ts rhodium-dev "SELECT w.name AS workspace, s.name, s.state FROM slot s JOIN workspace w ON w.id = s.workspace WHERE s.archivedAt IS NULL"
+```
+
+- 它用 `VACUUM INTO` 拷一份库（目录 700，文件 600），只读执行这条 SQL，打表，再删掉拷贝。
+- 第一个参数写实例名，也可以写 `rh.db` 的路径或状态目录。
+- 毫秒时间列换成本机时间。
+- 平台的用户 ID、聊天 ID、令牌这类列不打印。
+- 别的字符串格子里（比如 `event.data` 这样的 JSON、回复正文、用 `AS` 改过名的列）出现库里记着的平台 ID（`chat.platformChatId`、`inbound.sender`、`bot.owners`），换成 `***`。
+- 只写在 config 里、库里没出现过的 ID，它不认识，也就不会遮。
+- 确实要看 ID 时加 `--ids`。
+
+没有这个脚本时照下面手动做。`rhodium` 在跑时，不要直接打开 `rh.db`。先把 `rh.db*`（连同 `-wal`、`-shm`）拷出来，只读打开拷贝：
 
 ```sh
 d=$(mktemp -d) && cp ~/.local/state/rhodium-dev/rh.db* "$d"/
@@ -36,7 +50,7 @@ console.table(db.query("SELECT w.name AS workspace, s.name, s.state, s.mode, s.c
 ' "$d/rh.db"
 ```
 
-查完删掉 `$d`。写查询前先看 `src/store.ts` 里的列名，别猜：
+查完删掉 `$d`。不管用哪种办法，写查询前先看 `src/store.ts` 里的列名，别猜：
 
 - 槽位名分两半：`workspace.name` 和 `slot.name`。
 - 别的表里指向槽位、对话、窗口的列（`event.slot`、`inbound.route`、`slot.conversation` 等）存的是内部 ID，不是名字。
@@ -67,3 +81,14 @@ console.table(db.query("SELECT w.name AS workspace, s.name, s.state, s.mode, s.c
 - 只有用户本人能用的命令（`trace`、`set`、`use`、`bind`、`bot`、`pair`、`stop --all`）直接拒绝。
 
 要做这些事，把命令写给用户，请他在自己的终端跑。
+
+## 槽位收不进消息、停止也没用
+
+现象：消息写进了托管进程的 `in.log`，`out.log` 却不再动；网页上点停止，按钮不变回发送。多半是托管单元超了内存上限、被整个节流了，见[架构 §4.2](../architecture.md#42-怎么拉起)“内存阻塞”。Rhodium 认出来时状态是“内存阻塞”，没认出来（例如刚开始卡）也照下面查。
+
+1. 找单元和它的 cgroup：`systemctl --user show -p ControlGroup --value <unitPrefix>hold-<对话 ID>.service`，下面把 `/sys/fs/cgroup` 加上这个路径叫 `$cg`。
+2. 看 `cat $cg/memory.pressure` 的 `full` 行：`avg10` 几十以上、`total` 一直在涨，就是卡在内存上。
+3. 看 `grep -w anon $cg/memory.stat`：匿名内存接近 `cat $cg/memory.high`，才是进程自己申请的超了。只是页缓存多不会卡。
+4. 找最大的进程：`for p in $(cat $cg/cgroup.procs); do echo "$(grep RssAnon /proc/$p/status) $p $(tr '\0' ' ' < /proc/$p/cmdline | cut -c1-80)"; done | sort -k2 -n | tail`。卡住的进程状态是 `D`，`cat /proc/<pid>/wchan` 是 `mem_cgroup_handle_over_high`。
+
+临时解法：`systemctl --user set-property --runtime <单元> MemoryHigh=<更大>`，几秒内就恢复，排着的消息照常交进去。`--runtime` 只管到单元结束。也可以结束那个最大的进程。长期调高改配置的 `memoryHigh`，见[部署](../../deploy/README.md)。

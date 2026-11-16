@@ -9,7 +9,7 @@ import { updateClaude } from "./claude-update";
 import { claudeProjectDir, type Run, type Script } from "./fake-agent/fake-agent";
 import { codexOn, endTurn, on, piEnd, piOn, piStart, startTurn } from "./fake-agent/scripts";
 import { call } from "./fake-herdr/fake-herdr";
-import { BOARD_LOGIN, boardAct, newInstance, until, withoutSource, type Daemon, type Instance, type InstanceOptions } from "./instance";
+import { BOARD_LOGIN, boardAct, newInstance, recorded, until, withoutSource, type Daemon, type Instance, type InstanceOptions } from "./instance";
 
 const ME = "you-openid";
 const obey: Script = { on, steps: [...startTurn, { rhFrom: "in.message.content.0.text" }, ...endTurn("done"), { goto: 0 }] };
@@ -20,7 +20,8 @@ afterEach(() => rhodium.cleanup());
 
 /** An instance with a fake Herdr, whose bot q goes to w/a; started, with the slots w/a and w/b made. */
 async function begin(opts: InstanceOptions = {}): Promise<Instance> {
-  rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" } }, claude: { script: obey }, herdr: true, ...opts });
+  // Type-in off: these are of a terminal that turns your messages away (test/tui-user-input.test.ts has it on).
+  rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" } }, claude: { script: obey }, herdr: true, ...opts, toml: `${opts.toml ?? ""}\n[defaults]\ntypeIn = false` });
   daemon = await rhodium.start();
   board = `http://${daemon.logs.find((l) => l.msg === "ready")!.board}`;
   await rhodium.slots("a", "b");
@@ -87,7 +88,7 @@ test("stories 103, 106, 109, 111: /rh_tui opens the same conversation in the wor
   // Story 103: the same conversation, in the slot's directory.
   await until(() => runs("w/a").some(inPane), 15_000);
   const tui = runs("w/a").find(inPane)!;
-  expect(tui.argv).toEqual(["--permission-mode", "bypassPermissions", "--resume", session]);
+  expect(tui.argv).toEqual(["--permission-mode", "bypassPermissions", "--resume", session, ...PROMPT]);
   expect(tui.cwd).toBe(headless.cwd);
   // Herdr reports the session a moment after the agent starts, so not always by the notice.
   await until(async () => (await snapshot()).panes[0]?.agent_session !== undefined, 15_000);
@@ -108,7 +109,7 @@ test("stories 103, 106, 109, 111: /rh_tui opens the same conversation in the wor
   await posted("from the pane, no token");
   expect(await texts()).toContain("from the pane");
   // A message from another slot or your terminal waits for the switch back.
-  expect(await rhodium.ok("send", "w/a", "later")).toContain("它在 TUI 里，切回无头后再交给它。");
+  expect(await rhodium.ok("send", "w/a", "later")).toContain("它在 TUI 里，等输入框空着、没有对话框时打进去。");
   expect(runs("w/a").filter((r) => !inPane(r))).toHaveLength(1);
   // A switch is no crash: no notice of one.
   expect((await texts()).filter((t) => t.includes("崩溃"))).toEqual([]);
@@ -136,6 +137,9 @@ async function launches(): Promise<{ applied: any[]; typed: unknown[] }> {
     typed: calls.filter((c) => ["tab.create", "pane.send_input", "pane.send_text"].includes(c.method)),
   };
 }
+/** What a Claude or pi terminal ends with: the slot's prompt file (story 616). */
+const PROMPT = ["--append-system-prompt-file", expect.any(String), "--system-prompt-snapshot", "off"];
+const PI_PROMPT = ["--append-system-prompt", expect.any(String)];
 const RH_ENV = ["RHODIUM_SLOT", "RHODIUM_SOCKET", "RHODIUM_TOKEN", "TELEGRAM_STATE_DIR"];
 
 test("#372: the slot's tab runs Claude itself, nothing typed into a shell to show on its screen: one layout.apply, the token in its env alone", async () => {
@@ -150,7 +154,7 @@ test("#372: the slot's tab runs Claude itself, nothing typed into a shell to sho
   expect(applied).toHaveLength(1);
   const [{ workspace_id, tab_label, root }] = applied;
   expect([workspace_id, tab_label, root.type, root.cwd]).toEqual([(await snapshot()).workspaces[0].workspace_id, "a", "pane", headless.cwd]);
-  expect(root.command).toEqual(["/usr/bin/env", `PATH=${rhodium.env.PATH}`, rhodium.claude.path, "--permission-mode", "bypassPermissions", "--resume", sessionOf("w/a")]);
+  expect(root.command).toEqual(["/usr/bin/env", `PATH=${rhodium.env.PATH}`, rhodium.claude.path, "--permission-mode", "bypassPermissions", "--resume", sessionOf("w/a"), ...PROMPT]);
   expect(Object.keys(root.env).sort()).toEqual(RH_ENV);
   expect(root.command.join(" ")).not.toContain(root.env.RHODIUM_TOKEN);
 }, 30_000);
@@ -232,7 +236,7 @@ test("the terminal starts with the slot's /model and /effort, and with approval 
   await say("hi");
   await posted("done");
   await each("/model haiku", "/effort high");
-  expect(await launched()).toEqual(["--model", "haiku", "--effort", "high", "--permission-mode", "bypassPermissions", "--resume", sessionOf("w/a")]);
+  expect(await launched()).toEqual(["--model", "haiku", "--effort", "high", "--permission-mode", "bypassPermissions", "--resume", sessionOf("w/a"), ...PROMPT]);
 }, 30_000);
 
 test("approval on: the terminal gets no permission flag, so Claude's own default mode; a remembered model the last handshake no longer offers is left out", async () => {
@@ -244,7 +248,7 @@ test("approval on: the terminal gets no permission flag, so Claude's own default
   // Claude was upgraded meanwhile, and rh doctor met the new one first: its list has no Haiku.
   updateClaude(rhodium, "2.1.305", { extra: { models: [{ value: "sonnet", displayName: "Sonnet" }] } });
   await rhodium.rh(["doctor"]);
-  expect(await launched()).toEqual(["--effort", "low", "--resume", sessionOf("w/a")]);
+  expect(await launched()).toEqual(["--effort", "low", "--resume", sessionOf("w/a"), ...PROMPT]);
 }, 30_000);
 
 /** A reply at this level, as Claude writes the first of a turn down; by default of the fake's default model. */
@@ -279,7 +283,7 @@ test("xhigh with ultracode picked in the terminal stays with the slot once back,
   expect((await texts()).at(-1)).toContain("\n模型：默认（Opus 5.5）xhigh\n已开启 ultracode\n");
   await say("/rh_tui");
   await until(() => runs("w/a").filter(inPane).length === 2, 15_000);
-  expect(runs("w/a").filter(inPane)[1]!.argv).toEqual(["--effort", "xhigh", "--settings", '{"ultracode":true}', "--permission-mode", "bypassPermissions", "--resume", sessionOf("w/a")]);
+  expect(runs("w/a").filter(inPane)[1]!.argv).toEqual(["--effort", "xhigh", "--settings", '{"ultracode":true}', "--permission-mode", "bypassPermissions", "--resume", sessionOf("w/a"), ...PROMPT]);
 }, 45_000);
 
 test("a model switched to in the terminal stays with the slot once back, as if set with /model, but not the level it ran at there, which is that model's default", async () => {
@@ -359,14 +363,14 @@ test("story 332: /rh_tui on a slot in TUI already offers 切回无头; /rh_help 
   expect(home.buttons!.map((b) => b.label)).not.toContain("切到 TUI");
 }, 45_000);
 
-test("story 262: the board's stop on a slot in the terminal is turned away, saying to take it back on the banner, never a command to type", async () => {
+test("story 262: the board's stop on a slot in the terminal is turned away, saying to take it back in the top bar's ⋯, never a command to type", async () => {
   await begin();
   await rhodium.ok("send", "w/a", "hi");
   await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
   await rhodium.ok("tui", "w/a");
   await until(async () => (await rhodium.state("w/a")) === "TUI 模式", 15_000);
   const r = await boardAct(board, { kind: "common", slot: (await card("a")).id, name: "stop" });
-  expect(await r.json()).toEqual({ ok: false, error: "w/a 在 TUI 里，这条没交给它。点横幅上的“收回终端”把它切回无头。" });
+  expect(await r.json()).toEqual({ ok: false, error: "w/a 在 TUI 里，这条没交给它。点顶栏“⋯”里的“收回终端”把它切回无头。" });
 }, 45_000);
 
 test("stories 261, 263, 265, 266: the board's terminal key focuses the pane in Herdr, as /rh_tui does, and its take-back, sure once you confirmed it, ends the agent there; each shows on the board alone, and a switch that failed is told in IM all the same", async () => {
@@ -402,17 +406,35 @@ test("stories 261, 263, 265, 266: the board's terminal key focuses the pane in H
   }
 }, 45_000);
 
-test("stories 278, 279: in the terminal, a message from the board is turned away, saying to take it back on the banner; /rh_release typed there only says so, the slot left in the terminal", async () => {
+test("stories 278, 279: in the terminal, a message from the board is turned away, saying to take it back in the top bar's ⋯; /rh_release typed there only says so, the slot left in the terminal", async () => {
   await begin();
   await rhodium.ok("send", "w/a", "hi");
   await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
   await rhodium.ok("tui", "w/a");
   await until(async () => (await rhodium.state("w/a")) === "TUI 模式", 15_000);
   const say = async (text: string) => (await boardAct(board, { kind: "say", slot: (await card("a")).id, text })).json();
-  expect(await say("hello")).toEqual({ ok: false, error: "w/a 在 TUI 里，这条没交给它。点横幅上的“收回终端”把它切回无头。" });
-  expect(await say("/rh_release")).toEqual({ ok: true, text: "点横幅上的“收回终端”把它切回无头。" });
+  expect(await say("hello")).toEqual({ ok: false, error: "w/a 在 TUI 里，这条没交给它。点顶栏“⋯”里的“收回终端”把它切回无头。" });
+  expect(await say("/rh_release")).toEqual({ ok: true, text: "点顶栏“⋯”里的“收回终端”把它切回无头。" });
+  // /status is Rhodium's to answer all the same, as from IM (#737).
+  expect(await say("/status")).toMatchObject({ ok: true, card: { command: "status", ref: "w/a" } });
   await Bun.sleep(300);
   expect(await rhodium.state("w/a")).toBe("TUI 模式");
+}, 45_000);
+
+test("#737: /status from the board to a pi slot in the terminal, type-in on, is Rhodium's to answer: its status card, nothing typed; a plain message is typed in", async () => {
+  await begin({ bots: { q: { like: "qq", owner: ME, target: "w/p" } } });
+  await rhodium.ok("new", "w/p", "--agent", "pi");
+  await say("hi");
+  await posted("fake reply");
+  await rhodium.ok("set", "w/p", "type-in=on");
+  await say("/rh_tui");
+  await posted("切到 TUI 了");
+  const say2 = async (text: string) => (await boardAct(board, { kind: "say", slot: (await card("p")).id, text })).json();
+  expect(await say2("/status")).toMatchObject({ ok: true, card: { command: "status", ref: "w/p", agent: "pi" } });
+  const typed = async () => ((await herdr("fake.calls")).calls as { method: string }[]).filter((c) => c.method === "pane.send_input");
+  await Bun.sleep(1500);
+  expect(await typed()).toEqual([]);
+  expect(await say2("hello")).toEqual({ ok: true, text: "排进终端" });
 }, 45_000);
 
 test("/rh_tui from IM focuses the slot's pane in Herdr once it is open; an agent's rh tui does not (2026-10-21)", async () => {
@@ -721,17 +743,34 @@ test("story 112: quitting the agent in the pane puts the slot back to headless, 
   expect(runs("w/a").at(-1)!.argv).toContain(`--resume=${session}`);
 }, 30_000);
 
+test("story 616: the terminal Rhodium starts gets the slot's terminal prompt, in the file its headless agent gets; once back, the headless one again", async () => {
+  await begin();
+  const { pane, agent } = await inTerminal();
+  const promptOf = (argv: string[]) => readFileSync(argv[argv.indexOf("--append-system-prompt-file") + 1]!, "utf8");
+  const inPane = promptOf(agent.argv);
+  expect(inPane).toContain("你是 Rhodium 托管的 agent，现在在 Herdr 的终端里运行（TUI 模式）。");
+  expect(inPane).toContain("- 别的槽位发来的消息要回，用 `rh send <工作区/槽位>`。");
+  await quit(pane);
+  await posted("切回无头了");
+  await say("back on the phone");
+  await until(async () => (await dones()) === 2, 15_000);
+  const headless = runs("w/a").at(-1)!.argv;
+  expect(headless[headless.indexOf("--append-system-prompt-file") + 1]).toBe(agent.argv[agent.argv.indexOf("--append-system-prompt-file") + 1]);
+  expect(promptOf(headless)).toContain("你是 Rhodium 托管的无头 agent。");
+}, 30_000);
+
 test("story 106: with Herdr's session named default, the one you use, where to find the slot names no session", async () => {
   await begin({ herdrSession: "default" });
   await inTerminal();
   expect(await posted("切到 TUI 了")).toBe("w/a 切到 TUI 了。\n在 Herdr w 工作区的 a 标签页。\n在 TUI 里退出 agent，它会自动切回无头。这之前，这里的消息不会交给它。");
 }, 30_000);
 
-test("stories 143, 145, 208: on the board a slot in the terminal runs, as TUI 模式 with its pane; a page following it hears as the agent there writes, and once back, its transcript has the turns done there", async () => {
+test("stories 143, 145, 208: on the board a slot in the terminal says TUI 模式 with its pane; a page following it hears as the agent there writes, and once back, its transcript has the turns done there", async () => {
   await begin();
   const { pane } = await inTerminal();
   const a = await card("a");
-  expect([a.group, a.state]).toEqual(["running", `TUI 模式（pane ${pane}）`]);
+  // Its group goes by what Herdr says of its agent, once read (#664: board.test.ts).
+  expect(a.state).toBe(`TUI 模式（pane ${pane}）`);
   // Story 208: its pane, for the page's banner.
   expect(await fromBoard(`/api/slot?id=${a.id}`)).toMatchObject({ state: `TUI 模式（pane ${pane}）`, pane });
   // Story 208: a page following it hears as the agent there writes to its transcript.
@@ -812,7 +851,7 @@ test("/rh_tui of a conversation Claude never wrote down, as one you /clear'ed to
   await say("/rh_tui");
   await until(async () => (await texts()).filter((t) => t.includes("切到 TUI 了")).length === 2, 15_000);
   await until(() => runs("w/a").filter(inPane).length === 2, 15_000);
-  expect(runs("w/a").at(-1)!.argv).toEqual(["--permission-mode", "bypassPermissions", "--session-id", second]);
+  expect(runs("w/a").at(-1)!.argv).toEqual(["--permission-mode", "bypassPermissions", "--session-id", second, ...PROMPT]);
 }, 30_000);
 
 /** The session id of the conversation the slot is on, as rhodium has it now. */
@@ -830,11 +869,12 @@ test("stories 544, 545: /rh_tui on a slot with no conversation yet starts one in
   await say("/rh_tui");
   await until(() => runs("w/a").some(inPane), 15_000);
   const { argv } = runs("w/a").find(inPane)!;
-  expect(argv.slice(0, -1)).toEqual(["--permission-mode", "bypassPermissions", "--session-id"]);
-  expect(argv.at(-1)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  expect(argv.slice(0, 3)).toEqual(["--permission-mode", "bypassPermissions", "--session-id"]);
+  expect(argv.slice(4)).toEqual(PROMPT);
+  expect(argv[3]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   // On record before the agent starts, while the switch still waits for its screen: a rhodium that
   // died now would take this pane over on restart (architecture §10.1).
-  expect(sessionInDb("a")).toBe(argv.at(-1)!);
+  expect(sessionInDb("a")).toBe(argv[3]!);
   await posted("切到 TUI 了");
 }, 30_000);
 
@@ -848,7 +888,7 @@ test("a conversation you /resume'd to in the terminal that was started in anothe
   await say("/rh_tui");
   await until(async () => (await texts()).filter((t) => t.includes("切到 TUI 了")).length === 2, 15_000);
   await until(() => runs("w/a").filter(inPane).length === 2, 15_000);
-  expect(runs("w/a").at(-1)!.argv).toEqual(["--permission-mode", "bypassPermissions", "--resume", second]);
+  expect(runs("w/a").at(-1)!.argv).toEqual(["--permission-mode", "bypassPermissions", "--resume", second, ...PROMPT]);
 
   // Nothing said in the pane: the transcript is still only in the other directory's folder.
   const [pane] = (await snapshot()).panes;
@@ -862,7 +902,7 @@ test("a conversation you /resume'd to in the terminal that was started in anothe
 test("an rh send that waited for the switch back reaches the agent once back, on the conversation you moved to in the terminal", async () => {
   await begin();
   const { pane } = await inTerminal();
-  expect(await rhodium.ok("send", "w/a", "later")).toContain("它在 TUI 里，切回无头后再交给它。");
+  expect(await rhodium.ok("send", "w/a", "later")).toContain("它在 TUI 里，等输入框空着、没有对话框时打进去。");
   const second = crypto.randomUUID();
   await moveTo(pane, second);
   await Bun.sleep(1500);
@@ -980,9 +1020,20 @@ test("story 99: /rh_tui takes over a child the dispatcher spawned, as any slot",
   await say("/rh_tui");
   expect(await posted("切到 TUI 了")).toContain("w/c");
   await until(() => runs("w/c").some(inPane), 15_000);
-  expect(runs("w/c").find(inPane)!.argv).toEqual(["--permission-mode", "bypassPermissions", "--resume", sessionOf("w/c")]);
+  expect(runs("w/c").find(inPane)!.argv).toEqual(["--permission-mode", "bypassPermissions", "--resume", sessionOf("w/c"), ...PROMPT]);
   expect((await snapshot()).tabs.map((t: any) => t.label)).toEqual(["c"]);
   expect(await rhodium.state("w/c")).toBe("TUI 模式");
+  // Story 597: a child's process, headless or in its pane, is started as one, which rh --help and
+  // rh --skill go by, and its system prompt is the child's; its parent's are the other.
+  expect(runs("w/c").map((r) => r.env.RHODIUM_CHILD)).toEqual(runs("w/c").map(() => "1"));
+  expect(runs("w/a").map((r) => r.env.RHODIUM_CHILD)).toEqual(runs("w/a").map(() => undefined));
+  const prompt = (ref: string) => {
+    const argv = runs(ref).find((r) => !inPane(r))!.argv;
+    return readFileSync(argv[argv.indexOf("--append-system-prompt-file") + 1]!, "utf8");
+  };
+  expect([prompt("w/c").includes("是别的槽位派生的子槽位"), prompt("w/a").includes("是别的槽位派生的子槽位")]).toEqual([true, false]);
+  // Story 616: the prompt file its pane's claude was started on, rewritten for it, is the child's terminal one.
+  expect(prompt("w/c")).toContain("你是 Rhodium 托管的 agent，是别的槽位派生的子槽位，现在在 Herdr 的终端里运行（TUI 模式）。");
 }, 30_000);
 
 /** What the slot's headless claude runs were told, oldest first, without the line saying where it came from. */
@@ -1005,7 +1056,7 @@ test("story 110: a child's report and an rh send that come while the slot is in 
 
   await rhodium.im.inject("qc", { chat: ME, sender: ME, text: "1" });
   await until(async () => (await rhodium.state("w/c")) === "空闲", 15_000);
-  expect(await rhodium.ok("send", "w/a", "later")).toContain("它在 TUI 里，切回无头后再交给它。");
+  expect(await rhodium.ok("send", "w/a", "later")).toContain("它在 TUI 里，等输入框空着、没有对话框时打进去。");
   await Bun.sleep(500);
   expect(runs("w/a").filter((r) => !inPane(r))).toHaveLength(1);
   const before = told("w/a").length;
@@ -1017,6 +1068,98 @@ test("story 110: a child's report and an rh send that come while the slot is in 
   expect(report).toContain("w/c 完成了");
   expect(sent).toBe("later");
   expect(runs("w/a").filter((r) => !inPane(r))).toHaveLength(2);
+}, 45_000);
+
+test("story 605: what waits for the switch back is in the slot's queue on the board, by who sent it, its whole text a click away; you hear once when it has waited durations.tuiHeld, again only once the queue has emptied; taken off, it never goes; once back, the rest goes in", async () => {
+  await begin({ toml: '[durations]\ntuiHeld = "2s"' });
+  // Your chat goes to w/a: it is the one told.
+  await say("hi");
+  await posted("done");
+  await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
+  await rhodium.ok("tui", "w/a");
+  await until(async () => (await rhodium.state("w/a")) === "TUI 模式", 15_000);
+  const [pane] = (await snapshot()).panes;
+  const a = (await card("a")).id;
+  const queue = async () => (await fromBoard(`/api/slot?id=${a}`)).queue as { id: string; text: string; from: string; reason: string }[];
+  const held = (what: string) => `w/a 在 TUI 里，有 ${what}消息等了 2 秒还没交给它：认不出终端里的画面。\n可以切回无头，切回后交给它。`;
+  const notices = async () => (await rhodium.im.log("q", ME)).filter((p) => p.text.includes("还没交给它："));
+
+  // The receipt is as before: it waits for the switch back.
+  expect(await rhodium.ok("send", "w/a", "first line\nsecond line")).toContain("它在 TUI 里，等输入框空着、没有对话框时打进去。");
+  let [one] = await queue();
+  expect(one).toMatchObject({ text: "first line", from: "用户的终端", reason: "tui" });
+  // Its whole text, by its id, from the board's own page alone.
+  const whole = (headers: Record<string, string>) => fetch(`${board}/api/held?id=${one!.id}`, { headers: { "Tailscale-User-Login": BOARD_LOGIN, ...headers } });
+  expect(await (await whole({ "sec-fetch-site": "same-origin" })).json()).toEqual({ text: "first line\nsecond line" });
+  expect((await whole({ "sec-fetch-site": "cross-site" })).status).toBe(403);
+
+  // Past durations.tuiHeld, you hear once, with the button to switch it back; one more brings no second notice.
+  await until(async () => (await notices()).length === 1, 15_000);
+  expect((await notices())[0]).toMatchObject({ text: held("1 条"), buttons: [{ label: "切回无头", data: "/rh_release w/a" }] });
+  await rhodium.ok("send", "w/a", "second");
+  await Bun.sleep(3000);
+  expect(await notices()).toHaveLength(1);
+
+  // Taken off on the board, they never go. The queue empty, the next one waits durations.tuiHeld again for its notice.
+  for (const q of await queue()) expect(await (await boardAct(board, { kind: "queued", slot: a, op: "drop", input: q.id })).json()).toEqual({ ok: true, text: "删掉了。" });
+  expect(await queue()).toEqual([]);
+  await rhodium.ok("send", "w/a", "third");
+  await until(async () => (await notices()).length === 2, 15_000);
+  expect((await notices())[1]!.text).toBe(held("1 条"));
+  await rhodium.ok("send", "w/a", "fourth");
+
+  // Once back, the rest goes in, the dropped ones not; the notice is forgotten.
+  const before = told("w/a").length;
+  await quit(pane.pane_id);
+  await until(() => told("w/a").length === before + 2, 15_000);
+  expect(told("w/a").slice(before)).toEqual(["third", "fourth"]);
+  expect(await queue()).toEqual([]);
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  expect(db.query("SELECT tuiHeldNotice FROM slot WHERE name = 'a'").get()).toEqual({ tuiHeldNotice: null });
+  db.close();
+}, 60_000);
+
+test("story 605: what came while a /rh_tui waits for the turn is not told of before the pane opens; once open, you hear as soon as its screen was read", async () => {
+  await begin({ claude: { script: { on, steps: [...startTurn, { sleep: 4000 }, ...endTurn("slow reply"), { goto: 0 }] } }, toml: '[durations]\ntuiHeld = "1s"' });
+  await say("take your time");
+  await until(async () => (await rhodium.state("w/a")) === "运行中", 15_000);
+  await say("/rh_tui");
+  await posted("这一回合还没跑完，跑完就切到 TUI。");
+  expect(await rhodium.ok("send", "w/a", "on the way")).toContain("它在 TUI 里，等输入框空着、没有对话框时打进去。");
+  await posted("还没交给它：");
+  const all = await rhodium.im.log("q", ME);
+  const switched = all.findIndex((p) => p.text.includes("切到 TUI 了"));
+  const notice = all.findIndex((p) => p.text.includes("还没交给它："));
+  expect(switched).toBeGreaterThan(-1);
+  expect(notice).toBeGreaterThan(switched);
+  expect(all[notice]).toMatchObject({ text: "w/a 在 TUI 里，有 1 条消息等了 1 秒还没交给它：认不出终端里的画面。\n可以切回无头，切回后交给它。", buttons: [{ label: "切回无头", data: "/rh_release w/a" }] });
+  // Not before the pane's screen was read: a Claude slot's may be typed in a moment. Its text goes on
+  // the outbound row once the send is answered, a moment after the fake IM has it.
+  await recorded(rhodium, "SELECT 1 FROM outbound WHERE text LIKE '%还没交给它：%'");
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  const read = db.query("SELECT min(at) AS at FROM event WHERE type = 'tui_input'").get() as { at: number | null };
+  const sent = db.query("SELECT createdAt FROM outbound WHERE text LIKE '%还没交给它：%'").get() as { createdAt: number };
+  db.close();
+  expect(read.at).not.toBeNull();
+  expect(sent.createdAt).toBeGreaterThanOrEqual(read.at!);
+}, 30_000);
+
+test("stories 605, 609: a decision on a confirm request for a slot in the terminal waits in its queue, from Rhodium：确认结果", async () => {
+  await begin();
+  await rhodium.ok("send", "w/a", "hi");
+  await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
+  await rhodium.ok("tui", "w/a");
+  await until(async () => (await rhodium.state("w/a")) === "TUI 模式", 15_000);
+  const [pane] = (await snapshot()).panes;
+  // The agent in the pane asks to archive w/b; you refuse.
+  await typeInto(pane.pane_id, plan(["archive", "w/b"]));
+  const a = (await card("a")).id;
+  let asks: { id: string }[] = [];
+  await until(async () => (asks = (await fromBoard(`/api/slot?id=${a}`)).asks).length > 0, 15_000);
+  expect(await (await boardAct(board, { kind: "answer", ask: asks[0]!.id, text: "2" })).json()).toMatchObject({ ok: true });
+  let queue: { text: string; from: string }[] = [];
+  await until(async () => (queue = (await fromBoard(`/api/slot?id=${a}`)).queue).length === 1, 15_000);
+  expect(queue[0]).toMatchObject({ from: "Rhodium：确认结果", text: "用户拒绝了你的确认请求：rh archive w/b 没有执行。" });
 }, 45_000);
 
 /** The pi runs of the slot, oldest first: headless ones in rpc mode, a pane's not. */
@@ -1048,7 +1191,7 @@ test("story 108: a pi slot switches to the terminal on its session and back; the
   const folder = dirname(pane.agent_session.value); // the slot directory's pi sessions
   expect(alive(headless.pid)).toBe(false);
   // pi's own terminal on the same session, in the slot's directory (architecture §6.3).
-  expect(tui.argv).toEqual(["--session-id", session]);
+  expect(tui.argv).toEqual(["--session-id", session, ...PI_PROMPT]);
   expect(tui.cwd).toBe(headless.cwd);
   expect(Object.keys(tui.env).filter((k) => k.startsWith("ANTHROPIC_"))).toEqual([]);
   // Your pi's Herdr extension reports the session's file to the pane, from the pane's variables.
@@ -1080,6 +1223,54 @@ test("story 108: a pi slot switches to the terminal on its session and back; the
   expect(flag(piRuns("w/p").at(-1)!.argv, "--session-id")).toBe(moved);
 }, 60_000);
 
+/** A recorded screen of Codex's or pi's (test/fixtures/herdr/<agent>-screens.jsonl), by name. */
+const recordedScreen = (agent: "codex" | "pi", name: string): { text: string; typed?: string } =>
+  readFileSync(join(import.meta.dir, `fixtures/herdr/${agent}-screens.jsonl`), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l))
+    .find((s) => s.name === name);
+/** The recorded screen with "[来自 槽位 w/b，经 rh send]\n请回复一句：收到。" in the box, the box holding body from your terminal's rh send instead. */
+const typedScreen = (agent: "codex" | "pi", body: string) => recordedScreen(agent, "typed").text.replace("槽位 w/b", "用户的终端").replace("请回复一句：收到。", body);
+const sent = async (method: string) => ((await herdr("fake.calls")).calls as { method: string; params: any }[]).filter((c) => c.method === method);
+
+test("story 607: pi's terminal: Herdr saying blocked is enough for its card to say 被弹框挡住, whatever its screen, and back to TUI 模式 once it does not", async () => {
+  const { pane } = await piInTerminal();
+  await herdr("fake.set_screen", { pane_id: pane.pane_id, text: recordedScreen("pi", "empty").text, status: "blocked" });
+  await until(async () => (await card("p")).state === "被弹框挡住", 3_000);
+  await herdr("fake.set_status", { pane_id: pane.pane_id, status: "idle" });
+  await until(async () => (await card("p")).state === `TUI 模式（pane ${pane.pane_id}）`, 3_000);
+}, 30_000);
+
+test("stories 606, 615: pi's terminal is typed into while it works too; its box emptying after Enter takes the message, as pi writes a steered one down only once it reaches it", async () => {
+  const { pane } = await piInTerminal();
+  await herdr("fake.set_screen", { pane_id: pane.pane_id, text: recordedScreen("pi", "working").text, status: "working" });
+  await herdr("fake.on_input", { pane_id: pane.pane_id, text: typedScreen("pi", "hello pi"), status: "working" });
+  expect(await rhodium.ok("send", "w/p", "hello pi")).toContain("已发给 w/p。它在 TUI 里，等输入框空着、没有对话框时打进去。");
+  await until(async () => (await sent("pane.send_keys")).length === 1, 10_000);
+  expect((await sent("pane.send_input"))[0]!.params).toEqual({ pane_id: pane.pane_id, text: "[来自 用户的终端，经 rh send]\nhello pi", keys: [] });
+  const id = (await card("p")).id;
+  // Steered: shown above the box, the box empty; nothing in its session file yet.
+  await herdr("fake.set_screen", { pane_id: pane.pane_id, text: recordedScreen("pi", "working-steered").text, status: "working" });
+  await until(async () => (await fromBoard(`/api/slot?id=${id}`)).queue.length === 0, 5_000);
+  expect(readFileSync(pane.agent_session.value, "utf8")).not.toContain("hello pi");
+}, 30_000);
+
+test("stories 611, 615: pi's box emptying takes only what Rhodium pressed Enter on: one whose look before Enter fails stays 已投递，尚未确认收到 once the box is empty again", async () => {
+  const { pane } = await piInTerminal();
+  await herdr("fake.set_screen", { pane_id: pane.pane_id, text: recordedScreen("pi", "empty").text, status: "idle" });
+  // /resume's selector where the box was as the text goes in: no Enter.
+  await herdr("fake.on_input", { pane_id: pane.pane_id, text: recordedScreen("pi", "resume").text, status: "idle" });
+  await rhodium.ok("send", "w/p", "hello pi");
+  const id = (await card("p")).id;
+  const queue = async () => (await fromBoard(`/api/slot?id=${id}`)).queue as { text: string; wait?: string; unsure?: true }[];
+  await until(async () => (await queue())[0]?.unsure === true, 10_000);
+  await herdr("fake.set_screen", { pane_id: pane.pane_id, text: recordedScreen("pi", "empty").text, status: "idle" });
+  await Bun.sleep(3000);
+  expect(await sent("pane.send_keys")).toEqual([]);
+  expect(await queue()).toMatchObject([{ text: "hello pi", wait: "已投递，尚未确认收到", unsure: true }]);
+}, 30_000);
+
 test("#372: pi's tab runs pi itself too, without your Claude's keys, nothing typed into a shell", async () => {
   const { session } = await piInTerminal();
   const { applied, typed } = await launches();
@@ -1087,9 +1278,12 @@ test("#372: pi's tab runs pi itself too, without your Claude's keys, nothing typ
   // Those pi reads go by name even where rhodium's environment lacks them, as Herdr's may have them.
   const unset = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"].flatMap((k) => ["-u", k]);
   expect(applied.map((p) => [p.tab_label, p.root.command])).toEqual([
-    ["p", ["/usr/bin/env", ...unset, `PATH=${rhodium.env.PATH}`, rhodium.pi.path, "--session-id", session]],
+    ["p", ["/usr/bin/env", ...unset, `PATH=${rhodium.env.PATH}`, rhodium.pi.path, "--session-id", session, ...PI_PROMPT]],
   ]);
   expect(Object.keys(applied[0].root.env).sort()).toEqual(RH_ENV);
+  // Story 616: the slot's terminal prompt, by its file, as headless pi gets it.
+  const command: string[] = applied[0].root.command;
+  expect(readFileSync(command[command.indexOf("--append-system-prompt") + 1]!, "utf8")).toContain("现在在 Herdr 的终端里运行（TUI 模式）");
 }, 30_000);
 
 test("#419: pi's terminal goes without every variable of Claude's that its headless agent goes without, not only the two keys pi reads", async () => {
@@ -1226,7 +1420,7 @@ test("stories 58, 544: pi's terminal on a session with nothing written down yet 
   await until(async () => (await snapshot()).panes[0]?.agent_session !== undefined, 15_000);
   const [pane] = (await snapshot()).panes;
   const session = sessionInDb("p")!;
-  expect(piRuns("w/p").find((r) => !rpc(r))!.argv).toEqual(["--model", "fake/pi-other", "--thinking", "high", "--session-id", session]);
+  expect(piRuns("w/p").find((r) => !rpc(r))!.argv).toEqual(["--model", "fake/pi-other", "--thinking", "high", "--session-id", session, ...PI_PROMPT]);
   // The new session's file has no settings of its own before the terminal: they are the slot's.
   await herdr("pane.send_input", { pane_id: pane.pane_id, text: JSON.stringify({ type: "change", change: "thinking_level_change", level: "low" }), keys: ["enter"] });
   await until(() => existsSync(pane.agent_session.value) && readFileSync(pane.agent_session.value, "utf8").includes(`"thinkingLevel":"low"`), 15_000);
@@ -1595,6 +1789,8 @@ async function cxLaunched(): Promise<{ run: Run; pane: string }> {
   return { run: cxRuns("w/x").filter(cxPane).at(-1)!, pane: (await snapshot()).panes[0].pane_id };
 }
 /** What the slot's terminal ends with after its settings: no update or folder-trust prompt, for this launch alone. */
+/** What Codex's terminal ends with: the slot's terminal prompt, for a new thread (story 616). */
+const DEV = ["-c", expect.stringMatching(/^developer_instructions="/)];
 const quiet = (dir: string) => ["-c", "check_for_update_on_startup=false", "-c", `projects={${JSON.stringify(dir)}={trust_level="trusted"}}`];
 
 test("stories 503, 504: /rh_tui opens the slot's thread in codex, on no shared app-server, asking nothing with approval off; told once Herdr names codex, before its hook reports the thread; quitting there puts the slot back on it", async () => {
@@ -1610,8 +1806,12 @@ test("stories 503, 504: /rh_tui opens the slot's thread in codex, on no shared a
   expect(looks.length).toBeLessThan(10); // not polled for the 3 s a session report is waited for
   await until(() => cxRuns("w/x").some(cxPane), 15_000); // its log may come after Herdr names it
   const run = cxRuns("w/x").find(cxPane)!;
-  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(dir)]);
+  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(dir), ...DEV]);
   expect(run.cwd).toBe(dir);
+  // Story 616: the slot's terminal prompt as a TOML string, as codex takes a -c value.
+  const dev = JSON.parse(run.argv.at(-1)!.slice("developer_instructions=".length));
+  expect(dev).toContain("你是 Rhodium 托管的 agent，现在在 Herdr 的终端里运行（TUI 模式）。");
+  expect(dev).toContain("- 假 IM 私聊（`rh send q`）：");
   expect(Object.keys(run.env).filter((k) => /^(ANTHROPIC_|CLAUDE)/.test(k))).toEqual([]);
   expect(run.env.HERDR_PANE_ID).toBe(pane.pane_id); // your hook reports with it
 
@@ -1624,6 +1824,27 @@ test("stories 503, 504: /rh_tui opens the slot's thread in codex, on no shared a
   expect(threads("w/x")).toEqual([thread, thread]);
 }, 45_000);
 
+test("stories 606, 615: Codex's terminal is typed into: the text alone, then Enter once its box holds just it; the user message in its rollout takes it. An emoji's variation selector, which Codex draws a column narrow, is left out", async () => {
+  const { thread } = await codexSlot();
+  const { pane } = await cxLaunched();
+  await herdr("fake.set_screen", { pane_id: pane, text: recordedScreen("codex", "empty").text, status: "idle" });
+  await herdr("fake.on_input", { pane_id: pane, text: typedScreen("codex", "hello codex") });
+  expect(await rhodium.ok("send", "w/x", "hello codex")).toContain("已发给 w/x。它在 TUI 里，等输入框空着、没有对话框时打进去。");
+  await until(async () => (await sent("pane.send_keys")).length === 1, 10_000);
+  const want = "[来自 用户的终端，经 rh send]\nhello codex";
+  expect((await sent("pane.send_input"))[0]!.params).toEqual({ pane_id: pane, text: want, keys: [] });
+  const id = (await card("x")).id;
+  await herdr("fake.set_screen", { pane_id: pane, text: recordedScreen("codex", "empty").text, status: "idle" });
+  await Bun.sleep(1500);
+  expect((await fromBoard(`/api/slot?id=${id}`)).queue).toHaveLength(1); // the box emptied is not enough for Codex
+  appendFileSync(rollout(thread), JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: want }] } }) + "\n");
+  await until(async () => (await fromBoard(`/api/slot?id=${id}`)).queue.length === 0, 5_000);
+  await herdr("fake.set_screen", { pane_id: pane, text: recordedScreen("codex", "empty").text, status: "idle" });
+  await rhodium.ok("send", "w/x", "注意 ⚠️ 好");
+  await until(async () => (await sent("pane.send_input")).length === 2, 10_000);
+  expect((await sent("pane.send_input"))[1]!.params.text).toBe("[来自 用户的终端，经 rh send]\n注意 ⚠ 好");
+}, 45_000);
+
 test("stories 506, 544: /rh_tui on a Codex thread with no turn written down, which codex resume cannot open, starts a new codex in the terminal instead", async () => {
   // Codex opens the thread, then turns your message away: no turn, so no record.
   const refusing: Script = { on: [{ match: { method: "turn/start" }, emit: [JSON.stringify({ error: { code: -32600, message: "refused" }, id: "{{in.id}}" })] }, ...codexOn!], steps: [] };
@@ -1633,7 +1854,7 @@ test("stories 506, 544: /rh_tui on a Codex thread with no turn written down, whi
   await until(() => cxRuns("w/x").some((r) => r.stdin.some((l) => l.includes("turn/start"))), 15_000);
   await until(async () => (await rhodium.state("w/x")) === "空闲", 15_000);
   const { run } = await cxLaunched();
-  expect(run.argv).toEqual(["--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(run.cwd)]);
+  expect(run.argv).toEqual(["--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(run.cwd), ...DEV]);
   expect(sessionInDb("x")).toBeNull();
 }, 30_000);
 
@@ -1641,7 +1862,7 @@ test("story 545: a Codex slot with no conversation yet starts a new codex in the
   await begin({ bots: { q: { like: "qq", owner: ME, target: "w/x" } } });
   await rhodium.ok("new", "w/x", "--agent", "codex");
   let { run, pane } = await cxLaunched();
-  expect(run.argv).toEqual(["--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(run.cwd)]);
+  expect(run.argv).toEqual(["--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(run.cwd), ...DEV]);
   await quit(pane);
   await posted("切回无头了");
   expect(sessionInDb("x")).toBeNull();
@@ -1672,7 +1893,7 @@ test("story 505: a model or level you switch to in Codex's terminal, then run a 
 
   // A model there: kept, by its name as Codex has it, told by its display name, not the level it ran at.
   let { run, pane } = await cxLaunched();
-  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(dir)]);
+  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "--dangerously-bypass-approvals-and-sandbox", ...quiet(dir), ...DEV]);
   await turnIn(pane, thread);
   await until(async () => (await snapshot()).panes[0]?.agent_session !== undefined, 15_000);
   ranOn(thread, "gpt-6-luna", "medium");
@@ -1681,7 +1902,7 @@ test("story 505: a model or level you switch to in Codex's terminal, then run a 
 
   // A level there, against the turn before the terminal, as the slot has none.
   ({ run, pane } = await cxLaunched());
-  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "-m", "gpt-6-luna", "--dangerously-bypass-approvals-and-sandbox", ...quiet(dir)]);
+  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "-m", "gpt-6-luna", "--dangerously-bypass-approvals-and-sandbox", ...quiet(dir), ...DEV]);
   ranOn(thread, "gpt-6-luna", "high");
   await rhodium.ok("set", "w/x", "approval=on");
   await quit(pane);
@@ -1690,7 +1911,7 @@ test("story 505: a model or level you switch to in Codex's terminal, then run a 
 
   // Nothing run there: nothing kept.
   ({ run, pane } = await cxLaunched());
-  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "-m", "gpt-6-luna", "-c", "model_reasoning_effort=high", "-a", "on-request", "-s", "danger-full-access", ...quiet(dir)]);
+  expect(run.argv).toEqual(["resume", thread, "--no-daemon", "-m", "gpt-6-luna", "-c", "model_reasoning_effort=high", "-a", "on-request", "-s", "danger-full-access", ...quiet(dir), ...DEV]);
   await quit(pane);
   await until(async () => (await texts()).filter((t) => t.includes("切回无头了")).length === 3, 15_000);
   expect((await texts()).filter((t) => t.includes("切回无头了"))[2]).toBe("w/x 切回无头了。");

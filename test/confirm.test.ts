@@ -39,8 +39,12 @@ async function texts(n: number, bot = "q"): Promise<string[]> {
 const runsOf = (ref: string): Run[] => rhodium.claude.runs().filter((r) => r.env.RHODIUM_SLOT === ref && r.stdin.some((l) => JSON.parse(l).type === "user"));
 
 /** The texts of the user frames written to the slot's agents, over all their runs. */
-const told = (ref: string) =>
-  runsOf(ref).flatMap((r) => r.stdin.map((l) => JSON.parse(l)).filter((m) => m.type === "user").map((m) => withoutSource(m.message.content[0].text)));
+const told = (ref: string) => heard(ref).map(withoutSource);
+/** The same with their source lines. */
+const heard = (ref: string): string[] =>
+  runsOf(ref).flatMap((r) => r.stdin.map((l) => JSON.parse(l)).filter((m) => m.type === "user").map((m) => m.message.content[0].text));
+/** The source line of a decision on a confirm request (product §5.8, story 609). */
+const DECIDED = "[来自 Rhodium：确认结果]\n";
 
 /** The rh calls the slot's agents made, once there are at least n. */
 async function rhCalls(ref: string, n: number): Promise<Run["rh"]> {
@@ -64,7 +68,7 @@ const WANTS: Record<string, string> = {
 const asks = (cmd: string) => `w/a 想${WANTS[cmd]}\n\n命令：${cmd}\n回别的话算拒绝，并转告 w/a。`;
 const CONFIRM = asks("rh stop w/b");
 /** Agreed, you hear 已回答：同意 alone: the agent tells you what came of it (product §5.8). */
-const TELL = "用户在 IM 里只看到“已回答：同意”。请用 rh send me 把结果告诉用户；你有父槽位时，见 rh send me 的说明。";
+const TELL = "用户在 IM 里只看到“已回答：同意”。请用 rh send me 把结果告诉用户；你是子槽位时，写在最终回复里。";
 /** Agreed on the board, which shows the turn the decision begins: the reply will do (story 478). */
 const TELL_WEB = "用户是在网页上同意的，网页上看得到你这一回合的回复。请把结果写在回复里，不用 rh send me。";
 
@@ -90,6 +94,7 @@ test("story 85: an agent's rh stop of a slot not its descendant returns at once 
   await until(async () => (await rhodium.state("w/b")) === "未运行", 15_000);
   await until(() => told("w/a").length === 2, 15_000);
   expect(told("w/a")[1]).toBe(`用户同意了你的确认请求：rh stop w/b\n结果：正在停止 w/b，对话保留。\n${TELL}`);
+  expect(heard("w/a")[1]).toStartWith(DECIDED);
   // A turn your decision started replies to no one.
   await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
   expect(await rhodium.im.log("q", ME)).toHaveLength(3);
@@ -112,6 +117,7 @@ test("story 85: once you refuse, nothing runs, and the agent hears so, with your
   expect((await texts(3))[2]).toBe("已拒绝，并转告：“别动它”");
   await until(() => told("w/a").length === 2, 15_000);
   expect(told("w/a")[1]).toBe("用户拒绝了你的确认请求：rh stop w/b 没有执行。\n用户说：别动它");
+  expect(heard("w/a")[1]).toStartWith(DECIDED);
   expect(await rhodium.ok("ls")).toMatch(/^w\/b +\S+ +\S+ +空闲/m);
 }, 30_000);
 
@@ -352,7 +358,7 @@ test("story 85: an agent's rh tui and rh release of a slot not its descendant ea
   await inPane("w/b");
   // The decision waits for the switch, and carries how it went.
   await until(() => told("w/a").length === 2, 15_000);
-  expect(told("w/a")[1]).toMatch(new RegExp(`^用户同意了你的确认请求：rh tui w/b\n结果：w/b 切到 TUI 了。\n在 Herdr \\S+ 会话里 w 工作区的 b 标签页。\n在 TUI 里退出 agent，它会自动切回无头。这之前，这里的消息不会交给它。\n${TELL}$`));
+  expect(told("w/a")[1]).toMatch(new RegExp(`^用户同意了你的确认请求：rh tui w/b\n结果：w/b 切到 TUI 了。\n在 Herdr \\S+ 会话里 w 工作区的 b 标签页。\n在 TUI 里退出 agent，它会自动切回无头。这之前，这里的消息会打进终端，回复照常发回这里。\n${TELL}$`));
   await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
 
   await say(plan(["release", "w/b"]));
@@ -364,6 +370,7 @@ test("story 85: an agent's rh tui and rh release of a slot not its descendant ea
   await until(async () => (await rhodium.state("w/b")) === "未运行", 15_000);
   await until(() => told("w/a").length === 4, 15_000);
   expect(told("w/a")[3]).toBe(`用户同意了你的确认请求：rh release w/b\n结果：w/b 切回无头了。\n${TELL}`);
+  expect([heard("w/a")[1], heard("w/a")[3]].map((t) => t!.slice(0, DECIDED.length))).toEqual([DECIDED, DECIDED]);
   // Rhodium itself said nothing of either switch: not where you answered, nor in w/b's own chat.
   expect(await texts(6)).toEqual(["done", asks("rh tui w/b"), "已回答：同意。", "done", asks("rh release w/b"), "已回答：同意。"]);
   expect((await rhodium.im.log("qb", ME)).map((p) => p.text)).toEqual(["done"]);

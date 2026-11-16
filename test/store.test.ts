@@ -35,6 +35,7 @@ const samples: { [T in keyof Tables]: Insert<Tables[T]> } = {
   ask: { slot: "S", kind: "question", requestId: "r1", status: "open", deadline: now + 1 },
   quota: { kind: "qq_passive", owner: "IN", used: 1, resetsAt: now },
   meta: { id: "boot", value: "1" },
+  replyImage: { conversation: "C", path: "/tmp/shot.png", at: now, by: "loop", hash: "ab".repeat(32), name: "shot.png" },
 };
 
 test("a new database has every spec table, each row gets a ULID and the machine name", () => {
@@ -84,7 +85,11 @@ test("#276: a slot on the old ultracode level reopens on xhigh with ultracode on
   db.run("ALTER TABLE bot DROP COLUMN rowHash"); // #300's, after it
   db.run("ALTER TABLE slot DROP COLUMN turnStartedAt"); // #329's, after that
   beforeOwners(db); // #449's, after that
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 8}`);
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 16}`);
   db.close();
 
   const again = openStore(path);
@@ -101,7 +106,11 @@ test("#300: a bot from the release before keeps the hash of its / menu and has n
   db.run("ALTER TABLE bot DROP COLUMN rowHash");
   db.run("ALTER TABLE slot DROP COLUMN turnStartedAt"); // #329's, after it
   beforeOwners(db); // #449's, after that
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 7}`);
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 15}`);
   db.close();
 
   const again = openStore(path);
@@ -109,11 +118,17 @@ test("#300: a bot from the release before keeps the hash of its / menu and has n
   again.close();
 });
 
-/** Takes #449's migration back: a bot's one ownerId, no list of owners. And #489's, #506's, #593's and #601's, after it. */
+/** Takes #712's migration back. */
+function dropTyped(db: Database): void {
+  for (const col of ["typedAt", "typed", "resentAt", "noticedAt"]) db.run(`ALTER TABLE agentInput DROP COLUMN ${col}`);
+}
+
+/** Takes #449's migration back: a bot's one ownerId, no list of owners. And #489's, #506's, #593's, #601's, #664's, #668's, #669's and #710's, after it. */
 function beforeOwners(db: Database): void {
   db.run("ALTER TABLE bot ADD COLUMN ownerId TEXT");
   for (const col of ["owners", "pairAdd"]) db.run(`ALTER TABLE bot DROP COLUMN ${col}`);
-  for (const col of ["startedIdleAt", "activeAt", "pinnedAt", "webAt", "turnToldYou", "turnPlanTimedOut"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
+  for (const col of ["startedIdleAt", "activeAt", "pinnedAt", "webAt", "turnToldYou", "turnPlanTimedOut", "tuiStatus", "imAt", "tuiInput"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
+  db.run("DROP TABLE replyImage");
 }
 
 test("#506: a slot from the release before was last active as its turn began, running, else as its last turn ended; one that never ran, never; none is pinned", () => {
@@ -126,12 +141,37 @@ test("#506: a slot from the release before was last active as its turn began, ru
   });
   first.close();
   const db = new Database(path);
-  for (const col of ["activeAt", "pinnedAt", "webAt", "turnToldYou", "turnPlanTimedOut"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 3}`);
+  for (const col of ["activeAt", "pinnedAt", "webAt", "turnToldYou", "turnPlanTimedOut", "tuiStatus", "imAt", "tuiInput"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`);
+  db.run("DROP TABLE replyImage"); // #669's, after them
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 11}`);
   db.close();
 
   const again = openStore(path);
   expect(again.tx((tx) => tx.find("slot", {})).map((s) => [s.id, s.activeAt, s.pinnedAt])).toEqual([["I", 4, null], ["N", null, null], ["R", 5, null]]);
+  again.close();
+});
+
+test("#668: a slot from the release before has no time of your last writing to it in IM, and the one kept of the board goes, so rh send me is pushed till you write there again", () => {
+  const path = freshPath();
+  const first = openStore(path);
+  first.tx((tx) => void tx.insert("slot", { ...samples.slot, id: "A", name: "a", webAt: 5 }));
+  first.close();
+  const db = new Database(path);
+  for (const col of ["imAt", "tuiInput"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`); // #710's, after it
+  db.run("DROP TABLE replyImage"); // #669's, after it
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 7}`);
+  db.close();
+
+  const again = openStore(path);
+  expect(again.tx((tx) => tx.find("slot", {})).map((s) => [s.webAt, s.imAt])).toEqual([[null, null]]);
   again.close();
 });
 
@@ -147,7 +187,11 @@ test("#449: a bot's one owner from the release before is its one paired owner; T
   const db = new Database(path);
   beforeOwners(db);
   db.run("UPDATE bot SET ownerId = 'you' WHERE id IN ('T', 'Q')");
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 5}`);
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 13}`);
   db.close();
 
   const again = openStore(path);
@@ -157,6 +201,84 @@ test("#449: a bot's one owner from the release before is its one paired owner; T
     ["T", '["you"]', '{"you":"m"}', '{"you":"r"}'],
   ]);
   expect(again.tx((tx) => tx.get("bot", "T"))).not.toHaveProperty("ownerId");
+  again.close();
+});
+
+test("#664: a slot in the terminal from the release before has no word of its agent's status yet", () => {
+  const path = freshPath();
+  const first = openStore(path);
+  first.tx((tx) => void tx.insert("slot", { ...samples.slot, id: "T", name: "t", mode: "tui" }));
+  first.close();
+  const db = new Database(path);
+  for (const col of ["tuiStatus", "imAt", "tuiInput"]) db.run(`ALTER TABLE slot DROP COLUMN ${col}`); // #668's, after it
+  db.run("DROP TABLE replyImage"); // #669's, after them
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 8}`);
+  db.close();
+
+  const again = openStore(path);
+  expect(again.tx((tx) => tx.get("slot", "T"))!.tuiStatus).toBeNull();
+  again.tx((tx) => tx.update("slot", { id: "T" }, { tuiStatus: "idle" }));
+  expect(again.tx((tx) => tx.get("slot", "T"))!.tuiStatus).toBe("idle");
+  again.close();
+});
+
+test("#669: a database that ran #664's and #668's steps already gets the reply picture table and keeps its rows and their columns", () => {
+  const path = freshPath();
+  const first = openStore(path);
+  first.tx((tx) => void tx.insert("slot", { ...samples.slot, id: "T", name: "t", tuiStatus: "idle", imAt: 7 }));
+  first.close();
+  const db = new Database(path);
+  db.run("DROP TABLE replyImage");
+  db.run("ALTER TABLE slot DROP COLUMN tuiInput"); // #710's, after it
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 6}`);
+  db.close();
+
+  const again = openStore(path);
+  expect(again.tx((tx) => [tx.get("slot", "T")!.tuiStatus, tx.get("slot", "T")!.imAt, tx.insert("replyImage", samples.replyImage).path, tx.find("replyImage", { conversation: "C", path: "/tmp/shot.png" }).length])).toEqual(["idle", 7, "/tmp/shot.png", 1]);
+  again.close();
+});
+
+test("#710: a slot in the terminal from the release before has no word yet of whether its terminal takes typing", () => {
+  const path = freshPath();
+  const first = openStore(path);
+  first.tx((tx) => void tx.insert("slot", { ...samples.slot, id: "T", name: "t", mode: "tui", tuiStatus: "idle" }));
+  first.close();
+  const db = new Database(path);
+  db.run("ALTER TABLE slot DROP COLUMN tuiInput");
+  db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
+  dropTyped(db); // #712's, after that
+  db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 5}`);
+  db.close();
+
+  const again = openStore(path);
+  expect(again.tx((tx) => [tx.get("slot", "T")!.tuiStatus, tx.get("slot", "T")!.tuiInput])).toEqual(["idle", null]);
+  again.tx((tx) => tx.update("slot", { id: "T" }, { tuiInput: "dialog" }));
+  expect(again.tx((tx) => tx.get("slot", "T"))!.tuiInput).toBe("dialog");
+  again.close();
+});
+
+test("#692: a slot from the release before is not held up over its memory limit", () => {
+  const path = freshPath();
+  const first = openStore(path);
+  first.tx((tx) => void tx.insert("slot", { ...samples.slot, id: "M", name: "m" }));
+  first.close();
+  const db = new Database(path);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked");
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 1}`);
+  db.close();
+
+  const again = openStore(path);
+  expect(again.tx((tx) => tx.get("slot", "M")!.memBlocked)).toBeNull();
   again.close();
 });
 

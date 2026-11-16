@@ -73,7 +73,7 @@ async function repositories(): Promise<void> {
 
 /** Runs your clone's upgrade.sh for the instance, with no terminal, as the dev agent runs it once a
  *  PR is merged (deploy/README.md). */
-async function upgrade(ref?: string, note?: string) {
+async function upgrade(ref?: string, note?: string, from = checkout()) {
   // RHODIUM_SOCKET as your shell may have it, for another instance: upgrade.sh must not use it.
   const env = {
     ...rhodium.env,
@@ -83,7 +83,7 @@ async function upgrade(ref?: string, note?: string) {
     TMPDIR: tmp(),
   };
   const argv = [...(note === undefined ? [] : ["-m", note]), `${rhodium.unitPrefix}rhodium`, ...(ref === undefined ? [] : [ref])];
-  return exec([join(checkout(), "deploy/upgrade.sh"), ...argv], { env, timeoutMs: 120_000 });
+  return exec([join(from, "deploy/upgrade.sh"), ...argv], { env, timeoutMs: 120_000 });
 }
 
 /** upgrade.sh's stderr but for systemd's warning that the unit changed on disk. Nothing of this
@@ -118,10 +118,15 @@ test("story 149: upgrade.sh installs origin/main as it is after a fetch, switche
   const pid = await mainPid(unit);
   const merged = await merge("good"); // your clone has not fetched it
 
-  const r = await upgrade();
+  const r = await upgrade(undefined, "加了一个按钮");
   expect(stderr(r)).toBe("");
   expect(r.code).toBe(0);
   expect(r.out).toContain(`Claude 2.1.304`); // rh doctor's report
+  // #698: what the instance runs now, in your clone, for the next agent to read.
+  const running = readFileSync(join(checkout(), "deploy/RUNNING.txt"), "utf8");
+  expect(running).toContain(`- 版本：${version}\n- 提交：${merged}\n`);
+  expect(running).toMatch(/^- 时间：\d{4}-\d\d-\d\d \d\d:\d\d$/m);
+  expect(running).toContain("- 说明：加了一个按钮\n");
   expect(current()).toStartWith(`versions/${version}-${merged}-`);
   expect(readlinkSync(join(opt(), "previous"))).toBe(first);
   expect(existsSync(join(opt(), current(), "rh"))).toBe(true);
@@ -203,6 +208,7 @@ test("story 149: when rh doctor reports an error after the upgrade, upgrade.sh g
   expect(r.out).toMatch(/^错误：/m);
   expect(r.err).toContain(`going back to ${first.slice("versions/".length)}`);
   expect(current()).toBe(first);
+  expect(existsSync(join(checkout(), "deploy/RUNNING.txt"))).toBe(false);
   expect(existsSync(join(opt(), "previous"))).toBe(false);
   expect(await mainPid(unit)).not.toBe(pid);
   expect(await answers()).toBe(true);
@@ -250,11 +256,16 @@ test("story 149: when the new rhodium has migrated the database and then fails, 
   rhodium = newInstance();
   updateClaude(rhodium, "2.1.304");
   const { first } = await firstInstall();
-  await merge("migrating");
+  const merged = await merge("migrating");
+  // #698: run from a linked worktree, it still says in your clone what the instance runs now.
+  const wt = join(rhodium.dir, "wt");
+  await git(checkout(), "worktree", "add", "--quiet", "--detach", wt);
 
-  const r = await upgrade();
+  const r = await upgrade(undefined, undefined, wt);
   expect(r.code).toBe(1);
   expect(r.err).toMatch(/schema \d+ to 1000/);
   expect(r.err).not.toContain("going back");
   expect(current()).not.toBe(first);
+  expect(readFileSync(join(checkout(), "deploy/RUNNING.txt"), "utf8")).toContain(`- 提交：${merged}\n`);
+  expect(existsSync(join(wt, "deploy/RUNNING.txt"))).toBe(false);
 }, 40_000);

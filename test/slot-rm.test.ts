@@ -1,8 +1,8 @@
 // rh rm (product §4, architecture §9.8): only you delete a slot, archived and with its process stopped.
 // Rhodium forgets its own records of it; a chat rh use points at it goes back to its bot's default.
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -63,6 +63,7 @@ test("stories 532, 533: rh rm of an archived, stopped slot rh use points at forg
 }, 60_000);
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-slot-rm-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const ctx: Ctx = {
   now: Date.parse("2026-10-28T12:00:00Z"),

@@ -1,7 +1,7 @@
 // The rhodium daemon: single-instance lock, boot number, the main loop and its clock,
 // the rh socket and the IM bots' inbound streams (architecture §2, §5, §8, §9.1).
 import { dlopen } from "bun:ffi";
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { AGENT_KINDS, AGENTS } from "./agents";
@@ -14,16 +14,18 @@ import { createDoctor } from "./doctor";
 import { fakeBotFromConfig } from "./fake-im";
 import { makeFeishu } from "./feishu";
 import { keepFile, mediaLine, storeAttachments } from "./media";
+import { replyPictures, saidPictures } from "./reply-images";
 import { freeDisk, trace, upkeep } from "./ops";
 import { amid } from "./platforms";
 import { makeQQ, msgSeq } from "./qq";
 import { clip } from "./render";
-import { BOARD, chatName, menus, route, type Ctx, type Decision, type Effect, type Payload, type RhReply, type State, type Write } from "./router";
+import { BOARD, chatName, IN_TUI, menus, route, type Ctx, type Decision, type Effect, type Payload, type RhReply, type State, type Write } from "./router";
 import { createRunner } from "./runner";
-import { B32, MODEL_INFO, namesOf, openStore, setMeta, ulid, untaken, type EventSource, type Outbound, type Store, type Tx } from "./store";
+import { B32, MODEL_INFO, namesOf, openStore, setMeta, ulid, untaken, type AgentInput, type EventSource, type Outbound, type Store, type Tx } from "./store";
 import { makeTelegram } from "./telegram";
 import { recentMessages } from "./transcript";
 import { ancestors, createTui } from "./tui";
+import { watchMemory } from "./memory";
 
 // rh read shows this many of the slot's last messages, each cut to this many characters.
 const READ_COUNT = 10;
@@ -31,9 +33,20 @@ const READ_MAX = 500;
 /** The most rh send waits for its messages to you to be tried, to say where they went (architecture §8.7). */
 const SEND_WAIT = 15_000;
 
-/** One JSON object per line on stderr, which journald keeps. */
+/** One JSON object per line on stderr, which journald keeps. Not console.error: Bun colors that
+ *  red when FORCE_COLOR is set, and the escapes break the line as JSON (#741). Not process.stderr.write:
+ *  on a full pipe Bun queues the rest for later, so another write lands mid-line or an exit cuts it.
+ *  Bun makes fd 2 non-blocking, so writeSync may write part of the line or fail with EAGAIN: loop. */
 export function log(msg: string, fields: Record<string, unknown> = {}): void {
-  console.error(JSON.stringify({ msg, ...fields }));
+  const line = Buffer.from(JSON.stringify({ msg, ...fields }) + "\n");
+  for (let off = 0; off < line.length; ) {
+    try {
+      off += writeSync(2, line, off);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EAGAIN") return; // stderr is gone: nowhere to log
+      Bun.sleepSync(1);
+    }
+  }
 }
 
 /** 8 random Crockford base32 characters, 40 bits: a pairing code to type on a phone. */
@@ -64,10 +77,15 @@ export function createLoop(opts: {
   front?: Ctx["front"]; // whether a page of the board is in front (board.ts's serveBoard)
   retarget?: Ctx["retarget"];
   stepped?: () => void; // after each batch of inputs has committed and its effects are handed off
+  pictures?: (conversation: string) => void; // the rows of the local pictures in what its agent said are written (architecture §8.3)
 }): Loop {
   const { store, config, perform, capabilities = () => undefined, stepped = () => {}, retarget = () => null, front = () => false } = opts;
   const queue: Batch[] = [];
   let draining = false;
+  const media = join(config.stateDir, "media");
+  // Each conversation's message last written whole by its agent's process, and when its pictures were
+  // checked: a final reply of the same text is not checked again (reply-images.ts's replyPictures).
+  const said = new Map<string, { text: string; at: number }>();
 
   // The clock: a timer that comes due becomes an input. Timers live only in memory;
   // whoever arms one re-arms it from the state tables after a restart.
@@ -96,6 +114,7 @@ export function createLoop(opts: {
 
   function step({ inputs, writes }: Batch): void {
     let effects: Effect[];
+    const pictured = new Set<string>();
     try {
       effects = store.tx((tx) => {
         const effects: Effect[] = [];
@@ -104,8 +123,24 @@ export function createLoop(opts: {
           const slots = tx.find("slot", {});
           const held = tx.find("outbound", { status: "held" });
           const queued = tx.find("agentInput", { status: "queued" });
+          // What was typed into a terminal and is not known taken (architecture §10.5).
+          const typed = (["queued", "writing", "written", "unknown"] as const).flatMap((status) => (status === "queued" ? queued : tx.find("agentInput", { status }))).filter((i) => i.typedAt !== null);
           const unsure = input.kind === "agent" && input.event.type === "exit" ? untaken(tx, input.event.conv) : [];
+          // A turn ends with a reply: its local pictures as checked, for the router to send to IM
+          // (architecture §8.3). Checked now, where no message just written was the same text, the
+          // pages are told of the rows as ever.
+          // A turn in the terminal too, its reply read off the transcript (architecture §10.6).
+          const ended =
+            input.kind === "agent" && input.event.type === "turn_end" && input.event.reply
+              ? { conv: input.event.conv, reply: input.event.reply }
+              : input.kind === "tui_turn" && "end" in input && input.end.reply
+                ? { conv: input.end.conv, reply: input.end.reply }
+                : null;
+          const rows = ended ? tx.find("replyImage", { conversation: ended.conv }).length : 0;
+          const pictures = ended && replyPictures(tx, media, ended.conv, ended.reply, said.get(ended.conv), Date.now());
+          if (ended && tx.find("replyImage", { conversation: ended.conv }).length > rows) pictured.add(ended.conv);
           const state = {
+            pictures,
             workspaces: tx.find("workspace", {}),
             slots,
             conversations: tx.find("conversation", {}),
@@ -113,9 +148,12 @@ export function createLoop(opts: {
             chats: tx.find("chat", {}),
             holders: tx.find("holder", {}),
             queued,
+            typed,
             quotas: [
               ...tx.find("quota", { kind: "qq_active" }),
               ...slots.flatMap((s) => (s.turnInbound ? tx.find("quota", { kind: "qq_passive", owner: s.turnInbound }) : [])),
+              // A picture that failed after its turn ended: its line may still reply to that turn's message.
+              ...(input.kind === "send_failed" && input.inbound ? tx.find("quota", { kind: "qq_passive", owner: input.inbound }) : []),
             ],
             held,
             seen: input.kind === "im" ? seen(tx, input.message) : input.kind === "board" && store.traced(input.id).length > 0,
@@ -133,7 +171,7 @@ export function createLoop(opts: {
                   : [],
             unsure,
             chatOf: Object.fromEntries(
-              [...queued, ...unsure].flatMap((i) => {
+              [...queued, ...unsure, ...typed].flatMap((i) => {
                 const chat = i.source === "human" && i.trace ? tx.get("inbound", i.trace)?.chat : undefined;
                 return chat ? [[i.id, chat]] : [];
               }),
@@ -150,6 +188,14 @@ export function createLoop(opts: {
           const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, herdr, front, retarget, inboundOf });
           for (const w of d.writes) apply(tx, w);
           for (const e of d.events) tx.append(e);
+          // A message of the agent's is whole: its local pictures are checked and kept now, as rh send's
+          // files are, reading the disk here and not in the router (architecture §8.3).
+          if (input.kind === "agent" && input.event.type === "item" && input.event.item.kind === "message") {
+            const at = Date.now();
+            said.set(input.event.conv, { text: input.event.item.text, at });
+            if (saidPictures(tx, media, input.event.conv, input.event.item.text, at)) pictured.add(input.event.conv);
+          }
+          if (input.kind === "agent" && input.event.type === "exit") said.delete(input.event.conv);
           // Every change of a slot's state or mode goes on the event table, which the board's live
           // view follows (architecture §7.2), whichever part of the router made it. web: in a turn
           // your message on the board began, or at its end, which the web reminds you of alone.
@@ -161,8 +207,12 @@ export function createLoop(opts: {
           // So does each change of the board's queue (spec web-write "待发队列"): a turn's end may hand
           // what you queued to the agent, or hold it, with the slot's state as it was (#580). Of no
           // slot, as 详情 has nothing to say of it.
-          const board = (rows: typeof queued) => rows.flatMap((i) => (i.queueReason && i.source === "human" && i.trace && !tx.get("inbound", i.trace) ? [`${i.id} ${i.conversation} ${i.queueReason}`] : [])).join();
-          if (board(queued) !== board(tx.find("agentInput", { status: "queued" }))) tx.append({ source: input.kind, type: "board_queue" });
+          // What waits for a slot's switch back from the terminal is in its queue too (product §4.2).
+          // And what was typed there and is not known taken.
+          const listed = (i: AgentInput) => (i.queueReason && i.source === "human" && i.trace && !tx.get("inbound", i.trace)) || i.queueReason === IN_TUI;
+          const board = (rows: typeof queued) => rows.flatMap((i) => (listed(i) ? [`${i.id} ${i.conversation} ${i.queueReason} ${i.status}`] : [])).join();
+          const unsettled = () => [...tx.find("agentInput", { status: "queued" }), ...(["writing", "written", "unknown"] as const).flatMap((status) => tx.find("agentInput", { status, queueReason: IN_TUI }))];
+          if (board([...queued, ...typed.filter((i) => i.status !== "queued" && i.queueReason === IN_TUI)]) !== board(unsettled())) tx.append({ source: input.kind, type: "board_queue" });
           effects.push(...d.effects);
         }
         for (const w of writes) apply(tx, w);
@@ -176,6 +226,7 @@ export function createLoop(opts: {
       }
       return;
     }
+    for (const c of pictured) opts.pictures?.(c);
     for (const e of effects) {
       try {
         if (e.kind === "timer") arm(e);
@@ -202,13 +253,14 @@ export function createLoop(opts: {
 }
 
 /** The message m quotes, your message or Rhodium's in the same chat (architecture §8.3): its stored
- *  text, and the slot whose rh send to you it was, if that went led by the slot's name (product §5.3). */
+ *  text, and the slot whose rh send to you it was, or whose final reply (router's tellReply()), if that
+ *  went led by the slot's name (product §5.3). */
 function quoted(tx: Tx, store: Store, m: InboundMessage): State["quoted"] {
   const chat = m.quote && tx.find("chat", { bot: m.bot, platformChatId: m.chat })[0];
   if (!chat) return null;
   const where = { chat: chat.id, ref: m.quote!.ref };
   const sent = tx.find("outbound", where)[0];
-  const e = sent?.trace ? store.traced(sent.trace).find((e) => e.type === "send_me") : undefined;
+  const e = sent?.trace ? store.traced(sent.trace).find((e) => e.type === "send_me" || e.type === "final_reply") : undefined;
   return { text: (tx.find("inbound", where)[0] ?? sent)?.text ?? null, slot: (e?.data as { named?: true } | null)?.named ? e!.slot : null };
 }
 
@@ -389,8 +441,8 @@ async function send(store: Store, adapters: Map<string, ImAdapter>, id: string, 
   // The router sends it some other way (product §5.5). A hint that can't go out has nothing to wait
   // for; nor has a held message refused again on a fresh passive reply, likely for good (moderation).
   if (r.status === "failed" && (r.quota || r.refused) && !job.payload.hint && !job.payload.released) {
-    loop.enqueue({ kind: "refused", outbound: id, chat: chat.id, inbound: job.row.replyTo, payload: job.row.payload!, quota: !!r.quota });
-  } else if (r.status === "failed") loop.enqueue({ kind: "send_failed", payload: job.row.payload! });
+    loop.enqueue({ kind: "refused", outbound: id, chat: chat.id, inbound: job.row.replyTo, payload: job.row.payload!, quota: !!r.quota, trace: job.row.trace });
+  } else if (r.status === "failed") loop.enqueue({ kind: "send_failed", payload: job.row.payload!, chat: chat.id, inbound: job.row.replyTo, trace: job.row.trace });
 }
 
 /** rh send's receipt where n of its total messages went to another chat than from, to, their
@@ -580,12 +632,14 @@ export async function runDaemon(args: string[]): Promise<void> {
 
   // The board's pages open, and whether each is in front, which rh send me asks (product §5.9).
   const fronts: Fronts = new Map();
+  const hearing = new Set<Hear>(); // the board, once it is up
   const loop = createLoop({
     store,
     config,
     capabilities,
     front: () => inFront(fronts),
     stepped: () => syncMenus(),
+    pictures: (conversation) => hearing.forEach((hear) => hear(conversation, { type: "pictures" })),
     retarget(from, to) {
       const done = renameTarget(configPath, from, to);
       // So too the config as read at start: the file may say so only now, or not yet.
@@ -668,6 +722,8 @@ export async function runDaemon(args: string[]): Promise<void> {
           return tui.open(e.slot);
         case "tui_back":
           return tui.back(e.slot, e.force);
+        case "tui_peek":
+          return tui.peek(e.slot, e.input);
         case "tab_label":
           return tui.label(e.slot);
         case "import":
@@ -803,14 +859,13 @@ export async function runDaemon(args: string[]): Promise<void> {
       loop.enqueue({ kind: "notice", text: `rh doctor 自检：\n${text}` });
     },
   });
-  const tui = createTui({ cfg: config, store, loop });
-  const hearing = new Set<Hear>(); // the board, once it is up
+  const tui = createTui({ cfg: config, store, loop, capabilities });
   const runner = createRunner({
     cfg: config,
     store,
     boot,
     loop,
-    capabilities: (bot) => adapters.get(bot)?.capabilities,
+    capabilities,
     onVersion: (v) => doctor.versionSeen(v),
     inUse: tui.inUse,
     writing: (conversation, e) => hearing.forEach((hear) => hear(conversation, e)),
@@ -861,6 +916,8 @@ export async function runDaemon(args: string[]): Promise<void> {
   // Wakes waiting for room, only now: recover starts any slot it finds starting, so a slot this
   // had started before it would have been started twice.
   loop.enqueue({ kind: "recovery" });
+  // Holder units held up over MemoryHigh (architecture §4.2).
+  watchMemory({ cfg: config, store, loop });
   // A build the main chat has not heard of says so there, once, with the note upgrade.sh built it
   // with (architecture §12). Run from source with no commit, it is no build to tell of.
   if (COMMIT && store.tx((tx) => tx.get("meta", "toldBuild")?.value) !== BUILD) {
@@ -875,9 +932,15 @@ export async function runDaemon(args: string[]): Promise<void> {
   for (const s of store.tx((tx) => tx.find("slot", { state: "rate_limited" }))) loop.enqueue({ kind: "clock", timer: "quota_reset", key: s.id });
   // And the minute clock of a step a turn's message shows running (im-style §3.1), which shows the
   // minutes at once; it stops once no step runs.
-  for (const s of store.tx((tx) => [...tx.find("slot", { state: "running" }), ...tx.find("slot", { state: "waiting" })])) {
+  // A slot's in the terminal too, its turn read off the transcript (architecture §10.6).
+  for (const s of store.tx((tx) => [...tx.find("slot", { state: "running" }), ...tx.find("slot", { state: "waiting" }), ...tx.find("slot", { mode: "tui" })])) {
     if (s.conversation) loop.enqueue({ kind: "clock", timer: "tool_running", key: s.conversation });
   }
+  // And the clock of what waits for each slot in the terminal (architecture §10.5).
+  for (const s of store.tx((tx) => tx.find("slot", { mode: "tui" }))) loop.enqueue({ kind: "clock", timer: "tui_held", key: s.id });
+  // And of what was typed into one and is not known to have got there, of which you have yet to hear.
+  const typedIn = store.tx((tx) => (["writing", "written", "unknown"] as const).flatMap((status) => tx.find("agentInput", { status, queueReason: IN_TUI })));
+  for (const i of typedIn) if (i.typedAt !== null && i.noticedAt === null) loop.enqueue({ kind: "clock", timer: "tui_unconfirmed", key: i.id });
   // And the notice of a quota wait you have yet to hear of, at once.
   // Each agent's, as its quota is its own.
   const untold = store.tx((tx) => tx.find("slot", { state: "rate_limited", quotaUntold: 1 }).map((s) => tx.get("conversation", s.conversation!)?.agent));

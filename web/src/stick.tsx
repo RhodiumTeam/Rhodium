@@ -6,7 +6,7 @@ import { ArrowDown } from "lucide-react";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { Button } from "./components/ui/button";
-import { useEdges } from "./write";
+import { useEdges } from "./common";
 
 const NEAR = 400; // px from the top where the page before is brought
 const END = 40; // px from the bottom that count as at the newest

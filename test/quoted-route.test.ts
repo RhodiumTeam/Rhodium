@@ -1,13 +1,14 @@
 // Your quote of another slot's rh send to you, led by its name, goes to that slot (product §5.3, story 589),
 // seen from the router: a common command goes as ever, and an ask pushed here does not take it.
-import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
 import { route, type Ctx, type State } from "../src/router";
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-quoted-route-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const now = Date.parse("2026-11-06T12:00:00Z");
 const ctx: Ctx = {
@@ -85,4 +86,28 @@ test("story 589: w/b in TUI, your quote of it is refused, and the /rh_release yo
   Object.assign(s.slots[1]!, { mode: "tui", herdrLostAt: null });
   const sent = im("the old one", s).writes.find((w) => w.op === "insert" && w.table === "outbound") as { row: { payload: string } };
   expect(JSON.parse(sent.row.payload).text).toContain("发 /rh_release w/b 把它切回无头");
+});
+
+/** Whose time of your last writing to it in IM the decision sets, and whether the chat's own. */
+const wrote = (d: ReturnType<typeof im>) => ({
+  im: d.writes.flatMap((w) => (w.op === "update" && w.table === "slot" && "imAt" in w.patch ? [w.where.id] : [])),
+  chat: d.writes.some((w) => w.op === "update" && w.table === "chat" && "contactedAt" in w.patch),
+});
+
+test("story 594: where you last wrote goes by the slot: your quote of w/b's marks w/b, not w/a this chat goes to; a button answering an ask, or words to one pushed here, mark the ask's slot", () => {
+  expect(wrote(im("the old one", state()))).toEqual({ im: ["b"], chat: true });
+  const plain = (asks: unknown[] = []) => ({ ...state(asks), quoted: null });
+  expect(wrote(im("hi", plain(), false))).toEqual({ im: ["a"], chat: true });
+  const perm = { ...ask, kind: "permission", requestId: "r1", prompt: JSON.stringify({ tool: "Bash", input: { command: "ls" } }), listNo: null, pickedAt: null };
+  const press = route(state([perm]), { kind: "im", message: { bot: "q", chat: "me", messageId: "m", sender: "me", text: "", at: now, button: { data: "ask:k:1", message: "m0" } } }, ctx);
+  expect(wrote(press)).toEqual({ im: ["c"], chat: true });
+  expect(wrote(im("1", plain([perm]), false))).toEqual({ im: ["c"], chat: true });
+});
+
+test("story 594: /rh_use pointing this chat at a slot marks that you wrote to it in IM, and leaves the chat's own time", () => {
+  expect(wrote(im("/rh_use w/b", { ...state(), quoted: null }, false))).toEqual({ im: ["b"], chat: false });
+  // Pointed at it already: nothing changes but that, so its rh send me is pushed again.
+  const bound = { ...state(), quoted: null };
+  bound.chats[0]!.target = "b";
+  expect(wrote(im("/rh_use w/b", bound, false))).toEqual({ im: ["b"], chat: false });
 });

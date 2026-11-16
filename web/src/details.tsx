@@ -6,12 +6,12 @@ import { cn } from "cn";
 import { Check, ChevronRight, CircleQuestionMark, Flag, Globe, MessageSquare, Power, RotateCcw, Send, Square, TriangleAlert, X, type LucideIcon } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { moment, span } from "../../src/panels";
-import { Box } from "./common";
+import { Box, useEdges } from "./common";
 import { Events, type SlotData, type SlotEvent } from "./data";
 import { Stick } from "./stick";
 import { inTurn, Timeline } from "./timeline";
 import { toast } from "./toast";
-import { act, Spin, useAct, useEdges } from "./write";
+import { act, Spin, useAct } from "./write";
 
 export const KIND: Record<string, string> = { question: "选择题", plan: "计划确认", permission: "审批", confirm: "确认请求" };
 const ASKED: Record<string, string> = { deferred: "等你", open: "等你", answered: "已答", delivered: "已答", timeout: "超时", cancelled: "作废" };
@@ -92,7 +92,7 @@ export function Details({ d }: { d: SlotData }) {
   const timeline = useEdges<HTMLDetailsElement>(); // its cut ends fading (#638)
   return (
     <>
-      {d.process && <ProcessLine p={d.process} slot={d.id} />}
+      {d.process && <ProcessLine p={d.process} slot={d.id} memory={d.memory} />}
       <Settings d={d} />
       {/* Folded: the events are what 详情 is read for. */}
       {d.timeline.length > 0 && (
@@ -170,8 +170,9 @@ function Sent({ s }: { s: NonNullable<SlotEvent["sends"]>[number] }) {
 }
 
 /** A headless slot's process in a line, and the end of its stderr a tap away when it has some. One that
- *  runs has a key at the right that stops it, its conversation kept (story 270). */
-function ProcessLine({ p, slot }: { p: NonNullable<SlotData["process"]>; slot: string }) {
+ *  runs has a key at the right that stops it, its conversation kept (story 270). Held up over its memory
+ *  limit, what its unit uses and the limit under it (#692). */
+function ProcessLine({ p, slot, memory }: { p: NonNullable<SlotData["process"]>; slot: string; memory?: string }) {
   const [dot, state] = RUNS[p.activeState] ?? ["bg-idle", "已退出"];
   const says = [state, p.activeState === "active" && p.pid && `PID ${p.pid}`, state === "已退出" && p.exitStatus != null && `退出码 ${p.exitStatus}`];
   const [busy, run] = useAct();
@@ -186,6 +187,12 @@ function ProcessLine({ p, slot }: { p: NonNullable<SlotData["process"]>; slot: s
           </button>
         )}
       </div>
+      {memory && (
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-muted-foreground">内存</span>
+          <span className="tabular-nums">{memory}</span>
+        </div>
+      )}
       {p.stderr.length > 0 && (
         <details>
           <summary className="cursor-pointer text-sm text-muted-foreground transition-colors hover:text-foreground">错误输出</summary>

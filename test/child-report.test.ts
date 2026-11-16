@@ -1,8 +1,8 @@
 // A child's result reaches you once, from its parent (stories 577-579; product §6.1, architecture
 // §9.2, §9.3): no report of a turn you began or joined, a child you are not talking to has its rh
 // send me refused, and rh send's receipt names the chat it went to.
-import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { timeoutAnswer } from "../src/asks";
@@ -14,6 +14,7 @@ import { BOARD, route, type Ctx, type Decision, type State } from "../src/router
 import type { Chat, Slot } from "../src/store";
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-child-report-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const ctx: Ctx = {
   now: Date.parse("2026-11-06T12:00:00Z"),
@@ -52,13 +53,14 @@ const reports = (d: Decision) => d.writes.flatMap((w) => (w.op === "insert" && w
 const told = (d: Decision) => d.writes.flatMap((w) => (w.op === "insert" && w.table === "outbound" ? [JSON.parse(w.row.payload as string).text as string] : []));
 const marked = (d: Decision) => d.writes.some((w) => w.op === "update" && w.table === "slot" && "reported" in w.patch);
 
-test("story 578: a report says the child told you nothing itself, and one of it stuck that you have the ask or the crash notice already", () => {
+test("story 590: a report no longer says the child told you nothing itself, which it never can; one of it stuck says you have the ask or the crash notice already", () => {
   const [done] = reports(end(state()));
-  expect(done).toContain("子槽位 w/c 完成了。最后一条回复的开头：all 12 wicks trimmed\n它没有直接告诉用户。\n");
+  expect(done).toContain("子槽位 w/c 完成了。最后一条回复的开头：all 12 wicks trimmed\n看它的状态");
   const asked = event(state(), { type: "ask", requestId: "r", kind: "question", tool: "AskUserQuestion", input: { questions: [] } });
-  expect(reports(asked)[0]).toContain("它没有直接告诉用户。提问已经推给用户，不用转告。\n");
+  expect(reports(asked)[0]).toContain("\n提问已经推给用户，不用转告。\n");
   const crashed = event(state(), { type: "exit", proc: 1, code: 1, signal: null, from: "agent" });
-  expect(reports(crashed)[0]).toContain("它没有直接告诉用户。用户已收到崩溃通知，不用转告。\n");
+  expect(reports(crashed)[0]).toContain("\n用户已收到崩溃通知，不用转告。\n");
+  for (const r of [done, reports(asked)[0], reports(crashed)[0]]) expect(r).not.toContain("它没有直接告诉用户");
 });
 
 test("story 579: a child reports no turn you began or joined, from the board or a chat going to it by its bot's default alone, and marks none reported", () => {
@@ -81,10 +83,10 @@ const sendMe = (s: State, token = "c") => {
   return reply.ok ? reply.text : reply.error;
 };
 
-test("stories 577, 578: a child you are not talking to has its rh send me refused; one you are, or with its parent gone, sends, told where it went", () => {
-  expect(sendMe(state())).toContain("结果会随汇报交给父槽位 w/p，由它决定告诉用户什么。把结果和文件路径写进最终回复");
+test("stories 577, 590: a child's rh send me of words is refused, you talking to it or not; with its parent gone, as its parent does, it sends, told where it went", () => {
+  for (const s of [state(), state({ turnChat: BOARD }), state({}, { chat: { target: "c" } }), state({ mode: "tui" })]) expect(sendMe(s)).toStartWith("rh send me 被拒绝：你是子槽位，不能直接给用户发消息。");
   const sent = "已发到 Telegram 私聊。";
-  for (const s of [state({ turnChat: BOARD }), state({}, { chat: { target: "c" } }), state({}, { parent: { archivedAt: 1 } }), state({ mode: "tui" })]) expect(sendMe(s)).toBe(sent);
+  expect(sendMe(state({}, { parent: { archivedAt: 1 } }))).toBe(sent);
   expect(sendMe(state(), "p")).toBe(sent);
 });
 
@@ -103,13 +105,14 @@ test("#601: a child whose plan ask timed out stops to wait for you, so its turn'
   // Reported stuck already this turn, of that ask or one it raised since, and with a background task running.
   const [stuck, ...more] = reports(event(state({ turnPlanTimedOut: 1, reported: "stuck" }), { type: "turn_end", reply: "all 12 wicks trimmed", background: true }));
   expect(more).toEqual([]);
-  expect(stuck).toContain("子槽位 w/c 卡住了。它的计划确认超时，没有批准，停下来等用户回复。最后一条回复的开头：all 12 wicks trimmed\n它没有直接告诉用户。\n");
+  expect(stuck).toContain("子槽位 w/c 卡住了。它的计划确认超时，没有批准，停下来等用户回复。最后一条回复的开头：all 12 wicks trimmed\n看它的状态");
+  expect(stuck).not.toContain("它没有直接告诉用户");
   // Its next turn starts afresh.
   expect(event(state({ turnPlanTimedOut: 1 }), { type: "turn_start" }).writes).toContainEqual({ op: "update", table: "slot", where: { id: "c" }, patch: { turnPlanTimedOut: null } });
 });
 
-test("#601: what asks an agent to tell you a result itself sends one with a parent to rh send me's rule, as a child's may be refused", () => {
-  const rule = "你有父槽位时，见 rh send me 的说明";
+test("#601: what asks an agent to tell you a result itself tells a child to write it in its final reply, as its rh send me is refused", () => {
+  const rule = "你是子槽位时，写在最终回复里";
   expect((timeoutAnswer("plan", { tool: "ExitPlanMode", input: {} }) as { message: string }).message).toContain(`请用 rh send me 把计划摘要发给用户（${rule}）`);
   expect(skillText()).toContain(`由你用 rh send me 告诉用户（${rule}）`);
 });

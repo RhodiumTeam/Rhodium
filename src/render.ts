@@ -5,9 +5,12 @@
 // time the agent finishes saying something, the tool calls before it in a line on top.
 import { homedir } from "node:os";
 import type { AgentEvent, Capabilities } from "./contracts";
+// Each of the two uses only a function of the other's, when called.
+import { forIm } from "./reply-images";
 import { named, NOT_TOOLS, runs, shortLine, type Call } from "./tool-line";
 
-/** A part of a turn: something the agent said, done once it is whole; or the tool calls between two. */
+/** A part of a turn: something the agent said, as it goes to IM (forIm), done once it is whole; or the
+ *  tool calls between two. */
 type Part = { text: string; done?: true } | { tools: Call[] };
 
 export type Progress = {
@@ -43,20 +46,28 @@ export const start = (): Progress => ({ parts: [], running: null, from: [0, 0], 
  *  the call an ask is about shows as the ask (im-style §3.1). */
 export const hide = <P extends Progress>(p: P, id: string | undefined): P => (id ? { ...p, hidden: [...(p.hidden ?? []), id] } : p);
 
-/** Folds one agent event into the turn's progress. */
+/** Folds one agent event into the turn's progress. What the agent says is kept rewritten (forIm), so
+ *  every message of the turn, in Markdown or plain, and every cut of one, comes from that. */
+// ponytail: text that streams is rewritten as it grows, so a picture written inside a code span still
+// open shows as its words until the message is whole; hold the last line back if that shows.
 export function track(p: Progress, e: AgentEvent, v: View): Progress {
   const parts = p.parts.slice();
   const last = parts.at(-1);
   const talking = last && "text" in last && !last.done ? last : undefined;
   // What the agent says next is a new part: a step still running is over by then.
   if (e.type === "text_delta") {
-    if (talking) parts[parts.length - 1] = { text: talking.text + e.text };
-    else parts.push({ text: e.text });
-    return { ...p, parts, running: null };
+    const text = forIm((talking?.text ?? "") + e.text);
+    const i = talking ? parts.length - 1 : parts.length;
+    parts[i] = { text };
+    // A picture or link just completed is rewritten shorter: where the turn's message starts goes
+    // back to the last character both texts share, or what follows it would never show.
+    let at = p.from[0] === i && talking ? Math.min(p.from[1], text.length) : 0;
+    if (at && !text.startsWith(talking!.text.slice(0, at))) for (at = 0; text[at] === talking!.text[at]; ) at++;
+    return { ...p, parts, running: null, from: p.from[0] === i && talking ? [i, at] : p.from };
   }
   if (e.type === "tool_start") return NOT_TOOLS.has(e.name) ? p : { ...p, running: { id: e.id, call: describe(e.name, e.input, v.dir), since: v.now } };
   if (e.type !== "item") return p;
-  const item = e.item;
+  const item = e.item.kind === "message" ? { ...e.item, text: forIm(e.item.text) } : e.item;
   if (item.kind === "message") {
     // The whole of the message the text so far began, else another one.
     if (!talking) return { ...p, parts: [...parts, { text: item.text, done: true }], running: null };
@@ -311,9 +322,10 @@ export function hush<P extends Progress>(p: P, v: View): P {
 /** The turn's last messages on a platform that edits: all of it, the final reply its last part (it
  *  is the agent's last message), without the step still running. The first goes in place of the
  *  turn's message; more follow it where the turn outgrew it. */
-export function finishEdit(p: Progress, reply: string | undefined, v: View): Msg[] {
+export function finishEdit(p: Progress, reply: string | undefined, v: View, tail = ""): Msg[] {
   const talked = p.parts.some((x) => "text" in x && x.text.trim());
-  const all = talked || !reply ? p : { ...p, parts: [...p.parts, { text: reply, done: true as const }] };
+  const more = [...(talked || !reply ? [] : [forIm(reply)]), ...(tail ? [tail] : [])];
+  const all = { ...p, parts: [...p.parts, ...more.map((text) => ({ text, done: true as const }))] };
   return layout(all, v, false).msgs.filter((m) => m.text.trim());
 }
 
@@ -368,14 +380,16 @@ export function append(p: Progress, e: AgentEvent, v: View, room: number): { pro
  *  last of it the final reply; with what waited, in one message where that fits, else with a line
  *  saying how much waited. A turn that said nothing shows its tools and says so. One rh send me took
  *  over (View) says none of it: the tools not sent yet, those after the final reply too, go in one line. */
-export function finish(p: Progress, reply: string | undefined, v: View): string[] {
+export function finish(p: Progress, reply: string | undefined, v: View, tail = ""): string[] {
   const max = v.caps.maxTextLength;
   const calls = p.parts.slice(p.sent).flatMap((x) => ("tools" in x ? x.tools : []));
   const all = [...p.kept];
   if (v.toolsOnly) {
     if (calls.length) all.push(said(calls, "", v));
   } else if (p.parts.some((x) => "text" in x && clean(x.text))) all.push(...spoken(p, p.parts.length - 1, v));
-  else if (reply?.trim() || calls.length) all.push(said(calls, reply?.trim() ? clean(reply) : "这一回合没有回复文字。", v));
+  else if (reply?.trim() || calls.length) all.push(said(calls, reply?.trim() ? clean(forIm(reply)) : "这一回合没有回复文字。", v));
+  // The lines for the final reply's pictures that did not go end the last message, or are one alone.
+  if (tail) all.push([all.pop(), tail].filter(Boolean).join("\n\n"));
   if (all.length <= 1) return chunkText(all[0] ?? "", max);
   const joined = all.join("\n\n");
   if (joined.length <= max) return [joined];
@@ -391,7 +405,7 @@ const FENCE = /^ {0,3}(`{3,}(?=[^`]*$)|~{3,})/;
 const run = (open: string) => FENCE.exec(open)![1]!;
 
 /** The fence open after line, given the one open before it (null for none). */
-function fenced(open: string | null, line: string): string | null {
+export function fenced(open: string | null, line: string): string | null {
   const fence = FENCE.exec(line)?.[1];
   if (!fence) return open;
   if (open === null) return line.trimStart();

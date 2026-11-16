@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { newInstance, type Instance } from "./instance";
 
 let rhodium: Instance;
-afterEach(() => rhodium.cleanup());
+afterEach(() => rhodium?.cleanup());
 
 test("a second rhodium on the same state dir fails to start, and the first keeps serving", async () => {
   rhodium = newInstance();
@@ -63,4 +63,12 @@ test("rh without a running rhodium says it can't connect", async () => {
   const r = await rhodium.rh(["ls"]);
   expect(r.code).toBe(1);
   expect(r.err).toContain(rhodium.socket);
+});
+
+test("#741: a long log() line right before process.exit reaches a pipe whole, uncolored", async () => {
+  const daemon = new URL("../src/daemon.ts", import.meta.url).pathname;
+  const script = `const { log } = await import(${JSON.stringify(daemon)}); log("big", { pad: "x".repeat(1 << 20) }); process.exit(1);`;
+  const proc = Bun.spawn([process.execPath, "-e", script], { env: { ...process.env, FORCE_COLOR: "1" }, stdout: "ignore", stderr: "pipe" });
+  const [err] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  expect(JSON.parse(err.trim()).pad.length).toBe(1 << 20);
 });

@@ -515,9 +515,10 @@ function useInSight(link: RefObject<HTMLAnchorElement | null>, id: string, open:
   return (e: MouseEvent) => open || e.metaKey || e.ctrlKey || e.shiftKey || (clicked = id);
 }
 
-/** One running but not in a turn, as waiting for quota, or that could not switch back: it says why in
- *  place of the last thing said. */
-const whyNot = (c: Card, kind: Kind) => (kind === "running" && c.state !== "运行中") || c.state === "没能切回无头";
+/** One running but not in a turn, as waiting for quota, or that could not switch back, or in the
+ *  terminal, its agent at rest there or a dialog open there, or one held up over its memory limit (#692):
+ *  it says why in place of the last thing said. */
+const whyNot = (c: Card, kind: Kind) => (kind === "running" && c.state !== "运行中") || c.state === "没能切回无头" || c.state.startsWith("TUI 模式") || c.state === "被弹框挡住" || c.state === "内存阻塞";
 
 /** A slot's state in a word: 需要你 or 崩溃, 运行中, or how long ago its turn ended, it was archived, or
  *  it was last active. */

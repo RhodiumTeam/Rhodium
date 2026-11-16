@@ -142,7 +142,7 @@ function fromCodex(v: any): any {
 /** A tool item of Codex's record as a call, by the name its model calls the tool by (architecture
  *  §6.4's table): what it was given, and its output. null for one not known. Only those 0.162.1 was
  *  seen writing: no rollout here had a plan or a dynamic tool's call. */
-function codexCall(item: any): { name: string; arguments: unknown; output: { text: string; error: boolean }; took?: number } | null {
+export function codexCall(item: any): { name: string; arguments: unknown; output: { text: string; error: boolean }; took?: number } | null {
   const failed = item.status !== undefined && item.status !== "completed";
   switch (item.type) {
     case "CommandExecution": // what ran, the last of `zsh -lc`'s words; took: how long it ran, in ms
@@ -191,6 +191,13 @@ function asUser(v: any): any {
   return { ...v, type: "user", uuid: a.source_uuid, message: { role: "user", content: a.prompt } };
 }
 
+// A long message Rhodium typed into a terminal, which Claude took for a paste and wrapped whole in its
+// tag (architecture §7.7, §10.5): with a source line first inside, as if not wrapped.
+function unwrapped(said: string): string {
+  const m = /^\s*<pasted_content\b[^>]*>\n?([\s\S]*?)\n?<\/pasted_content\b[^>]*>\s*$/.exec(said);
+  return m && splitSource(m[1]!).source !== null ? m[1]! : said;
+}
+
 // Claude and pi both nest role and content in `message`.
 function toEntry(offset: number, raw: string): Entry {
   const entry: Entry = { offset, raw };
@@ -212,12 +219,20 @@ export type Result = { at: string; time: number | null; text: string; length?: n
  *  what it sent, by address, once the board has found its send_me event (spec web-images): none, text
  *  alone, [] then. Without it, it may never have run. */
 export type Send = { to: string; text: string; files: string[]; media?: Media[] };
+/** A local picture an agent's message shows, as checked (architecture §8.3): its copy, by address; why
+ *  it did not pass; pending, a headless slot's block just written whose row the main loop has yet to
+ *  write, or one whose copy could not be kept; gone, its copy pruned. */
+export type LocalImage = Media | { why: string } | { pending: true } | { gone: true };
+/** What an agent's message refers to on this machine, by path as decoded (src/local.ts): each picture's
+ *  check, and whether each link gives a file to download, is a code reference, or neither. */
+export type Local = { images: Record<string, LocalImage>; links: Record<string, "file" | "code" | "none"> };
 type Body =
   /** id: what the agent's record names it by, where that is what Rhodium sent it as: Claude's uuid
    *  (frameUuid of its input's id), Codex's client_id (its input's id). media: what it carried, in
    *  place of the lines that say so at its end (architecture §8.3). */
   | { kind: "user"; text: string; source: string | null; id?: string; media?: Media[] }
-  | { kind: "assistant"; text: string }
+  /** local: what it refers to on this machine, which the board adds. */
+  | { kind: "assistant"; text: string; local?: Local }
   | { kind: "thinking"; text: string; length?: number }
   /** input: its arguments as JSON, only their start where length is given; shown: its name and argument
    *  as a detailed tool line has them; result: if on the same page; send: the rh send to you it runs. */
@@ -299,7 +314,7 @@ function blocksOf(offset: number, raw: string, max: number, dir: string, keep?: 
         add({ kind: "system", title: "你打断了回合", text: "" });
         break;
       }
-      const said = all.filter((t) => !/^\s*<(?!pasted_content\b)/.test(t)).join("\n\n");
+      const said = unwrapped(all.filter((t) => !/^\s*<(?!pasted_content\b)/.test(t)).join("\n\n"));
       if (!said.trim()) break;
       const { source, text: body } = splitSource(said);
       const { text, media } = withoutMedia(body);
@@ -487,7 +502,7 @@ export async function messagePage(file: string, at: number, direction: "forward"
 const LAST = 200; // characters of the last thing said that lastSaid gives
 
 /** The last thing you or the agent said in file, as a page has it, and when: on one line, without
- *  Markdown's marks for headings, bold, code and links, cut to LAST characters; a user message's
+ *  Markdown's marks for headings, bold, code, links and pictures, cut to LAST characters; a user message's
  *  source too, as its source line names it, and whether it quotes. null if neither has said anything.
  *  Reads back from the end only as far as that. */
 export async function lastSaid(file: string): Promise<(Message & { at: number | null; source?: string; quoted?: true }) | null> {
@@ -501,7 +516,7 @@ export async function lastSaid(file: string): Promise<(Message & { at: number | 
       // the quote's start, as the queue shows it.
       const q = b?.kind === "user" ? quoteOf(b.text) : null;
       const words = q ? q.rest.trim() || (carried ? "" : plain(q.quote)) : (b?.text ?? "");
-      const text = b && oneLine(words.replace(/^ {0,3}#{1,6}\s+/gm, "").replace(/\*\*|`/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") + carried);
+      const text = b && oneLine(words.replace(/^ {0,3}#{1,6}\s+/gm, "").replace(/\*\*|`/g, "").replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1") + carried);
       if (b && text) return { role: b.kind, text: clip(text, LAST, "…"), at: b.time, ...(b.kind === "user" && b.source && { source: b.source }), ...(q && { quoted: true as const }) };
     }
     if (page.start === 0 || !page.entries.length) return null;

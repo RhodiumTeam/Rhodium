@@ -35,6 +35,7 @@ export const BUILTIN = {
 
 /** Fixed stand-ins: signatures and encrypted content, and account values. */
 export const FAKE = {
+  piExtension: "pi-example-ext",
   signature: "c3ludGhldGljLXNpZ25hdHVyZQ==",
   encrypted: "c3ludGhldGljLWVuY3J5cHRlZC1jb250ZW50",
   email: "user@example.com",
@@ -201,8 +202,25 @@ const CODEX_ROOT = /^- `(r\d+)` = `([^`]+)`$/;
 const CODEX_SKILL = /^- (\S+?): .*\(file: ([^)]+)\)\s*$/;
 const CODEX_LIST = "### Available skills";
 
+const PI_EXTENSION = /Extension package "[^"]*\/node_modules\/((?:@[\w.-]+\/)?[\w.-]+)\/package\.json"/g;
+
+/** The packages you installed in pi (its settings' "packages": "npm:<name>[@version]", a git URL or a path):
+ *  their names say what you use, and pi lists them bare, as in its list of updates. */
+export function piPackages(home = homedir()): string[] {
+  let list: unknown;
+  try {
+    list = JSON.parse(readFileSync(join(home, ".pi/agent/settings.json"), "utf8")).packages;
+  } catch {
+    return [];
+  }
+  return (Array.isArray(list) ? list : [])
+    .map((p) => (typeof p === "string" ? p : typeof p?.source === "string" ? p.source : ""))
+    .map((p: string) => (p.startsWith("npm:") ? p.slice(4).replace(/(?<=.)@[^/]*$/, "") : basename(p.replace(/@[^/@]*$/, "").replace(/\/+$/, ""), ".git")))
+    .filter(Boolean);
+}
+
 /** Your skill, plugin and MCP server names, from every list the recording has of them. */
-export function collect(values: unknown[], extra: string[]): Names {
+export function collect(values: unknown[], extra: string[], packages: string[] = []): Names {
   const n: Names = { skills: [], plugins: [], servers: [] };
   const add = (list: string[], v?: unknown) => {
     if (typeof v === "string" && v && !PLACEHOLDER.test(v) && !list.includes(v)) list.push(v);
@@ -221,6 +239,8 @@ export function collect(values: unknown[], extra: string[]): Names {
   };
   const server = (name?: string) => !keepServer(name) && add(n.servers, name);
   const text = (s: string) => {
+    // pi warns about an extension package by its path; a dependency of one shows up only in stack traces.
+    for (const m of s.matchAll(PI_EXTENSION)) if (m[1] !== FAKE.piExtension) plugin(m[1]);
     if (!s.includes(CODEX_LIST)) return;
     const roots = new Map<string, string>();
     for (const line of s.split("\n")) {
@@ -260,6 +280,7 @@ export function collect(values: unknown[], extra: string[]): Names {
   };
   values.forEach(visit);
   for (const s of extra) skill(s);
+  for (const p of packages) plugin(p);
   return n;
 }
 
@@ -377,9 +398,22 @@ function structural(v: any, family: string) {
   // The real gap can't be had back from it, and no test reads it: it goes.
   if (family === "feishu" && v.ev === "press" && typeof v.lag === "number" && Math.abs(v.lag) >= 1e9) delete v.lag;
   // pi
+  // Herdr: an agent's screen as pane.read gave it (test/fixtures/herdr/claude-screens.jsonl)
+  if (family === "herdr" && typeof v.text === "string") v.text = SCREEN.reduce((t, [re, to]) => t.replace(re, to), v.text);
   if (family === "pi") for (const k of PI_ENTRY_KEYS) if (typeof v[k] === "string" && /^[0-9a-f]{8}$/.test(v[k]) && !SYNTHETIC_PI_ENTRY.test(v[k])) v[k] = `00${digits(v[k], 6)}`;
   Object.values(v).forEach((x) => structural(x, family));
 }
+
+/** What a recorded Claude screen tells of your account and setup, made fixed: the banner's plan, the clock
+ *  a turn ended at, and /status's lines, styles between label and value kept. */
+const STATUS_LINE = (label: string, value: string): [RegExp, string] => [new RegExp(`(${label}:\\s*(?:\\x1b\\[[0-9;:]*m)*)[^\\x1b\\r\\n]+`, "g"), `$1${value}`];
+const SCREEN: [RegExp, string][] = [
+  [/\bClaude (?:Pro|Max|Ultra|Team|Enterprise)\b/g, FAKE.claudePlan],
+  [/\bdone \d{1,2}:\d\d (?:AM|PM)\b/g, "done 9:00 AM"],
+  STATUS_LINE("MCP servers", "1 connected "),
+  STATUS_LINE("Setting sources", "User settings"),
+  STATUS_LINE("Auto mode server", "Enabled"),
+];
 
 /** Codex's skill list without your skills and their roots. */
 function codexSkills(s: string): string {
@@ -423,7 +457,7 @@ export function synthRecording(rec: Rec, agent: string, opts: Options = {}): Rec
   const objs = raws.map(parse);
   const ins = rec.inLog.split("\n").map((l) => parse(l.slice(l.indexOf(" ") + 1)));
   const home = opts.home ?? homedir();
-  const n = collect([...objs, ...ins], opts.names ?? []);
+  const n = collect([...objs, ...ins], opts.names ?? [], piPackages(home));
   const c = cleaner(n, rec.outLog + rec.inLog, home, [...objs, ...ins]);
   const walk = walker(c);
   const line = (raw: string, o: any) => {
@@ -455,7 +489,8 @@ function leaks(text: string, n: Names, home: string): string[] {
 export function synthLines(text: string, family: string, opts: Options = {}): string {
   const lines = text.split("\n");
   const objs = lines.map(parse);
-  const walk = walker(cleaner(collect(objs, opts.names ?? []), text, opts.home ?? homedir(), objs));
+  const home = opts.home ?? homedir();
+  const walk = walker(cleaner(collect(objs, opts.names ?? [], piPackages(home)), text, home, objs));
   return lines.map((raw, i) => {
     const o = objs[i];
     if (o === undefined || typeof o !== "object") return raw;

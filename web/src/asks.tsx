@@ -5,13 +5,13 @@ import { ArrowUp, ClipboardList, Hand, LoaderCircle, MessageCircleQuestionMark, 
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import type { AskCard } from "../../src/asks";
-import { clock } from "./common";
+import { clock, Scrolls, useEdges } from "./common";
 import { buttonVariants } from "./components/ui/button";
 import type { SlotData } from "./data";
 import { KIND } from "./details";
 import { MARKDOWN } from "./tools";
 import { toast } from "./toast";
-import { act, StopKey, useEdges } from "./write";
+import { act, StopKey } from "./write";
 
 type Ask = SlotData["asks"][number];
 type Questions = Extract<AskCard, { questions: unknown }>["questions"];
@@ -87,11 +87,13 @@ function Card({ a, stop, busy, send }: { a: Ask; stop?: string; busy: boolean; s
   const head = "questions" in c ? (c.questions.length === 1 ? c.questions[0]!.question : "") : c.head;
   return (
     <section aria-label={KIND[a.kind]} className="rounded-lg border border-l-4 border-l-needs bg-card px-3 py-2 text-sm">
-      <div className="flex items-start gap-2">
+      {/* The stop key's round sits 6px inside the top and right borders; the row's first line drops
+          6px with it, so the icon, head and clock stay on the round's midline (#658). */}
+      <div className={cn("flex items-start gap-2", stop && "pt-1.5")}>
         <Icon className="mt-0.5 size-4 shrink-0 text-needs" />
         <p className="min-w-0 flex-1 font-medium whitespace-pre-wrap wrap-anywhere">{head}</p>
         {a.deadline !== null && <span className="mt-0.5 shrink-0 text-xs text-muted-foreground tabular-nums">{clock(a.deadline)} 超时</span>}
-        {stop && <StopKey slot={stop} className="-my-2.5 -mr-1.5" />}
+        {stop && <StopKey slot={stop} className="-mt-3 -mb-2.5 -mr-2.5" />}
       </div>
       {qs ? <Choose qs={qs} busy={busy} send={send} /> : <Decide c={c as YesNo} busy={busy} send={send} />}
     </section>
@@ -100,9 +102,9 @@ function Card({ a, stop, busy, send }: { a: Ask; stop?: string; busy: boolean; s
 
 const field = "h-11 min-w-0 flex-1 rounded-md border bg-background px-3 text-base outline-none transition-colors hover:border-ring/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50";
 
-/** The send key, which spins while the answer is on its way. */
+/** The send key, which spins while the answer is on its way; its round lines up with the stop key's (#658). */
 const Send = ({ busy, ok }: { busy: boolean; ok: boolean }) => (
-  <button type="submit" aria-label="发送" disabled={busy || !ok} className="group focus-child grid size-11 shrink-0 place-items-center disabled:opacity-50">
+  <button type="submit" aria-label="发送" disabled={busy || !ok} className="group focus-child -mr-2.5 grid size-11 shrink-0 place-items-center disabled:opacity-50">
     <span className="grid size-9 place-items-center rounded-full bg-primary text-primary-foreground transition-colors group-enabled:group-hover:bg-primary/80">{busy ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}</span>
   </button>
 );
@@ -158,10 +160,13 @@ function Option({ on, press, box, onClick, children }: { on: boolean; press: boo
       type="button"
       aria-pressed={press ? on : undefined}
       onClick={onClick}
-      className={cn(buttonVariants({ variant: on ? "default" : "outline" }), "h-auto min-h-11 max-w-full items-start gap-2 px-3 py-1.5 text-left whitespace-normal wrap-anywhere")}
+      className={cn(buttonVariants({ variant: on ? "default" : "outline" }), "h-auto min-h-11 max-w-full px-3 py-1.5 text-left whitespace-normal wrap-anywhere")}
     >
-      {box && <Box className="mt-0.5" />}
-      <span className="flex min-w-0 flex-col">{children}</span>
+      {/* One line sits on the button's midline; the box stays on the first line of several. */}
+      <span className="flex min-w-0 items-start gap-2">
+        {box && <Box className="mt-0.5" />}
+        <span className="flex min-w-0 flex-col">{children}</span>
+      </span>
     </button>
   );
 }
@@ -177,7 +182,9 @@ function Decide({ c, busy, send }: { c: YesNo; busy: boolean; send: (text: strin
         (c.markdown ? (
           <Plan body={c.body} />
         ) : (
-          <pre className="card-scroll max-h-40 overflow-auto rounded-md bg-muted px-2.5 py-1.5 font-mono text-xs whitespace-pre-wrap wrap-anywhere [clip-path:border-box]">{c.body}</pre>
+          <div className="flex max-h-40 flex-col rounded-md bg-muted">
+            <Scrolls className="px-2.5 py-1.5 text-xs">{c.body}</Scrolls>
+          </div>
         ))}
       {c.told && <input value={why} onChange={(e) => setWhy(e.target.value)} placeholder="理由" aria-label="理由" disabled={busy} className={field} />}
       <div className="flex gap-2">

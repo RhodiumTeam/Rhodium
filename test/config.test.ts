@@ -87,9 +87,9 @@ test("the agents' PATH and the holder unit's MemoryHigh are configurable", () =>
   expect([c.agentPath, c.memoryHigh]).toEqual(["/opt/node/bin:/usr/bin", "1G"]);
 });
 
-test("without agentPath agents get rhodium's own PATH, and MemoryHigh defaults to 3G", () => {
+test("without agentPath agents get rhodium's own PATH, and MemoryHigh defaults to 4G (#692)", () => {
   const c = loadConfig(configFile(""), { ...env, PATH: "/a/bin:/usr/bin" });
-  expect([c.agentPath, c.memoryHigh]).toEqual(["/a/bin:/usr/bin", "3G"]);
+  expect([c.agentPath, c.memoryHigh]).toEqual(["/a/bin:/usr/bin", "4G"]);
   expect(loadConfig(configFile(""), env).agentPath).toBe("/usr/local/bin:/usr/bin:/bin");
 });
 

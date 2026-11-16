@@ -77,3 +77,18 @@ test.each([".claude/settings.json", ".config/herdr/config.toml"])(
     expect(existsSync(rhodium.dir)).toBe(false); // it still cleaned up
   },
 );
+
+test("#741: rhodium still gets to ready when FORCE_COLOR asks Bun for color", async () => {
+  rhodium = newInstance({ env: { FORCE_COLOR: "1" } });
+  const d = await rhodium.start(undefined, 10_000);
+  expect(d.logs.some((l) => l.msg === "ready")).toBe(true);
+}, 15_000);
+
+test("#741: a rhodium that never says ready is killed, and start() throws with its log", async () => {
+  rhodium = newInstance();
+  const pidFile = join(rhodium.dir, "pid");
+  const silent = ["sh", "-c", `echo $$ > ${pidFile}; echo not-json >&2; exec sleep 300`, "sh"];
+  await expect(rhodium.start(silent, 500)).rejects.toThrow(/not ready after 500 ms[^]*not-json/);
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  expect(() => process.kill(pid, 0)).toThrow(); // gone, not left running
+});

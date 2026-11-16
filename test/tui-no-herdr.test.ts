@@ -1,13 +1,14 @@
 // Without Herdr installed (product §4.2), rh tui, which /rh_tui and the board's 切到终端 are too, says
 // so before it stops anything: the headless agent goes on (story 586).
-import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
 import { route, type Ctx, type State } from "../src/router";
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-tui-no-herdr-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const ctx = (herdr: boolean): Ctx => ({
   now: Date.parse("2026-11-06T12:00:00Z"),

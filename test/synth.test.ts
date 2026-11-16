@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { FAKE, SYNTHETIC_TAIL, SYNTHETIC_UUID, synthLines, synthName, synthRecording } from "../scripts/probes/synth";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const HOME = "/home/alice";
 const j = (o: unknown) => JSON.stringify(o);
@@ -100,6 +103,26 @@ describe("synthesizing a Claude recording", () => {
     expect(out[1].event.delta.text).toBe("Saved to /home/user/plan.md");
   });
 
+  test("pi's extension packages become placeholders across the recording: named in a warning or in pi's settings, shown bare in another record; a dependency's path and words holding the name stay", () => {
+    const home = mkdtempSync(join(tmpdir(), "rhodium-test-synth-pi-"));
+    try {
+      mkdirSync(join(home, ".pi/agent"), { recursive: true });
+      writeFileSync(join(home, ".pi/agent/settings.json"), JSON.stringify({ packages: ["npm:pi-set-ext@1.2.0", "git:github.com/someone/pi-git-ext.git", "git:github.com/someone/pi-ref-ext@v1"] }));
+      const lines = [
+        { text: 'Warning: Extension package "/home/user/.pi/agent/npm/node_modules/pi-warned-ext/package.json": typebox' },
+        { text: "Updates:\r\n - pi-warned-ext\r\n - pi-set-ext\r\n - pi-git-ext\r\n - pi-ref-ext\r\n" },
+        { text: "at /home/user/.pi/agent/npm/node_modules/ws/lib/x.js shows 2 rows; pi-warned-extra stays" },
+      ].map(j).join("\n");
+      const [warn, list, trace] = parse(synthLines(lines, "herdr", { home }));
+      expect(JSON.stringify([warn, list])).not.toMatch(/pi-(warned|set|git|ref)-ext/);
+      expect(list.text).toMatch(/^Updates:\r\n(?: - plugin-\d+\r\n){4}$/);
+      expect(warn.text).toContain("typebox");
+      expect(trace.text).toBe("at /home/user/.pi/agent/npm/node_modules/ws/lib/x.js shows 2 rows; pi-warned-extra stays");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("in.log offsets follow the out.log lines they pointed at", () => {
     const first = j(initResponse);
     const second = j({ type: "system", subtype: "session_state_changed", state: "idle" });
@@ -193,6 +216,24 @@ describe("synthesizing other recordings", () => {
     const [qr, done] = parse(synthLines(log, "feishu"));
     expect([qr.t, done.t]).toEqual(["2026-01-01T00:00:00.377Z", "2026-01-01T00:01:00.877Z"]);
     expect(done.appId).toMatch(/^cli_0000\d{12}$/);
+  });
+
+  test("a recorded Claude screen loses your plan, your clock and your /status setup, whatever styles sit between label and value", () => {
+    const screen = [
+      "\x1b[0m\x1b[38;2;153;153;153mHaiku 5.5 · Claude Max\x1b[0m\r",
+      "\x1b[0m\x1b[38;2;153;153;153m✻ Baked for 2s · done 11:42 PM\x1b[0m\r",
+      "   \x1b[0m\x1b[1mMCP servers:       \x1b[0m\x1b[38;2;78;186;101m7 connected \x1b[0m\x1b[38;2;153;153;153m· /mcp\x1b[0m\r",
+      "   \x1b[0m\x1b[1mSetting sources:   \x1b[0mUser settings, Project local settings\r",
+      "   \x1b[0m\x1b[1mAuto mode server:  \x1b[0mDisabled",
+    ].join("\n");
+    const [got] = parse(synthLines(j({ name: "status", status: "idle", text: screen }), "herdr"));
+    const plain = got.text.replace(/\x1b\[[0-9;]*m/g, "");
+    expect(plain).toContain(`Haiku 5.5 · ${FAKE.claudePlan}\r`);
+    expect(plain).toContain("done 9:00 AM\r");
+    expect(plain).toContain("MCP servers:       1 connected · /mcp");
+    expect(plain).toContain("Setting sources:   User settings\r");
+    expect(plain).toContain("Auto mode server:  Enabled");
+    expect(parse(synthLines(j(got), "herdr"))[0]).toEqual(got);
   });
 
   test("the pid in the name of a Claude socket becomes a synthetic one, the same wherever it shows", () => {

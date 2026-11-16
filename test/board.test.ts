@@ -1,5 +1,6 @@
 // The read-only board (seam one, product §7, architecture §11): its JSON and event stream over
 // HTTP, with and without your Tailscale login in the header tailscale serve adds.
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -11,7 +12,7 @@ import { loadConfig } from "../src/config";
 import { openStore, type Slot, type Store } from "../src/store";
 import { call, installFakeHerdr, startFakeHerdr } from "./fake-herdr/fake-herdr";
 import { asking, PROGRESS_PIECES } from "./fake-agent/scripts";
-import { BOARD_LOGIN, newInstance, until, type Daemon, type Instance } from "./instance";
+import { BOARD_LOGIN, newInstance, recorded, until, type Daemon, type Instance } from "./instance";
 
 const ME = "you-openid";
 const GROUP = "-100999"; // a group of r's, the main chat
@@ -689,6 +690,7 @@ test("story 322: /api/slot gives the slot's settings, each with its own value, n
     ["ask-timeout", "提问超时", "duration", null, "number"],
     ["crash-resume", "崩溃续跑", "flag", null, "number"],
     ["auto-continue", "额度续跑", "flag", null, "number"],
+    ["type-in", "你的消息打进终端", "flag", null, "number"],
   ]);
   expect(await set("reap=600s", "approval=on")).toMatchObject({ ok: true });
   const value = (s: { settings: Setting[] }, key: string) => s.settings.find((x) => x.key === key)!.value;
@@ -789,6 +791,11 @@ describe("the web terminal of a slot in the terminal, with a fake Herdr", () => 
   let pane = "";
   /** The lines the fake Herdr's terminal session controls got, as fake.calls has them. */
   const herdr = async () => ((await call(term.herdr.socket, "fake.calls")).result.calls as { method: string; params: any }[]).filter((c) => c.method.startsWith("terminal."));
+  /** The slot's card on term's board, and the group it is in. */
+  const where = async (name: string) => {
+    const g = ((await (await get("/api/board", BOARD_LOGIN, {}, undefined, at)).json()) as Board).workspaces[0]!.groups;
+    for (const group of Object.keys(g) as Group[]) for (const card of g[group]) if (card.name === name) return { group, card };
+  };
   beforeAll(async () => {
     term = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/t" } }, herdr: true });
     const d = await term.start();
@@ -799,11 +806,95 @@ describe("the web terminal of a slot in the terminal, with a fake Herdr", () => 
     await until(async () => (await term.state("w/t")) === "空闲", 15_000);
     await term.ok("tui", "w/t");
     await until(async () => (await term.state("w/t")) === "TUI 模式", 15_000);
-    const card = ((await (await get("/api/board", BOARD_LOGIN, {}, undefined, at)).json()) as Board).workspaces[0]!.groups.running[0]!;
-    slot = card.id;
+    slot = (await where("t"))!.card.id;
     pane = ((await (await get(`/api/slot?id=${slot}`, BOARD_LOGIN, {}, undefined, at)).json()) as { pane: string }).pane;
   }, 30_000);
   afterAll(() => term.cleanup());
+
+  test("#664, #690: a slot in the terminal is among the running only while Herdr says its agent works, or does not say; idle or done, it is grouped as any other, ended when it turned so from working or blocked, not from unknown, its card still says TUI 模式; back to headless, what Herdr said is dropped", async () => {
+    await term.ok("new", "w/u");
+    await term.ok("tui", "w/u");
+    await until(async () => (await term.state("w/u")) === "TUI 模式", 15_000);
+    // The fake Herdr says idle of a pane with an agent: u, which never ran a turn, is idle.
+    await until(async () => (await where("u"))!.group === "idle", 2_000);
+    const { card } = (await where("u"))!;
+    const u = ((await (await get(`/api/slot?id=${card.id}`, BOARD_LOGIN, {}, undefined, at)).json()) as { pane: string }).pane;
+    expect(card.state).toBe(`TUI 模式（pane ${u}）`);
+    // #690: from working or blocked, idle or done is a turn's end, just ended at the change; from unknown,
+    // as a new agent says for a few seconds before idle, it is not.
+    for (const [status, group] of [["unknown", "running"], ["idle", "idle"], ["working", "running"], ["done", "done"], ["unknown", "running"], ["blocked", "running"], ["idle", "done"]] as const) {
+      const from = Date.now();
+      await call(term.herdr.socket, "fake.set_status", { pane_id: u, status });
+      await recorded(term, `SELECT 1 FROM slot WHERE id = '${card.id}' AND tuiStatus = '${status}'`, 2_000);
+      await until(async () => (await where("u"))!.group === group, 2_000).catch(() => expect([status, "is not among", group]).toBe([]));
+      if (group === "done") expect((await where("u"))!.card.turnEndedAt).toBeWithin(from, Date.now() + 1);
+      if (group === "idle") expect((await where("u"))!.card.turnEndedAt ?? null).toBeNull();
+    }
+    // Written only as it changes: two more reads of the pane saying the same, and there are the eight changes, no more.
+    const reads = async () => ((await call(term.herdr.socket, "fake.calls")).result.calls as { method: string; params: any }[]).filter((c) => c.method === "pane.get" && c.params.pane_id === u).length;
+    const read = await reads();
+    await until(async () => (await reads()) >= read + 2, 5_000);
+    await recorded(term, `SELECT 1 WHERE (SELECT count(*) FROM event WHERE type = 'tui_status' AND json_extract(data, '$.slot') = '${card.id}') = 8`, 1);
+    // Each change is an event, which the page refreshes on; not one of the slot's own, which 详情 lists.
+    await recorded(term, `SELECT 1 FROM event WHERE type = 'tui_status' AND slot IS NULL AND data = '{"slot":"${card.id}","status":"working"}'`);
+    await recorded(term, `SELECT 1 FROM slot WHERE id = '${card.id}' AND tuiStatus = 'idle'`);
+    await term.ok("release", "w/u");
+    await recorded(term, `SELECT 1 FROM slot WHERE id = '${card.id}' AND mode = 'headless' AND tuiStatus IS NULL`);
+  }, 30_000);
+
+  test("story 607: a dialog's footer on the screen of a slot's terminal, or Herdr saying blocked, or unknown over a footer, is dialog: kept on the slot with a tui_input event, its card says 被弹框挡住 and stays in its group; the footer gone, TUI 模式 again; written only as it changes; back to headless, dropped", async () => {
+    const screens = Object.fromEntries(
+      readFileSync(join(import.meta.dir, "fixtures/herdr/claude-screens.jsonl"), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .reverse() // the default screen's, over the fullscreen one's
+        .map((s) => [s.name, s.text as string]),
+    );
+    await term.ok("new", "w/v");
+    await term.ok("tui", "w/v");
+    await until(async () => (await term.state("w/v")) === "TUI 模式", 15_000);
+    const { card } = (await where("v"))!;
+    const v = ((await (await get(`/api/slot?id=${card.id}`, BOARD_LOGIN, {}, undefined, at)).json()) as { pane: string }).pane;
+    const input = (want: string) => recorded(term, `SELECT 1 FROM slot WHERE id = '${card.id}' AND tuiInput = '${want}'`, 3_000);
+    const set = (status: string, screen: string) => call(term.herdr.socket, "fake.set_screen", { pane_id: v, text: screens[screen], status });
+    const count = `(SELECT count(*) FROM event WHERE type = 'tui_input' AND json_extract(data, '$.slot') = '${card.id}')`;
+    const events = () => {
+      const db = new Database(join(term.dir, "state/rh.db"), { readonly: true });
+      try {
+        return (db.query(`SELECT ${count} AS n`).get() as { n: number }).n;
+      } finally {
+        db.close();
+      }
+    };
+    let first = 0;
+    // Herdr says idle of /status: the footer alone tells it; the card keeps the group Herdr gives it.
+    for (const [status, screen, want, group] of [
+      ["idle", "empty", "ready", "idle"],
+      ["idle", "status", "dialog", "idle"],
+      ["idle", "draft", "draft", "idle"],
+      ["blocked", "empty", "dialog", "running"],
+      ["unknown", "permission", "dialog", "running"],
+      ["unknown", "empty", "unknown", "running"],
+      ["working", "queued", "ready", "running"],
+    ] as const) {
+      await set(status, screen);
+      await input(want);
+      const shown = await where("v");
+      expect([status, screen, shown!.card.state, shown!.group]).toEqual([status, screen, want === "dialog" ? "被弹框挡住" : `TUI 模式（pane ${v}）`, group]);
+      first ||= events();
+    }
+    // Each change an event the page refreshes on, not one of the slot's own; two more reads saying the same add none.
+    await recorded(term, `SELECT 1 FROM event WHERE type = 'tui_input' AND slot IS NULL AND data = '{"slot":"${card.id}","input":"dialog"}'`);
+    const reads = async () => ((await call(term.herdr.socket, "fake.calls")).result.calls as { method: string; params: any }[]).filter((c) => c.method === "pane.read" && c.params.pane_id === v);
+    const read = (await reads()).length;
+    await until(async () => (await reads()).length >= read + 2, 5_000);
+    // After the first: dialog, draft, dialog, then blocked to unknown over a footer is no change, unknown, ready.
+    expect(events()).toBe(first + 5);
+    expect((await reads()).at(-1)!.params).toEqual({ pane_id: v, source: "recent", format: "ansi", strip_ansi: false });
+    await term.ok("release", "w/v");
+    await recorded(term, `SELECT 1 FROM slot WHERE id = '${card.id}' AND mode = 'headless' AND tuiInput IS NULL`);
+  }, 30_000);
 
   test("story 356: the terminal's handshake is checked as a write is: no login or another's, a page elsewhere, a host elsewhere is 403, with no upgrade; no upgrade or no slot is 400; Herdr hears of none", async () => {
     const q = `?slot=${slot}&cols=50&rows=20`;

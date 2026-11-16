@@ -158,7 +158,13 @@ for (const file of taken) {
     for (const [what, hit] of builtIn) if (held.some(hit)) problems.push(`${at()}：长串里有${what}`);
   }
   if (file.endsWith(".md")) {
-    for (const m of text.matchAll(/\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) {
+    // A link written as code is an example, not a link: code blocks and spans are blanked first,
+    // newlines kept so the line numbers hold.
+    // ponytail: regexes, not a parser: a fence indented 4+ spaces, a span across lines, backticks in an
+    // HTML comment can still mislead them; parse with mdast-util-from-markdown if one ever bites.
+    const blank = (s: string) => s.replace(/[^\n]/g, " ");
+    const prose = text.replace(/^ *(`{3,}(?![^\n]*`)|~{3,})[^\n]*\n[\s\S]*?^ *\1[`~]*[ \t]*$/gm, blank).replace(/(?<![\\`])(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, blank);
+    for (const m of prose.matchAll(/\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) {
       // Only what reads as a path, a file name or a directory: not a URL, an anchor or a placeholder like (地址).
       const target = m[1]!, bare = target.split("#")[0]!;
       if (/^[a-z][a-z+.-]*:/i.test(target) || !/\.\w+$|\/$/.test(bare)) continue;

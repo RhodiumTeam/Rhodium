@@ -1,0 +1,32 @@
+{"t":104,"dir":">>","msg":{"id":"si:1","method":"workspace.create","params":{"cwd":"/work","label":"w","focus":false}}}
+{"t":207,"dir":"<<","msg":{"id":"si:1","result":{"type":"workspace_created","workspace":{"workspace_id":"w1","number":1,"label":"w","focused":true,"pane_count":1,"tab_count":1,"active_tab_id":"w1:t1","agent_status":"unknown"},"tab":{"tab_id":"w1:t1","workspace_id":"w1","number":1,"label":"1","focused":true,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w1:p1","terminal_id":"term_00009810739496","workspace_id":"w1","tab_id":"w1:t1","focused":true,"cwd":"/work","foreground_cwd":"/work","agent_status":"unknown","scroll":{"offset_from_bottom":0,"max_offset_from_bottom":0,"viewport_rows":40},"revision":0}}}}
+{"t":207,"dir":">>","msg":{"id":"si:2","method":"layout.apply","params":{"workspace_id":"w1","tab_label":"paste","root":{"type":"pane","cwd":"/work","command":["python3","-c","import os,sys,tty\nsys.stdout.write('\\x1b[?2004h')\ntty.setraw(0)\nsys.stdout.write('ready\\r\\n');sys.stdout.flush()\nwhile True:\n  b=os.read(0,4096)\n  sys.stdout.write(repr(b)+'\\r\\n');sys.stdout.flush()\n"]}}}}
+{"t":311,"dir":"<<","msg":{"id":"si:2","result":{"type":"layout_apply","layout":{"workspace_id":"w1","tab_id":"w1:t2","zoomed":false,"focused_pane_id":"w1:p2","root":{"type":"pane","pane_id":"w1:p2","cwd":"/work","command":["python3","-c","import os,sys,tty\nsys.stdout.write('\\x1b[?2004h')\ntty.setraw(0)\nsys.stdout.write('ready\\r\\n');sys.stdout.flush()\nwhile True:\n  b=os.read(0,4096)\n  sys.stdout.write(repr(b)+'\\r\\n');sys.stdout.flush()\n"]}}}}}
+{"t":1112,"dir":">>","msg":{"id":"si:3","method":"pane.send_input","params":{"pane_id":"w1:p2","text":"[来自 Rhodium：子槽位汇报]\nline two\tTAB\nline three","keys":[]}}}
+{"t":1214,"dir":"<<","msg":{"id":"si:3","result":{"type":"ok"}}}
+{"t":1614,"dir":">>","msg":{"id":"si:4","method":"pane.read","params":{"pane_id":"w1:p2","source":"recent","format":"text","strip_ansi":false}}}
+{"t":1715,"dir":"<<","msg":{"id":"si:4","result":{"type":"pane_read","read":{"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t2","source":"recent","format":"text","text":"ready\nb'\\x1b[200~[\\xe6\\x9d\\xa5\\xe8\\x87\\xaa Rhodium\\xef\\xbc\\x9a\\xe5\\xad\\x90\\xe6\\xa7\\xbd\\xe4\\xbd\\x8d\\xe6\\xb1\\x87\\xe6\\x8a\\xa5]\\n\nline two\\tTAB\\nline three\\x1b[201~'\n","revision":0,"truncated":false}}}}
+{"t":1716,"dir":">>","msg":{"id":"si:5","method":"pane.send_keys","params":{"pane_id":"w1:p2","keys":["enter"]}}}
+{"t":1816,"dir":"<<","msg":{"id":"si:5","result":{"type":"ok"}}}
+{"t":2217,"dir":">>","msg":{"id":"si:6","method":"pane.read","params":{"pane_id":"w1:p2","source":"recent","format":"text","strip_ansi":false}}}
+{"t":2218,"dir":"<<","msg":{"id":"si:6","result":{"type":"pane_read","read":{"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t2","source":"recent","format":"text","text":"ready\nb'\\x1b[200~[\\xe6\\x9d\\xa5\\xe8\\x87\\xaa Rhodium\\xef\\xbc\\x9a\\xe5\\xad\\x90\\xe6\\xa7\\xbd\\xe4\\xbd\\x8d\\xe6\\xb1\\x87\\xe6\\x8a\\xa5]\\n\nline two\\tTAB\\nline three\\x1b[201~'\nb'\\r'\n","revision":0,"truncated":false}}}}
+{"t":2218,"dir":">>","msg":{"id":"si:7","method":"tab.close","params":{"tab_id":"w1:t2"}}}
+{"t":2326,"dir":"<<","msg":{"id":"si:7","result":{"type":"ok"}}}
+{"t":2326,"dir":">>","msg":{"id":"si:8","method":"layout.apply","params":{"workspace_id":"w1","tab_label":"plain","root":{"type":"pane","cwd":"/work","command":["python3","-c","import os,sys,tty\ntty.setraw(0)\nsys.stdout.write('ready\\r\\n');sys.stdout.flush()\nwhile True:\n  b=os.read(0,4096)\n  sys.stdout.write(repr(b)+'\\r\\n');sys.stdout.flush()\n"]}}}}
+{"t":2430,"dir":"<<","msg":{"id":"si:8","result":{"type":"layout_apply","layout":{"workspace_id":"w1","tab_id":"w1:t3","zoomed":false,"focused_pane_id":"w1:p3","root":{"type":"pane","pane_id":"w1:p3","cwd":"/work","command":["python3","-c","import os,sys,tty\ntty.setraw(0)\nsys.stdout.write('ready\\r\\n');sys.stdout.flush()\nwhile True:\n  b=os.read(0,4096)\n  sys.stdout.write(repr(b)+'\\r\\n');sys.stdout.flush()\n"]}}}}}
+{"t":3231,"dir":">>","msg":{"id":"si:9","method":"pane.send_input","params":{"pane_id":"w1:p3","text":"[来自 Rhodium：子槽位汇报]\nline two\tTAB\nline three","keys":[]}}}
+{"t":3232,"dir":"<<","msg":{"id":"si:9","result":{"type":"ok"}}}
+{"t":3632,"dir":">>","msg":{"id":"si:10","method":"pane.read","params":{"pane_id":"w1:p3","source":"recent","format":"text","strip_ansi":false}}}
+{"t":3633,"dir":"<<","msg":{"id":"si:10","result":{"type":"pane_read","read":{"pane_id":"w1:p3","workspace_id":"w1","tab_id":"w1:t3","source":"recent","format":"text","text":"ready\nb'[\\xe6\\x9d\\xa5\\xe8\\x87\\xaa Rhodium\\xef\\xbc\\x9a\\xe5\\xad\\x90\\xe6\\xa7\\xbd\\xe4\\xbd\\x8d\\xe6\\xb1\\x87\\xe6\\x8a\\xa5]\\nline two\\\ntTAB\\nline three'\n","revision":0,"truncated":false}}}}
+{"t":3633,"dir":">>","msg":{"id":"si:11","method":"pane.send_keys","params":{"pane_id":"w1:p3","keys":["enter"]}}}
+{"t":3734,"dir":"<<","msg":{"id":"si:11","result":{"type":"ok"}}}
+{"t":4136,"dir":">>","msg":{"id":"si:12","method":"pane.read","params":{"pane_id":"w1:p3","source":"recent","format":"text","strip_ansi":false}}}
+{"t":4137,"dir":"<<","msg":{"id":"si:12","result":{"type":"pane_read","read":{"pane_id":"w1:p3","workspace_id":"w1","tab_id":"w1:t3","source":"recent","format":"text","text":"ready\nb'[\\xe6\\x9d\\xa5\\xe8\\x87\\xaa Rhodium\\xef\\xbc\\x9a\\xe5\\xad\\x90\\xe6\\xa7\\xbd\\xe4\\xbd\\x8d\\xe6\\xb1\\x87\\xe6\\x8a\\xa5]\\nline two\\\ntTAB\\nline three'\nb'\\r'\n","revision":0,"truncated":false}}}}
+{"t":4137,"dir":">>","msg":{"id":"si:13","method":"tab.close","params":{"tab_id":"w1:t3"}}}
+{"t":4145,"dir":"<<","msg":{"id":"si:13","result":{"type":"ok"}}}
+{"t":4145,"dir":">>","msg":{"id":"si:14","method":"pane.send_input","params":{"pane_id":"w99:p9","text":"x","keys":[]}}}
+{"t":4246,"dir":"<<","msg":{"id":"si:14","error":{"code":"pane_not_found","message":"pane w99:p9 not found"}}}
+{"t":4246,"dir":">>","msg":{"id":"si:15","method":"pane.send_keys","params":{"pane_id":"w99:p9","keys":["enter"]}}}
+{"t":4246,"dir":"<<","msg":{"id":"si:15","error":{"code":"pane_not_found","message":"pane w99:p9 not found"}}}
+{"t":4246,"dir":">>","msg":{"id":"si:16","method":"tab.close","params":{"tab_id":"w1:t1"}}}
+{"t":4255,"dir":"<<","msg":{"id":"si:16","result":{"type":"ok"}}}

@@ -20,7 +20,7 @@ import { Details } from "./details";
 import { Carried } from "./media";
 import { Face, Mark } from "./faces";
 import { Stick, type Place } from "./stick";
-import { CopyKey, Fold, folded, KEY, MARKDOWN, Running, type Shown } from "./tools";
+import { CopyKey, Fold, folded, KEY, MARKDOWN, Running, SaidOf, type Shown } from "./tools";
 import { SettingsMenu, useTerminalEntry } from "./settings";
 import { useUnreadBut } from "./unread";
 import { Asks } from "./asks";
@@ -550,6 +550,9 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
   const turn = inTurn(d);
   // Something at the bottom clear of the screen's edge: where you type. Asks waiting on you take its place.
   const bottom = d.mode === "headless" && !d.asks.length;
+  // The chat of one in the terminal has it too while your words go in there, its type-in on (#737).
+  const typeIn = d.settings.find((s) => s.key === "type-in");
+  const typesIn = terminal && Boolean(typeIn?.value ?? typeIn?.default);
   // The terminal key, unless 终端入口 is off or there is no Herdr (spec web-write "终端入口").
   const entry = useTerminalEntry();
   const changed = () => redraw((n) => n + 1);
@@ -557,9 +560,11 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
   // Its transcript grew: bring the blocks written since, and only them. One not brought comes next time.
   // And once now, for what grew while the chat was not yet drawn to be told.
   useEffect(() => {
-    const more = () => void log.newer().then(() => redraw((n) => n + 1), () => {});
+    const drawn = () => redraw((n) => n + 1);
+    // A local picture whose check has yet to come is read again as the board says it has, or in a minute (spec web-images).
+    const more = () => void log.newer().then(() => (drawn(), log.settle(drawn)), () => {});
     // Marked as it hears, as the chat drawn in its new place visits before this one goes.
-    const hear = (what: string, text?: string) => (left.set(log, heardCount), what === "grew" ? more() : (log.wrote(what, text), redraw((n) => n + 1)));
+    const hear = (what: string, text?: string) => (left.set(log, heardCount), what === "grew" ? more() : what === "pictures" ? void log.reread().then(drawn, () => {}) : (log.wrote(what, text), drawn()));
     heard.add(hear);
     left.set(log, heardCount);
     more();
@@ -654,7 +659,7 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
             <div className="mx-auto grid max-w-3xl grid-cols-[minmax(0,1fr)] gap-4 px-4 pt-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
               {!log.blocks.length && <p className="text-sm text-muted-foreground">{log.conversation ? "对话里还没有消息。" : "还没有对话。"}</p>}
               {shown.map((b) => (
-                <Said key={b.at} b={b} conversation={log.conversation ?? ""} keys={{ slot: d.id, quotes: bottom, last: b.at === lastSaid }} />
+                <Said key={b.at} b={b} conversation={log.conversation ?? ""} keys={{ slot: d.id, quotes: bottom || (reading && typesIn), last: b.at === lastSaid }} />
               ))}
               {log.drafts.map((d, i) => (
                 // Streaming: Markdown half written, as **bold not yet closed, shows as it will.
@@ -671,6 +676,8 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
           );
         }}
       </Stick>}
+      {/* What waits for the switch back, over the terminal; the chat shown, over the box that types into it (product §7). */}
+      {terminal && d.queue.length > 0 && <Queue slot={d.id} queue={d.queue} spaced />}
       {/* Kept attached under the chat: the page is still yours (spec web-terminal "一处在操作"). */}
       {terminal && (
         <Suspense
@@ -680,17 +687,19 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
             </section>
           }
         >
-          <TerminalView key={d.id} slot={d.id} font={font} shown={!reading} />
+          <TerminalView key={d.id} slot={d.id} font={font} shown={!reading} boxed={typesIn} />
         </Suspense>
       )}
       {/* The toasts float over what is at the bottom: the asks, where you type, or with neither, the screen's edge. */}
       <div className="relative shrink-0">
         <Toasts />
-        {d.mode === "headless" && d.queue.length > 0 && <Queue slot={d.id} queue={d.queue} />}
+        {/* With nothing under it, clear of the screen's edge. */}
+        {!terminal && d.queue.length > 0 && <Queue slot={d.id} queue={d.queue} spaced={!bottom && !d.asks.length} />}
         {/* Asks waiting on you take the place of where you type, the stop key on the top one (spec web-write "页面"). */}
         <Asks d={d} turn={turn} />
         {bottom && <Composer key={d.id} slot={d.id} turn={turn} archived={d.archivedAt !== null} switchable={d.archivedAt === null && entry} log={log} changed={changed} commands={d.commands} agent={d.agent} model={d.model} effort={d.effort} ultracode={d.ultracode} />}
-        {!bottom && <div className="h-[env(safe-area-inset-bottom)]" />}
+        {reading && typesIn && <Composer key={d.id} slot={d.id} turn={false} archived={false} switchable={false} log={log} changed={changed} commands={[]} agent={d.agent} model={null} effort={null} ultracode={false} terminal />}
+        {!bottom && !(reading && typesIn) && <div className="h-[env(safe-area-inset-bottom)]" />}
       </div>
     </div>
   );
@@ -722,10 +731,11 @@ export function Preview({ slot, conversation, live }: { slot: string; conversati
   const [log] = useState(() => new Messages(slot, json, conversation));
   const [, redraw] = useState(0);
   useEffect(() => {
-    const more = () => void log.newer().then(() => redraw((n) => n + 1), () => {});
+    const drawn = () => redraw((n) => n + 1);
+    const more = () => void log.newer().then(() => (drawn(), log.settle(drawn)), () => {});
     more();
     if (!live) return;
-    const hear = (what: string, text?: string) => (what === "grew" ? more() : (log.wrote(what, text), redraw((n) => n + 1)));
+    const hear = (what: string, text?: string) => (what === "grew" ? more() : what === "pictures" ? void log.reread().then(drawn, () => {}) : (log.wrote(what, text), drawn()));
     heard.add(hear);
     return () => void heard.delete(hear);
   }, [log, live]);
@@ -820,9 +830,11 @@ function Said({ b, conversation, keys }: { b: Shown; conversation: string; keys?
       return (
         <div className="group grid gap-1">
           {time}
-          <Streamdown mode="static" {...MARKDOWN}>
-            {b.text}
-          </Streamdown>
+          <SaidOf value={{ local: b.local, conversation }}>
+            <Streamdown mode="static" {...MARKDOWN}>
+              {b.text}
+            </Streamdown>
+          </SaidOf>
           {keys && <Keys text={b.text} slot={keys.slot} quotes={keys.quotes} last={keys.last} className="-ml-3.5 mouse:-ml-1.5" />}
         </div>
       );

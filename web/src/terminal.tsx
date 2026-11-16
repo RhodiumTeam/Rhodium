@@ -164,7 +164,7 @@ export const retryIn = (tries: number) => (tries ? Math.min(500 * 2 ** tries, 30
  *  elsewhere (story 351). What you type in it, paste or press goes to the pane (story 346); a wheel or a
  *  swipe on it scrolls the pane (story 343), and a mouse's clicks go to it (story 357). A phone has a row of
  *  keys and a box under it (stories 347, 348). */
-export default function TerminalView({ slot, font, shown }: { slot: string; font: number; shown: boolean }) {
+export default function TerminalView({ slot, font, shown, boxed = false }: { slot: string; font: number; shown: boolean; boxed?: boolean }) {
   const box = useRef<HTMLDivElement>(null);
   const [drawn, setDrawn] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -379,8 +379,9 @@ export default function TerminalView({ slot, font, shown }: { slot: string; font
           </div>
         )}
       </section>
-      {/* A phone's: on a computer you type into the terminal itself. Under the chat shown in its place, the box alone (story 355). */}
-      <div className="hidden shrink-0 bg-background px-3 pb-2 pointer-coarse:block">
+      {/* A phone's: on a computer you type into the terminal itself. Under the chat shown in its place, the box alone (story 355);
+          none there when the chat has its own (boxed, #737). */}
+      <div className={cn("hidden shrink-0 bg-background px-3 pb-2", !(boxed && !shown) && "pointer-coarse:block")}>
         {/* Each keeps the keyboard as it was, up or down. */}
         <div role="toolbar" aria-label="特殊键" onMouseDown={(e) => e.preventDefault()} className={cn("mx-auto grid max-w-3xl grid-cols-9 text-sm text-muted-foreground", !shown && "hidden")}>
           {KEYS.map((k) => (

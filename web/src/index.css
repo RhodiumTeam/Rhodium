@@ -161,7 +161,7 @@
 /* A code block's scroller, unwrapped (#507), and a table's (#502), its edges faded as T3 Code's tables
    are (Base UI ScrollArea's gradient scroll fade): the text is gone 12px inside an edge and fades in
    over 24px, each no wider than how far the scroller can still go that way (--os, --oe, from
-   write.tsx), so it grows as a scroll starts and there is none where nothing is hidden. The bar under
+   common.tsx), so it grows as a scroll starts and there is none where nothing is hidden. The bar under
    it, card-scroll's 10px, stays whole (--under); on a phone, whose bars lie over what scrolls, the fade
    goes all the way down, as over a row of attachments (#577). The build adds -webkit-mask, for iOS Safari. */
 @utility edge-fade {
@@ -177,8 +177,9 @@
 
 /* A plan's scroller on its ask card (#557), in no box, and the palette's (#577), the message box's,
    the queue's and the jump box's (#579): its top and bottom fade, each over no more than how far it
-   can still go that way (--ot, --ob, from write.tsx), so its ends show where it is cut. Its upright
-   bar, --bar wide, stays whole. Its border fades too: a line over it is drawn outside it. */
+   can still go that way (--ot, --ob, from common.tsx), so its ends show where it is cut. Its upright
+   bar, --bar wide, stays whole. Its border and ground fade too: a line over it, or a box
+   with a ground, as round a log or an approval's excerpt (#656), is drawn outside it. */
 @utility edge-fade-y {
   --ft: min(2rem, var(--ot, 0px));
   --fb: min(2rem, var(--ob, 0px));

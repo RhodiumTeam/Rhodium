@@ -10,12 +10,14 @@ import type { RhReply } from "./router";
 
 /** Runs one rh call and returns its exit code. */
 export async function rh(args: string[], env: Record<string, string | undefined> = process.env): Promise<number> {
+  // They ask no rhodium: a child slot's agent is known by what its process was started with (architecture §6.1).
+  const child = env.RHODIUM_CHILD === "1";
   if (!args.length || args[0] === "--help" || args[0] === "-h") {
-    process.stdout.write(helpText());
+    process.stdout.write(helpText(child));
     return 0;
   }
   if (args[0] === "--skill") {
-    process.stdout.write(skillText());
+    process.stdout.write(skillText(undefined, child));
     return 0;
   }
   // Loaded only here: it brings the fake IM platform, which every other rh call can do without.

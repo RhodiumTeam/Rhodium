@@ -314,7 +314,7 @@ test("rh set lifetime=longterm keeps a one-off child; lifetime=oneoff has a long
   expect(await rhodium.ok("ls", "w/once")).toMatch(/^生命周期: 长期$/m);
 }, 30_000);
 
-test("story 98: /rh_use points a chat at a child the dispatcher spawned; you talk to it there, and its rh send me comes there", async () => {
+test("story 98: /rh_use points a chat at a child the dispatcher spawned; you talk to it there, and its reply comes there, its rh send me of words refused (story 590)", async () => {
   await begin({ bots: { q: { like: "qq", owner: ME, target: "w/a" }, t: { like: "telegram", owner: ME, target: "w/a" } } });
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan(["spawn", "fix", "fix the bug"]) });
   expect(await texts(1)).toEqual(["done"]);
@@ -324,8 +324,9 @@ test("story 98: /rh_use points a chat at a child the dispatcher spawned; you tal
   await rhodium.im.inject("t", { chat: ME, sender: ME, text: "/rh_use fix" });
   expect(await texts(1, "t")).toEqual([expect.stringContaining("w/fix")]);
   await rhodium.im.inject("t", { chat: ME, sender: ME, text: plan(["send", "me", "from fix"]) });
-  expect((await texts(2, "t"))[1]).toBe("from fix");
+  expect((await texts(2, "t"))[1]).toBe("done");
   expect(told(await runOf("w/fix"))).toEqual(["fix the bug", plan(["send", "me", "from fix"])]);
+  expect((await rhCalls("w/fix", 1))[0]).toMatchObject({ code: 1, err: "rh: rh send me 被拒绝：你是子槽位，不能直接给用户发消息。把结果写在最终回复里。要发给别的槽位，写全名“工作区/槽位”。\n" });
 
   // The dispatcher keeps its own chat.
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan(["send", "me", "from a"]) });

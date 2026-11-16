@@ -19,7 +19,7 @@ import { PiDriver } from "./pi";
 import { systemPrompt, withSentAt } from "./prompt";
 import { clip } from "./render";
 import { chatOf, PASSED, sendWord, type Write } from "./router";
-import { B32, modelNames, setMeta, setModelNames, untaken, type AgentInput, type Conversation, type Holder, type Slot, type Store } from "./store";
+import { madeAt, modelNames, setMeta, setModelNames, untaken, type AgentInput, type Conversation, type Holder, type Slot, type Store } from "./store";
 import { hasTranscript, listConversations, type Conversation as Found } from "./transcript";
 
 /**
@@ -73,11 +73,12 @@ export async function activeHolders(cfg: Config): Promise<Set<string>> {
 
 /** The environment every agent gets: rhodium's own, the configured PATH, and an empty state dir
  *  for the Telegram channel plugin, which then finds no token and leaves your bot to your own
- *  Claude (architecture §6.2). */
+ *  Claude (architecture §6.2). Not RHODIUM_CHILD, which a rhodium started from a child slot's
+ *  shell has: childEnv sets it, for a child alone. */
 export function agentBaseEnv(cfg: Config): Record<string, string> {
   const telegram = join(cfg.stateDir, "telegram-off");
   mkdirSync(telegram, { recursive: true });
-  const env = Object.fromEntries(Object.entries(process.env).filter((kv): kv is [string, string] => kv[1] !== undefined));
+  const env = Object.fromEntries(Object.entries(process.env).filter((kv): kv is [string, string] => kv[1] !== undefined && kv[0] !== "RHODIUM_CHILD"));
   return { ...env, PATH: cfg.agentPath, TELEGRAM_STATE_DIR: telegram };
 }
 
@@ -117,14 +118,37 @@ function resumable(timeline: Conversation[], found: Found[], current: string): R
 
 /** The slot's name for rh, and its token, made the first time: one per slot, kept for good, as an
  *  agent outlives a rhodium restart and keeps its environment. */
-export function slotToken(store: Store, slot: string): { ref: string; token: string } {
+export function slotToken(store: Store, slot: string): { ref: string; token: string; child: boolean } {
   return store.tx((tx) => {
     const s = tx.get("slot", slot)!;
     const token = s.token ?? randomBytes(32).toString("hex");
     tx.update("slot", { id: slot }, { token });
-    return { ref: `${tx.get("workspace", s.workspace)!.name}/${s.name}`, token };
+    // A child slot as its process starts, as the router's isChild: its parent there, and not archived.
+    const parent = s.parent === null ? undefined : tx.get("slot", s.parent);
+    return { ref: `${tx.get("workspace", s.workspace)!.name}/${s.name}`, token, child: !!parent && parent.archivedAt === null };
   });
 }
+
+/** The slot's appended system prompt, written afresh for each agent process, headless or in the
+ *  terminal (tui), to one file (architecture §6.1): a child slot's, or the other. capabilities: as
+ *  createRunner's. Returns the file and what it says. */
+export function writePrompt(o: { cfg: Config; store: Store; capabilities: (bot: string) => Capabilities | undefined }, slot: string, child: boolean, tui = false): { file: string; text: string } {
+  const { cfg, store } = o;
+  const file = join(cfg.stateDir, "prompt", `${slot}.md`);
+  const rows = store.tx((tx) => tx.find("bot", {}));
+  const bots = rows.flatMap((b) => {
+    const caps = o.capabilities(b.id);
+    return caps ? [{ chat: chatOf(cfg, b, "私聊"), send: sendWord(cfg, b), caps }] : []; // gone from the config
+  });
+  const text = systemPrompt(bots, cfg.durations.oneoffArchive, cfg.durations.sentAtAfter, child, tui);
+  mkdirSync(join(cfg.stateDir, "prompt"), { recursive: true });
+  writeFileSync(file, text);
+  return { file, text };
+}
+
+/** What tells rh --help and rh --skill, which ask no rhodium, that a child slot's agent reads them
+ *  (architecture §6.1). */
+export const childEnv = (child: boolean): { RHODIUM_CHILD?: string } => (child ? { RHODIUM_CHILD: "1" } : {});
 
 export type Runner = ReturnType<typeof createRunner>;
 
@@ -146,7 +170,7 @@ export function createRunner(o: {
   inUse: (session: string) => Promise<string | null>;
   writing?: (conversation: string, e: Extract<AgentEvent, { type: "text_delta" | "item" | "exit" }>) => void;
 }) {
-  const { cfg, store, boot, loop, capabilities } = o;
+  const { cfg, store, boot, loop } = o;
   const live = new Map<string, Live>(); // by conversation id
   const answering = new Set<string>(); // asks whose answer is being written
   let batch: AgentEvent[] | null = null; // what the driver reports while fed one chunk of output
@@ -179,31 +203,19 @@ export function createRunner(o: {
 
   /** The agent's whole environment: the base one, and rh pointed at this rhodium with the slot's
    *  name and token (architecture §9.1). */
-  function agentEnv(slot: { ref: string; token: string }): Record<string, string> {
+  function agentEnv(slot: { ref: string; token: string; child: boolean }): Record<string, string> {
     return {
       ...agentBaseEnv(cfg),
       RHODIUM_SOCKET: join(cfg.socketDir, "rh.sock"),
       RHODIUM_SLOT: slot.ref,
       RHODIUM_TOKEN: slot.token,
+      ...childEnv(slot.child),
     };
-  }
-
-  /** The slot's appended system prompt, written afresh for each agent process (architecture §6.1). */
-  function promptFile(slot: string): string {
-    const file = join(cfg.stateDir, "prompt", `${slot}.md`);
-    const rows = store.tx((tx) => tx.find("bot", {}));
-    const bots = rows.flatMap((b) => {
-      const caps = capabilities(b.id);
-      return caps ? [{ chat: chatOf(cfg, b, "私聊"), send: sendWord(cfg, b), caps }] : []; // gone from the config
-    });
-    mkdirSync(join(cfg.stateDir, "prompt"), { recursive: true });
-    writeFileSync(file, systemPrompt(bots, cfg.durations.oneoffArchive, cfg.durations.sentAtAfter));
-    return file;
   }
 
   /** How to launch the slot's agent, resuming its conversation if it has one. */
   async function spawnSpec(me: Live, slot: Slot, conv: Conversation): Promise<SpawnSpec> {
-    const { ref, token } = slotToken(store, slot.id);
+    const who = slotToken(store, slot.id);
     // Let through for this start: the last process's exit dropped any resume of its own.
     const resumed = store.tx((tx) => tx.find("agentInput", { conversation: conv.id, status: "queued", source: "crash_resume" }).length > 0);
     // A new session id is recorded only once the agent has the session: Claude once its output says
@@ -217,11 +229,11 @@ export function createRunner(o: {
     // After a crash Claude runs the interrupted turn again by itself (architecture §4.8); deliver
     // writes it the resume prompt only if it has none. Only then: rhodium's own environment never
     // turns it on.
-    const { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: _, ...env } = agentEnv({ ref, token });
+    const { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: _, ...env } = agentEnv(who);
     return me.driver.spawn({
       cwd: slot.dir,
       session,
-      systemPromptFile: promptFile(slot.id),
+      systemPromptFile: writePrompt(o, slot.id, who.child).file,
       env,
       resumed,
       approval: Boolean(slot.approval ?? cfg.defaults.approval),
@@ -494,8 +506,7 @@ export function createRunner(o: {
   function told(input: AgentInput): string {
     const body = input.body ?? "";
     // One from the board has no inbound message: the input was made as it came, its ULID's time.
-    const made = () => [...input.id.slice(0, 10)].reduce((t, c) => t * 32 + B32.indexOf(c), 0);
-    const sent = input.source === "human" && input.trace ? (store.tx((tx) => tx.get("inbound", input.trace!)?.receivedAt) ?? made()) : undefined;
+    const sent = input.source === "human" && input.trace ? (store.tx((tx) => tx.get("inbound", input.trace!)?.receivedAt) ?? madeAt(input.id)) : undefined;
     const now = Date.now();
     return sent !== undefined && now - sent > cfg.durations.sentAtAfter ? withSentAt(body, sent, now) : body;
   }

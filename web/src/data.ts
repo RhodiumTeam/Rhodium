@@ -65,8 +65,8 @@ export const refresh = () => queryClient.invalidateQueries();
 
 /** What is told what the stream of the slot whose page it is says of its conversation (architecture
  *  §7.7), its chat: grew, its transcript grew; delta, with text, the agent wrote that; said, the message
- *  it wrote is whole; exit, its process ended; open, the stream opened, which it may have been down,
- *  missing some. */
+ *  it wrote is whole; exit, its process ended; pictures, the board has the checks of the local pictures
+ *  in what it said; open, the stream opened, which it may have been down, missing some. */
 export const heard = new Set<(what: string, text?: string) => void>();
 
 /** How many things heard has been told: a chat drawn again with none told since it went missed nothing. */
@@ -162,7 +162,7 @@ export function follow(changed: () => void, live: (on: boolean) => void, slot?: 
       front();
     });
     // Not in the event table: told to the chat alone, and the rest of the page stays.
-    for (const what of ["grew", "delta", "said", "exit"]) {
+    for (const what of ["grew", "delta", "said", "exit", "pictures"]) {
       events.addEventListener(what, (e) => {
         const { text } = JSON.parse((e as MessageEvent<string>).data) as { text?: string };
         tell(what, text);
@@ -274,8 +274,48 @@ export class Messages {
     const other = this.loaded && p.conversation !== this.conversation;
     const drafts = other ? [] : this.drafts.filter((d) => !d.whole);
     if (other) for (const s of this.sent) s.from = 0;
+    // A block's at is its place in its own transcript: the next one's are timed anew.
+    if (other) this.timed.clear();
     Object.assign(this, { conversation: p.conversation, blocks: p.blocks, start: p.start, end: p.end, loaded: true, drafts });
     this.sent = unread(this.sent, this.blocks);
+  }
+
+  /** The things the agent said with a local picture whose check has yet to come (spec web-images). */
+  waiting(): Block[] {
+    return this.blocks.filter((b) => b.kind === "assistant" && Object.values(b.local?.images ?? {}).some((i) => "pending" in i));
+  }
+
+  /** The blocks settle has timed, by at. */
+  private timed = new Set<string>();
+
+  /** Each of them not timed yet is read again once, 61 s after it came, then changed is called: the
+   *  board, which left its check to the main loop for the minute after it was written, by its own
+   *  clock, checks it itself by then. Counted from when it came, not when it was written, so a page
+   *  whose clock runs ahead never asks early; and once only, so one still waiting then, its copy not
+   *  kept on a full disk say, is not asked for over and over. The pictures event, or loading the page
+   *  again, brings it later. */
+  settle(changed?: () => void): void {
+    if (changed) this.changed = changed;
+    for (const b of this.waiting()) {
+      if (this.timed.has(b.at)) continue;
+      this.timed.add(b.at);
+      setTimeout(() => void this.reread([b.at]).then(() => this.changed?.(), () => {}), 61_000);
+    }
+  }
+
+  /** Whom settle tells: the chat drawn last, as one left and come back to keeps these messages. */
+  private changed?: () => void;
+
+  /** Reads those of them at one of ats again, all with none given, each from its line, and puts what
+   *  came in its place; not what came of another conversation than the one shown by then, the slot's
+   *  new one say, whose blocks may sit at the same place. */
+  async reread(ats?: string[]): Promise<void> {
+    for (const b of this.waiting()) {
+      if (ats && !ats.includes(b.at)) continue;
+      const p = await this.get(`${this.url}&after=${line(b)}`);
+      const again = p.conversation === this.conversation && p.blocks.find((n) => n.at === b.at && n.kind === b.kind);
+      if (again) this.blocks = this.blocks.map((o) => (o.at === b.at ? again : o));
+    }
   }
 
   /** Takes what the stream says the agent writes (heard): delta, text; said, the message is whole; exit,
@@ -302,6 +342,8 @@ export class Messages {
     if (p.conversation === this.conversation) {
       this.blocks = [...p.blocks.filter((b) => line(b) < this.start), ...this.blocks];
       this.start = Math.min(this.start, p.start);
+      // One of an older page may wait too, its row not written yet.
+      this.settle();
     }
     return this.start !== start;
   }

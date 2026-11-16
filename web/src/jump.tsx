@@ -6,9 +6,8 @@ import { Search } from "lucide-react";
 import { useState } from "react";
 import { useLocation } from "wouter";
 import { COLOR, Name, order, word, type Row } from "./board";
-import { AgentLogo, chatAt, openFrom, recent, ROOM } from "./common";
+import { AgentLogo, chatAt, openFrom, recent, ROOM, useEdges } from "./common";
 import { json, type BoardData } from "./data";
-import { useEdges } from "./write";
 
 /** The slots the jump box lists for what was typed (story 441). Nothing: those opened lately in this tab
  *  (recent, the latest first) but the open one (current), then the rest as the list has them; no

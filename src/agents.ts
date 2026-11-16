@@ -66,6 +66,17 @@ export const AGENT_KINDS = Object.keys(AGENTS) as AgentKind[];
 /** The agent of a slot made without one, and the one the /resume list and rh ls leave unmarked. */
 export const DEFAULT_AGENT: AgentKind = "claude";
 
+/** By agent, whether Rhodium types what comes for it into its terminal (architecture §10.5); busy: also
+ *  while Herdr says it works, as Claude takes it into the turn; runs: what of yours from the board led by
+ *  / or ! it types bare, as a command the agent runs, which tui.ts knows on screen and in the transcript
+ *  (#737 probes: Claude's / and !, pi's /skill: and !; Codex could not be probed). One not here is never
+ *  typed into: what comes for it waits for the switch back. Its screen rule and its trace are in tui.ts. */
+export const TYPING: Partial<Record<AgentKind, { busy: boolean; runs?: RegExp }>> = {
+  claude: { busy: true, runs: /^(?:\/[^\s/]|!\s*\S)/ },
+  codex: { busy: true },
+  pi: { busy: true, runs: /^(?:\/skill:\S|!\s*\S)/ },
+};
+
 // Variables a parent Claude or Codex session or Herdr pane hands down (architecture §6.2, §6.4). Left
 // in, a user Herdr hook or extension would report the headless process as that pane's agent. The
 // Claude session ones have many names that change between versions, so every CLAUDE_CODE_ variable

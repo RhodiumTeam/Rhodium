@@ -19,8 +19,9 @@ afterEach(() => rhodium.cleanup());
 
 /** An instance with a fake Herdr, whose bot q (and a Telegram-like t) go to w/a; started, with the slot w/a made. */
 async function begin(opts: InstanceOptions = {}): Promise<Instance> {
+  // Type-in off: these are of a terminal that turns your messages away (test/tui-user-input.test.ts has it on).
   const bots = { q: { like: "qq", owner: ME, target: "w/a" }, t: { like: "telegram", owner: ME, target: "w/a" } } as const;
-  rhodium = newInstance({ bots, claude: { script: obey }, herdr: true, ...opts });
+  rhodium = newInstance({ bots, claude: { script: obey }, herdr: true, ...opts, toml: `${opts.toml ?? ""}\n[defaults]\ntypeIn = false` });
   await rhodium.start();
   await rhodium.slots("a");
   return rhodium;

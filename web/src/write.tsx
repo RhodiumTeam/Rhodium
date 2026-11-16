@@ -5,22 +5,24 @@
 import { AlertDialog } from "@base-ui/react/alert-dialog";
 import { Menu } from "@base-ui/react/menu";
 import { cn } from "cn";
-import { Archive, ArchiveRestore, ArrowUp, Check, ChevronDown, CircleAlert, CornerUpRight, FileText, List, ListPlus, LoaderCircle, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, Quote, RotateCw, Square, SquarePen, SquareTerminal, Trash2, Workflow, X, Zap, type LucideIcon } from "lucide-react";
-import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject, type UIEvent } from "react";
+import { Archive, ArchiveRestore, ArrowUp, Check, ChevronDown, CircleAlert, CornerUpRight, FileText, List, ListPlus, LoaderCircle, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, Quote, RotateCw, Square, SquarePen, SquareTerminal, Terminal, Trash2, Workflow, X, Zap, type LucideIcon } from "lucide-react";
+import { lazy, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject, type UIEvent } from "react";
 import { useLocation } from "wouter";
-import { AGENTS } from "../../src/agents";
+import { AGENTS, TYPING } from "../../src/agents";
 import { parseCommand, plain, quoteOf, quoting, type AgentKind, type BoardAct } from "../../src/contracts";
 import type { Candidate } from "../../src/panels";
 import type { RhReply } from "../../src/router";
 import { cutOrNone, flash, measure } from "./board";
-import { AgentLogo, breakLong, chatAt, FileRow, goHash, MAC, Max, ModelName, ROOM } from "./common";
+import { AgentLogo, breakLong, chatAt, edges, FileRow, goHash, MAC, Max, ModelName, ROOM, useEdges } from "./common";
 import { buttonVariants } from "./components/ui/button";
-import { posting, request, type Card, type Command, type Messages, type Sent, type SlotData } from "./data";
+import { json, posting, request, type Card, type Command, type Messages, type Sent, type SlotData } from "./data";
 import { InfoCard } from "./card";
 import { AgentSheet, Answer, matching, ModelSheet, Palette } from "./palette";
 import { dismiss, toast, useToasts, type Toast } from "./toast";
 import { useTerminalEntry } from "./settings";
 import { askOnce } from "./unread";
+
+const Viewer = lazy(() => import("./viewer"));
 
 const TRIES = 3;
 
@@ -205,41 +207,6 @@ export function keep(storage: () => Storage, key: string, value: string | null) 
   } catch {}
 }
 
-/** Writes how far a scroller can still go left and right, up and down, how wide its upright bar is and
- *  how high the one under it, none where bars lie over what scrolls, for its edge-fade or edge-fade-y
- *  (index.css). */
-const edges = (el: HTMLElement) => {
-  el.style.setProperty("--os", `${el.scrollLeft}px`);
-  el.style.setProperty("--oe", `${el.scrollWidth - el.clientWidth - el.scrollLeft}px`);
-  el.style.setProperty("--ot", `${el.scrollTop}px`);
-  el.style.setProperty("--ob", `${el.scrollHeight - el.clientHeight - el.scrollTop}px`);
-  el.style.setProperty("--bar", `${el.offsetWidth - el.clientWidth}px`);
-  el.style.setProperty("--under", `${el.offsetHeight - el.clientHeight}px`);
-};
-/** A scroller's ref and onScroll that keep its edge-fade up to date: on a scroll, and as the scroller or
- *  what it holds changes size, a line or a row still being written, a part swapped for another or
- *  opened included (#638); the scroller may come later than its component. A message box holds no
- *  element: it reads them again as its text changes. box: a ref that gets the scroller too. */
-export function useEdges<T extends HTMLElement>(box?: RefObject<T | null>) {
-  const ref = useCallback((el: T | null) => {
-    if (box) box.current = el;
-    if (!el) return;
-    const sized = new ResizeObserver(() => edges(el));
-    const watch = () => {
-      sized.disconnect();
-      for (const n of [el, ...el.children]) sized.observe(n);
-    };
-    const swapped = new MutationObserver(watch);
-    swapped.observe(el, { childList: true });
-    watch();
-    return () => {
-      sized.disconnect();
-      swapped.disconnect();
-      if (box) box.current = null;
-    };
-  }, []);
-  return { ref, onScroll: (e: UIEvent<T>) => edges(e.currentTarget) };
-}
 /** A choice in a menu: its icon and what it says; on: the one now, ticked. */
 export type Choice = { icon?: LucideIcon; label: string; on?: boolean; run: () => void };
 
@@ -611,7 +578,10 @@ const MAX_FILES = 20 << 20;
  *  thinking level (agent, model, effort), ultracode marked where on, each opening its sheet (stories 302-304), as /rh_agent and
  *  /model do, picked or typed alone, and closing it tapped again (story 519); then, switchable, the terminal key (story 265). A slot archived has
  *  none of the three, as the model sheet's /model and /effort on opening would bring it back. changed: what the chat shows has changed. */
-export function Composer({ slot, turn, archived, switchable, log, changed, commands, agent, model, effort, ultracode }: { slot: string; turn: boolean; archived: boolean; switchable: boolean; log: Messages; changed: () => void; commands: Command[]; agent: AgentKind | null; model: string | null; effort: string | null; ultracode: boolean }) {
+/** Where you type to the slot (spec web-write "页面"). terminal: under the chat of a slot in the terminal,
+ *  whose words Rhodium types in there (#737): words, files and a quote only, no palette, no bar, no stop;
+ *  a / or ! command its agent runs goes as typed, a ! told it runs in the shell. */
+export function Composer({ slot, turn, archived, switchable, log, changed, commands, agent, model, effort, ultracode, terminal = false }: { slot: string; turn: boolean; archived: boolean; switchable: boolean; log: Messages; changed: () => void; commands: Command[]; agent: AgentKind | null; model: string | null; effort: string | null; ultracode: boolean; terminal?: boolean }) {
   const [text, setText] = useState(() => draft(slot));
   const [files, setFiles] = useState<File[]>(() => unsentFiles.get(slot) ?? []);
   useEffect(() => void (files.length ? unsentFiles.set(slot, files) : unsentFiles.delete(slot)), [slot, files]);
@@ -636,7 +606,10 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
   const box = useRef<HTMLTextAreaElement>(null);
   const edged = useEdges(box);
   const type = (t: string) => (setText(t), keepDraft(slot, t), setAt(0), setShut(null));
-  const list = /^\/\S*$/.test(text) && text !== shut ? matching(commands, text.slice(1)) : [];
+  const list = !terminal && /^\/\S*$/.test(text) && text !== shut ? matching(commands, text.slice(1)) : [];
+  // A command its terminal's agent runs (TYPING's runs): a ! one goes to its shell.
+  const runs = terminal && agent !== null && !!TYPING[agent]?.runs?.test(text.trim());
+  const shell = runs && text.trim().startsWith("!");
   const empty = !text.trim() && !files.length;
   const mode = keyMode(turn, text, files.length);
   const stop = turn && empty;
@@ -702,10 +675,10 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
     if (busy || (empty && !stop)) return;
     if (files.reduce((n, f) => n + f.size, 0) > MAX_FILES) return toast("附件一次最多 20MB。", true);
     if (stop) return halt();
-    // Queued, it shows in the queue rather than as a bubble (story 283).
-    const queued = keyMode(turn, typed, files.length) === "queue";
-    // Words for the agent go under the reply you quote, which then goes; a command leaves it.
-    const words = quoted === null ? typed.trim() : withQuote(quoted, typed.trim(), files.length);
+    // Queued, it shows in the queue rather than as a bubble (story 283); so does all for the terminal, till it is typed in.
+    const queued = terminal || keyMode(turn, typed, files.length) === "queue";
+    // Words for the agent go under the reply you quote, which then goes; a command leaves it, one for the terminal led by ! too.
+    const words = quoted === null || (terminal && /^[!/]/.test(typed.trim())) ? typed.trim() : withQuote(quoted, typed.trim(), files.length);
     if (words !== typed.trim()) setQuoted(null);
     const shown = queued ? null : forAgent(words, files.length);
     const s: Sent = { id: crypto.randomUUID(), text: shown ?? "", words, files, from: log.end };
@@ -733,6 +706,8 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
     setBusy(false);
     if (shown !== null) s.failed = r.ok ? undefined : r.error;
     else if (!r.ok) (toast(r.error, true), putBack(slot, words, files));
+    // For the terminal, what Rhodium answers itself, as /status or a /rh_ command, shows as show() has it.
+    else if (terminal && r.text !== "排进终端") show(r, words);
     changed();
   };
   return (
@@ -754,6 +729,12 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
           </div>
         )}
         {files.length > 0 && <Attached files={files} drop={(i) => setFiles(files.filter((_, j) => j !== i))} />}
+        {shell && (
+          <div className="flex items-center gap-1.5 pt-2.5 pl-4 text-sm text-muted-foreground">
+            <Terminal className="size-3.5 shrink-0" />
+            <span className="min-w-0 truncate">将在终端里执行 bash 命令</span>
+          </div>
+        )}
         <textarea
           aria-label="消息"
           placeholder="发消息"
@@ -790,10 +771,10 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
           }}
           // A phone's floating bar is drawn square over the box's round corners: clipped to them, where it
           // has them, with nothing over it (#646).
-          className={cn("card-scroll edge-fade-y block max-h-[40dvh] scroll-py-8 min-h-11 w-full resize-none [clip-path:border-box] bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground", quoted === null && !files.length && "rounded-t-[inherit]")}
+          className={cn("card-scroll edge-fade-y block max-h-[40dvh] scroll-py-8 min-h-11 w-full resize-none [clip-path:border-box] bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground", quoted === null && !files.length && !shell && "rounded-t-[inherit]")}
         />
         <div className="flex min-w-0 items-center px-1 pb-1">
-          {agent && !archived && (
+          {agent && !archived && !terminal && (
             <>
               <button aria-label="换 agent" aria-expanded={shown === "agent"} onClick={() => sheet("agent", true)} className="hover-round grid size-11 shrink-0 place-items-center">
                 <AgentLogo agent={agent} className="size-5" />
@@ -844,15 +825,28 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
 }
 
 /** Why one Rhodium holds for you waits (story 286). */
-const HELD: Partial<Record<SlotData["queue"][number]["reason"], string>> = { after_interrupt: "等打断生效", after_quota: "等额度", stopping: "正在停止" };
+const HELD: Partial<Record<SlotData["queue"][number]["reason"], string>> = { after_interrupt: "等打断生效", after_quota: "等额度", stopping: "正在停止", tui: "切回无头才交给它" };
 
 /** The queue above where you type (spec web-write "待发队列", stories 283-286): how many wait, and once a
  *  stop paused them, a pause sign and 继续. Each a line: 插话 sends it in now (发送, paused), 编辑 takes it
  *  back where you type, 删除 takes it off. One with files has no 编辑: they cannot go back. One Rhodium
- *  holds for you can only be taken off, why under it. Three lines high, then it scrolls, faded where cut
- *  (#579). Only what goes wrong is said: the queue itself shows what went right. */
-export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] }) {
+ *  holds for you can only be taken off, why under it. So can one waiting for the switch back from the
+ *  terminal, or to be typed there, or typed and not known to have got there (product §4.2), who sent
+ *  it beside why (yours, 你 and the chat), that last with 重发 too; a click on it shows its whole text. Three lines
+ *  high, then it scrolls, faded where cut (#579). Only what goes wrong is said: the queue itself shows
+ *  what went right. */
+export function Queue({ slot, queue, spaced = false }: { slot: string; queue: SlotData["queue"]; spaced?: boolean }) {
   const [busy, setBusy] = useState<string | null>(null);
+  // The one waiting for the switch back opened, with its whole text once it came.
+  const [open, setOpen] = useState<{ id: string; text?: string } | null>(null);
+  const show = (id: string) => {
+    if (open?.id === id) return setOpen(null);
+    setOpen({ id });
+    json<{ text: string }>(`api/held?id=${encodeURIComponent(id)}`).then(
+      ({ text }) => setOpen((o) => (o?.id === id ? { id, text } : o)),
+      () => setOpen((o) => (o?.id === id ? null : o)),
+    );
+  };
   const scroller = useEdges<HTMLDivElement>();
   const run = async (key: string, a: Omit<Extract<BoardAct, { kind: "queued" }>, "kind" | "slot">, then?: () => void) => {
     if (busy) return;
@@ -869,7 +863,8 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
     </button>
   );
   return (
-    <section aria-label="待发队列" className="px-3 pt-1">
+    // spaced: clear of the terminal's black, and of the screen's edge under the chat, with no box there on a computer.
+    <section aria-label="待发队列" className={cn("px-3 pt-1", spaced && "py-2")}>
       <div className="mx-auto max-w-3xl rounded-2xl border bg-card text-sm shadow-xs">
         <div className="flex h-9 items-center gap-1.5 border-b pl-3 text-muted-foreground">
           <span role="img" aria-label={paused ? "暂停了" : "排着"}>
@@ -880,14 +875,16 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
         </div>
         {/* The line over it is the head's: the fade would take it. A phone's floating bar keeps inside
             the box's round corners, as the message box's does. */}
-        <div {...scroller} className="card-scroll edge-fade-y max-h-[8.25rem] scroll-py-8 overflow-y-auto rounded-b-[inherit] [clip-path:border-box]">
+        {/* One opened, and still there, has room to be read, half the screen. */}
+        <div {...scroller} className={cn("card-scroll edge-fade-y scroll-py-8 overflow-y-auto rounded-b-[inherit] [clip-path:border-box]", queue.some((q) => q.id === open?.id) ? "max-h-[50dvh]" : "max-h-[8.25rem]")}>
           <ul>
             {queue.map((q) => {
               const held = HELD[q.reason];
               // Under a quote, your words, so two quoting the same are told apart; the quote's, with none.
               const quoted = quoteOf(q.text);
               return (
-                <li key={q.id} className="flex min-h-11 items-center pl-3">
+                // Opened, its delete key stays by its first line.
+                <li key={q.id} className={cn("flex min-h-11 pl-3", open?.id === q.id ? "items-start" : "items-center")}>
                   {q.files > 0 && (
                     <span role="img" aria-label="附件" className="mr-1.5 shrink-0 text-muted-foreground">
                       <Paperclip className="size-3.5" />
@@ -898,10 +895,21 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
                       <Quote className="size-3.5" />
                     </span>
                   )}
-                  <div className="min-w-0 flex-1 py-1">
-                    <p className="truncate">{quoted ? quoted.rest.trim() || plain(quoted.quote) : q.text}</p>
-                    {held && <p className="text-xs text-muted-foreground">{held}</p>}
-                  </div>
+                  {q.reason === "tui" ? (
+                    <button aria-expanded={open?.id === q.id} onClick={() => show(q.id)} className="min-w-0 flex-1 py-1 text-left">
+                      {open?.id === q.id && open.text !== undefined ? <p className="wrap-anywhere whitespace-pre-wrap">{open.text}</p> : <p className="truncate">{quoted ? quoted.rest.trim() || plain(quoted.quote) : q.text}</p>}
+                      <p className="flex gap-3 text-xs text-muted-foreground">
+                        <span className={q.via ? "shrink-0" : "truncate"}>{q.from}</span>
+                        {q.via && <span className="truncate">{q.via}</span>}
+                        {(q.wait ?? held) && <span className="shrink-0">{q.wait ?? held}</span>}
+                      </p>
+                    </button>
+                  ) : (
+                    <div className="min-w-0 flex-1 py-1">
+                      <p className="truncate">{quoted ? quoted.rest.trim() || plain(quoted.quote) : q.text}</p>
+                      {held && <p className="text-xs text-muted-foreground">{held}</p>}
+                    </div>
+                  )}
                   {!held &&
                     (q.reason === "web_paused"
                       ? button(`${q.id} now`, "发送", <ArrowUp className="size-4" />, () => void run(`${q.id} now`, { op: "now", input: q.id }))
@@ -909,6 +917,7 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
                   {/* With files, a gap where 编辑 goes keeps the buttons in their columns. */}
                   {!held &&
                     (q.files ? <span className="size-11 shrink-0" /> : button(`${q.id} edit`, "编辑", <Pencil className="size-4" />, () => void run(`${q.id} edit`, { op: "drop", input: q.id }, () => putBack(slot, q.text))))}
+                  {q.unsure && button(`${q.id} resend`, "重发", <RotateCw className="size-4" />, () => void run(`${q.id} resend`, { op: "resend", input: q.id }))}
                   {button(`${q.id} drop`, "删除", <X className="size-4" />, () => void run(`${q.id} drop`, { op: "drop", input: q.id }))}
                 </li>
               );
@@ -925,13 +934,23 @@ export function Queue({ slot, queue }: { slot: string; queue: SlotData["queue"] 
  *  track and its 3px clear border, the list's 16px). drop: the i-th let go. */
 function Attached({ files, drop }: { files: File[]; drop: (i: number) => void }) {
   const scroller = useEdges<HTMLDivElement>();
+  // The pictures, each by an address of its own bytes in the page, which the viewer steps through.
+  const [pics, setPics] = useState<{ file: File; src: string; alt: string }[]>([]);
+  useEffect(() => {
+    const made = files.filter((f) => f.type.startsWith("image/")).map((f) => ({ file: f, src: URL.createObjectURL(f), alt: f.name }));
+    setPics(made);
+    return () => made.forEach((p) => URL.revokeObjectURL(p.src));
+  }, [files]);
+  const [open, setOpen] = useState<number>();
   return (
     <div {...scroller} className="card-scroll edge-fade overflow-x-auto [--track-x:0.8125rem]">
       <ul aria-label="附件" className="flex w-max gap-2 px-4 pt-3">
         {files.map((f, i) => (
           <li key={`${i} ${f.name}`} className="relative shrink-0 pt-1.5 pr-1.5">
             {f.type.startsWith("image/") ? (
-              <Thumb file={f} className="size-14 rounded-lg border object-cover" />
+              <button onClick={() => setOpen(pics.findIndex((p) => p.file === f))} className="block rounded-lg">
+                <img src={pics.find((p) => p.file === f)?.src} alt={f.name} className="size-14 rounded-lg border object-cover" />
+              </button>
             ) : (
               <span className="flex h-14 w-32 items-center gap-1.5 rounded-lg border bg-muted px-2 text-xs">
                 <FileText className="size-4 shrink-0 text-muted-foreground" />
@@ -944,6 +963,11 @@ function Attached({ files, drop }: { files: File[]; drop: (i: number) => void })
           </li>
         ))}
       </ul>
+      {open !== undefined && (
+        <Suspense>
+          <Viewer pics={pics} at={open} close={() => setOpen(undefined)} />
+        </Suspense>
+      )}
     </div>
   );
 }

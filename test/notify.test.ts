@@ -291,7 +291,7 @@ test("with both of QQ's quotas used up, rh send me comes through the Telegram bo
   expect((await posts("t", 1)).map((p) => p.text)).toEqual([`${FORWARDED}hi`]);
 }, 30_000);
 
-test("a child's rh send me another bot takes to a chat that goes to its parent says whose it is under the forwarding line, alone before a file", async () => {
+test("a child's file by rh send me another bot takes to a chat that goes to its parent says whose it is under the forwarding line, alone before the file", async () => {
   // q's chat points at the child (/rh_use), so it is the child's; t's still goes to w/a (product §5.9).
   await begin({ toml: "[limits]\nqqPassiveReplies = 1\nqqActive = 0", claude: { script: obey } });
   await rhodium.ok("send", "w/a", plan(["spawn", "c", plan()]));
@@ -299,9 +299,10 @@ test("a child's rh send me another bot takes to a chat that goes to its parent s
   writeFileSync(join(rhodium.dir, "w/notes.txt"), "12 wicks\n");
   await say("q", "/rh_use c");
   await posts("q", 1);
-  await say("q", plan(["send", "me", "hi"], ["send", "me", "--file", "notes.txt"]));
-  const got = await posts("t", 3);
-  expect(got.map((p) => p.file?.name ?? p.text.trimEnd())).toEqual([`${FORWARDED}〔w/c〕\nhi`, `${FORWARDED}〔w/c〕`, "notes.txt"]);
+  // A child sends you a file alone, and only while you talk to it directly (story 591).
+  await say("q", plan(["send", "me", "--file", "notes.txt"]));
+  const got = await posts("t", 2);
+  expect(got.map((p) => p.file?.name ?? p.text.trimEnd())).toEqual([`${FORWARDED}〔w/c〕`, "notes.txt"]);
 }, 30_000);
 
 test("rh send me for a chat whose bot is faulted comes through the other bot", async () => {

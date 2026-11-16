@@ -3,19 +3,20 @@
 // is on its own at the end. Each call is drawn with its kind's icon (#206), as T3 Code and Orca do.
 import { cjk } from "@streamdown/cjk";
 import { cn } from "cn";
-import { Bot, Brain, Check, ChevronRight, CircleX, Copy, FilePen, FileText, Globe, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
-import { Fragment, useEffect, useState, useSyncExternalStore, type ComponentProps, type CSSProperties } from "react";
+import { Bot, Brain, Check, ChevronRight, CircleX, Copy, FilePen, FileText, Globe, Image, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
+import { createContext, Fragment, useContext, useEffect, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type MouseEvent } from "react";
 import { defaultComponents, Streamdown, type ExtraProps, type StreamdownProps } from "streamdown";
 import type { FullData } from "../../src/board";
 import type { AgentKind } from "../../src/contracts";
+import { decoded, elsewhere, inPage, linkWords } from "../../src/local";
 import { span } from "../../src/panels";
 import { named, NOT_TOOLS, shortParts, type ShortParts } from "../../src/tool-line";
-import { Box } from "./common";
-import { Carried } from "./media";
+import { Box, useEdges } from "./common";
+import { Carried, NoPicture, Picture } from "./media";
 import { Button } from "./components/ui/button";
-import { json, type Block } from "./data";
+import { json, request, type Block } from "./data";
 import { toast } from "./toast";
-import { keep, kept, useEdges } from "./write";
+import { keep, kept } from "./write";
 
 type Tool = Extract<Block, { kind: "tool" }>;
 type Step = Tool | Extract<Block, { kind: "thinking" }>;
@@ -28,10 +29,77 @@ export type Shown =
 
 const THOUGHT = { name: "思考", arg: null, code: false };
 
+/** The thing the agent said that the Markdown under it draws: what it refers to on this machine, as the
+ *  board checked it, and its conversation. With none, as for what it still writes, no local picture or
+ *  link has a check yet. */
+export const SaidOf = createContext<{ local?: Extract<Block, { kind: "assistant" }>["local"]; conversation: string } | null>(null);
+
+const last = (path: string) => path.slice(path.lastIndexOf("/") + 1);
+/** Whether a link stays one, for Link to draw: to http or https, or a local path. Not one to any other
+ *  address elsewhere, nor to a place in the page (#安装, a footnote's), nor one with no target, as
+ *  Streamdown gives one still being written. */
+const linked = (to: string) => /^https?:/i.test(to) || (!!to && !to.startsWith("streamdown:") && !elsewhere(to) && !inPage(to));
+/** Whether a local picture is inside: such a link is the picture alone, whose tap opens the viewer and
+ *  must not follow a link too, nor give way to the link's words. */
+const pictured = (n: Hast): boolean => !!n.children?.some((c) => (c.tagName === "img" && !elsewhere(String(c.properties?.src ?? ""))) || pictured(c));
+
+/** A link in what the agent said (spec web-images "页面"): one to http or https as ever; a local path the
+ *  board says gives a file downloads it, as the disk has it then, by /api/file, saying so where it no
+ *  longer does; any other local one, a code reference too, is its words and path, no link. */
+function Link({ node, href, children, ...p }: ComponentProps<"a"> & ExtraProps) {
+  const of = useContext(SaidOf);
+  const to = String(href ?? "");
+  if (elsewhere(to)) return <defaultComponents.a node={node} href={href} {...p}>{children}</defaultComponents.a>;
+  const path = decoded(to);
+  const words = text((node as Hast | undefined) ?? {});
+  // No words but a picture elsewhere, a badge say: the picture stays, not the path in its place.
+  if (of?.local?.links[path] !== "file") return !words && (node as Hast | undefined)?.children?.length ? <>{children}</> : linkWords(words, path) === path ? path : <>{children}（{path}）</>;
+  const url = `api/file?conversation=${encodeURIComponent(of.conversation)}&path=${encodeURIComponent(path)}`;
+  const gone = () => toast("文件不在了，或者不能下载。", true);
+  // Asked first: a download that fails says nothing on the page.
+  const get = (e: MouseEvent) => (e.preventDefault(), void request(url, { method: "HEAD" }).then((r) => (r.ok ? Object.assign(document.createElement("a"), { href: url, download: last(path) }).click() : gone()), gone));
+  return <defaultComponents.a node={node} {...p} href={url} download={last(path)} target={undefined} onClick={get}>{children}</defaultComponents.a>;
+}
+
+/** A picture in what the agent said (spec web-images "页面"): one elsewhere as ever, the browser's to
+ *  load. A local one by the board's check of it: kept, its preview on a line of its own, which opens
+ *  the viewer; not passed, a grey box with its words, path and why; pruned, a box saying so. Not
+ *  checked yet, as in what the agent still writes, a grey box a line high with its words. Never an
+ *  <img> of a local path, which the browser could only draw broken. */
+function LocalImage({ node, src, alt, ...p }: ComponentProps<"img"> & ExtraProps) {
+  const of = useContext(SaidOf);
+  const to = String(src ?? "");
+  if (elsewhere(to)) return <defaultComponents.img node={node} src={src} alt={alt} {...p} />;
+  const path = decoded(to);
+  const it = of?.local?.images[path];
+  const icon = <Image className="size-4 shrink-0 text-muted-foreground" />;
+  if (it && "hash" in it) return <span className="my-3 block"><Picture m={it} /></span>;
+  if (it && "gone" in it) return <span className="my-3 block"><NoPicture gone /></span>;
+  if (it && "why" in it)
+    return (
+      <span className="my-3 grid w-fit max-w-full gap-0.5 rounded-xl border bg-muted px-3 py-2 text-sm">
+        {/* Long words wrap, as the path does: the icon by their first line. */}
+        <span className="flex min-w-0 items-start gap-2">
+          <span className="flex h-lh items-center">{icon}</span>
+          <span className="min-w-0">{alt || last(path)}</span>
+        </span>
+        <span className="font-mono text-xs break-all text-muted-foreground">{path}</span>
+        <span className="text-xs text-muted-foreground">{it.why}</span>
+      </span>
+    );
+  return (
+    <span className="inline-flex max-w-full items-start gap-1.5 rounded-md border bg-muted px-1.5 align-bottom text-sm text-muted-foreground">
+      <span className="flex h-lh items-center">{icon}</span>
+      <span className="min-w-0">{alt || last(path)}</span>
+    </span>
+  );
+}
+
 // Quiet, as in IM: a table in one box with no buttons (#502), a code block only its own two
 // (CodeBlock), no line numbers, links open with no warning. On a page that writes, what an agent wrote
 // is never more than words (spec web-write): raw HTML shows as written, with no rehype-raw to make it
-// elements, and a link goes only to http or https, any other its words alone. One object each, so the
+// elements, and a link goes only to http or https, or downloads a local file the board checked (Link);
+// one to any other address elsewhere, mailto or javascript say, is its words alone. One object each, so the
 // agent's messages are not drawn again for each piece of a draft (Streamdown's memo). min-w-0: in a
 // grid or flex it is no wider than its column, so a long code line or a wide table scrolls in its own
 // box, not the chat (#488).
@@ -42,12 +110,40 @@ export const MARKDOWN: Partial<StreamdownProps> = {
     code: (p) => ("data-block" in p ? <CodeBlock {...p} /> : <defaultComponents.code {...p} />),
     table: Table,
     td: Cell,
+    a: Link,
+    img: LocalImage,
+    // A task list item's box (#677), the board's own in both schemes, where the dot of any other item
+    // is (className below): only shown, never a key, as the browser's disabled one was. Out of the line,
+    // so the item's words start where any other item's do, the space after the box gone with it.
+    input: ({ node, checked, ...p }) =>
+      p.type === "checkbox" ? (
+        <span className="absolute -ml-[1.125em] flex h-lh items-center">
+          <span role="checkbox" aria-checked={!!checked} aria-disabled className={cn("grid size-[0.875em] place-items-center rounded-[0.2em] border", checked ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/60")}>
+            {checked && <Check className="size-[0.75em]" strokeWidth={3} />}
+          </span>
+        </span>
+      ) : (
+        <input checked={checked} {...p} />
+      ),
+    // A numbered list's left room follows the digits of its last number: its numbers hang left of the
+    // words (className below), and a fixed room cut "10." at a plan card's edge, "2024." to "024.".
+    ol: ({ node, ...p }) => {
+      const to = (Number(p.start) || 1) + ((node as Hast | undefined)?.children?.filter((c) => c.tagName === "li").length ?? 1) - 1;
+      return <defaultComponents.ol node={node} {...p} style={{ paddingLeft: `${String(to).length + 1.5}ch` }} />;
+    },
   },
   lineNumbers: false,
   linkSafety: { enabled: false },
-  className: "min-w-0 wrap-anywhere",
+  // A list's markers hang outside its items, so a picture's box, on a line of its own, starts under the
+  // item's words as its wrapped lines do: Streamdown's own put the marker in the line, the box under it.
+  // A task list item has its box for a marker, no dot. An item's paragraphs after its first each start
+  // a line of their own, under the first's words: Streamdown runs them all into one line (#677). A
+  // picture in a line adds no room above it, Streamdown's wrapper's 16px margins, and sits on the middle
+  // of the words, not their baseline (#677). The item holds its box, so the box scrolls with the item in
+  // a scroll box that is not positioned itself, a plan card's.
+  className: "min-w-0 wrap-anywhere [&_ol]:list-outside [&_ul]:list-outside [&_ul]:pl-6 [&_.task-list-item]:list-none [&_.task-list-item]:relative [&_li>p+p]:block [&_li>p+p]:mt-2 [&_[data-streamdown=image-wrapper]]:my-0 [&_[data-streamdown=image-wrapper]]:align-middle",
   rehypePlugins: [],
-  allowElement: (e) => e.tagName !== "a" || /^https?:/i.test(String(e.properties.href ?? "")),
+  allowElement: (e) => e.tagName !== "a" || (linked(String(e.properties.href ?? "")) && !pictured(e)),
   unwrapDisallowed: true,
 };
 
@@ -67,7 +163,9 @@ const TAB = 4;
  *  either. Wide, it scrolls inside, its edges faded as an unwrapped code block's are. A cell's words
  *  keep whole, a link's too (Streamdown's wrap-anywhere on it), a long one widening the table (#559):
  *  the chat's wrap-anywhere let it squeeze a column to one letter instead. --share: 3/4 of a column's
- *  share of the box, which Cell keeps for its words; the rest goes to the cells with the most words. */
+ *  share of the box, which Cell keeps for its words; the rest goes to the cells with the most words.
+ *  A picture's preview in a cell, a button, is no wider than --share less the cell's padding, so the
+ *  table need not scroll for it: a cell has no width for its own max-w-full to go by. */
 function Table({ node, ...p }: ComponentProps<"table"> & ExtraProps) {
   const scroller = useEdges<HTMLDivElement>();
   const cols = (node as Hast | undefined)?.children?.find((c) => c.tagName === "thead")?.children?.find((c) => c.tagName === "tr")?.children?.filter((c) => c.tagName === "th").length || 1;
@@ -75,12 +173,12 @@ function Table({ node, ...p }: ComponentProps<"table"> & ExtraProps) {
   return (
     <div className="my-4 overflow-hidden rounded-lg border bg-card">
       <div {...scroller} className="@container card-scroll edge-fade overflow-x-auto">
-        <table {...p} style={{ "--share": `${75 / cols}cqw` } as CSSProperties} className="table-head w-full divide-y wrap-break-word [&_a]:wrap-break-word [&_td]:px-3 [&_th]:px-3" />
+        <table {...p} style={{ "--share": `${75 / cols}cqw` } as CSSProperties} className="table-head w-full divide-y wrap-break-word [&_a]:wrap-break-word [&_td]:px-3 [&_td_button]:max-w-[calc(var(--share)-1.5rem)] [&_th]:px-3" />
       </div>
     </div>
   );
 }
-type Hast = { tagName?: string; value?: string; children?: Hast[] };
+type Hast = { tagName?: string; value?: string; properties?: Record<string, unknown>; children?: Hast[] };
 const text = (n: Hast): string => n.value ?? n.children?.map(text).join("") ?? "";
 /** A table cell no narrower than its words on one line, up to 12em of them and --share of the box
  *  (#559): else a long path widening the table left the other columns only their longest word or

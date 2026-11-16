@@ -8,3 +8,5 @@ dist/
 .env
 # recorded fixtures are committed even though they end in .log
 !test/fixtures/**
+# what upgrade.sh says the instance runs now (deploy/README.md)
+deploy/RUNNING.txt

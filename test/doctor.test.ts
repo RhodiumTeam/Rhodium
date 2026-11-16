@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { PROTOCOL } from "../src/doctor";
 import { updateClaude as update, type UpdateOptions } from "./claude-update";
 import { installFakeAgent, type Config as FakeAgentConfig, type Script } from "./fake-agent/fake-agent";
-import { endTurn, on, startTurn } from "./fake-agent/scripts";
+import { codexOn, endTurn, on, startTurn } from "./fake-agent/scripts";
 import { newInstance, until, type Instance } from "./instance";
 
 const ME = "you-openid";
@@ -168,6 +168,33 @@ test("the daily checks report free disk space, database backups and pi's version
   const later = await rhodium.ok("doctor");
   expect(later).toMatch(/^最近的数据库备份：0 小时前$/m);
   expect(later).not.toMatch(/^告警：.*备份/m);
+});
+
+test("doctor reads the version of a managed pi install, whose bin/pi is a launcher script", async () => {
+  rhodium = newInstance();
+  await rhodium.start();
+  updateClaude("2.1.304");
+  // bin/pi runs install/releases/<install/current-version>/node_modules/.bin/pi, a link into the package.
+  const install = join(rhodium.dir, "install");
+  const release = join(install, "releases/1.5.0/node_modules");
+  const pkg = join(release, "@earendil-works/pi-coding-agent");
+  mkdirSync(join(pkg, "dist/bundle"), { recursive: true });
+  mkdirSync(join(release, ".bin"));
+  writeFileSync(join(pkg, "package.json"), j({ name: "@earendil-works/pi-coding-agent", version: "1.5.0" }));
+  renameSync(rhodium.pi.path, join(pkg, "dist/bundle/cli.js"));
+  symlinkSync(join(pkg, "dist/bundle/cli.js"), join(release, ".bin/pi"));
+  writeFileSync(join(install, "current-version"), "1.5.0\n");
+  const launcher = '#!/bin/sh\nd="$(dirname "$0")/.."\nexec "$d/install/releases/$(cat "$d/install/current-version")/node_modules/.bin/pi" "$@"\n';
+  writeFileSync(rhodium.pi.path, launcher, { mode: 0o755 });
+
+  expect(await rhodium.ok("doctor")).toContain("pi 1.5.0");
+
+  for (const bad of ["1.4.0\n", "../1.5.0\n", ""]) {
+    writeFileSync(join(install, "current-version"), bad);
+    const out = await rhodium.ok("doctor");
+    expect(out).toContain(`告警：读不到 pi 的版本号（${rhodium.pi.path}）`);
+    expect(out).not.toMatch(/^pi \d/m);
+  }
 });
 
 test("a Claude process reporting a new version runs the checks, which tell you in the main chat; the slot answers all the same", async () => {
@@ -395,6 +422,15 @@ test("#435: a provider of your own in codex's config is a login, by its name and
 test("stories 498, 510: a codex that no longer takes untrusted is an error: Codex slots with approval on cannot start", async () => {
   const out = await doctor({ codex: { script: "codex-no-untrusted" } });
   expect(out).toMatch(/^错误：Codex 这一版不再接受“每条都问”的审批设置.*unknown variant `untrusted`.*审批开的 Codex 槽位起不来/m);
+});
+
+test("#733: codex answering an error once it has started is Codex's own, which upgrade.sh keeps the new version on; one that fails initialize is a failed handshake", async () => {
+  const down = await doctor({ codex: { script: "codex-backend-down" } });
+  expect(down).toMatch(/^错误：Codex 的 account\/read 应答出错：workspace routing discovery timed out$/m);
+  expect(down).not.toContain("握手失败");
+
+  codexAs({ script: { on: [{ match: { method: "initialize" }, emit: [JSON.stringify({ error: { code: -32600, message: "unsupported client" }, id: "{{in.id}}" })] }, ...codexOn!], steps: [] } });
+  expect(await rhodium.ok("doctor")).toMatch(/^错误：和 codex 握手失败：initialize 应答出错：unsupported client$/m);
 });
 
 test("story 510: a codex of another version than the last check's is a warning, once; with no codex installed there is no Codex section", async () => {

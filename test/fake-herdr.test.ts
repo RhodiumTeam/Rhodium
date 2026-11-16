@@ -348,6 +348,79 @@ test("tab.rename, as Herdr 0.9.1 did it (scripts/probes/herdr/probe-tab-rename.t
   expect(fake).toEqual(real);
 });
 
+const reading: { dir: string; msg: any }[] = readFileSync(join(import.meta.dir, "fixtures/herdr/pane-read.jsonl"), "utf8")
+  .split("\n")
+  .filter(Boolean)
+  .map((l) => JSON.parse(l));
+
+test("#710: pane.read, as Herdr 0.9.5 did it (scripts/probes/herdr/probe-pane-read.ts): recent and visible keep the styles, with or without strip_ansi; text drops them; detection is plain text whatever the format; a pane not there is pane_not_found; the fake reads the screen a test gave the pane alike", async () => {
+  const requests = reading.filter((l) => l.dir === ">>").map((l) => l.msg);
+  const answer = (id: string) => reading.find((l) => l.dir === "<<" && l.msg.id === id)!.msg;
+  const seen = (method: string, a: any) => (a.error ? a.error.code : method === "pane.read" ? [shape(a.result), a.result.read.source, a.result.read.format, a.result.read.text] : shape(a.result));
+  const real = requests.map((r) => [r.method, seen(r.method, answer(r.id))]);
+  const styled = real.find(([m, s]) => m === "pane.read" && s[1] === "recent" && s[2] === "ansi")![1][3] as string;
+  expect(styled).toContain("\x1b[2mdim");
+  expect(real.filter(([m]) => m === "pane.read").map(([, s]) => (typeof s === "string" ? s : s[3] === styled ? "styled" : s[3]))).toEqual([
+    "styled", "dim plain red grey\n", // recent
+    "dim plain red grey\n", "dim plain red grey\n", // detection
+    "styled", "dim plain red grey\n", // visible
+    "styled", "styled", // strip_ansi left out, true
+    "pane_not_found",
+  ]);
+
+  const t = await setup();
+  const fake = [];
+  for (const r of requests) {
+    const params = JSON.parse(JSON.stringify(r.params).replaceAll('"/work"', JSON.stringify(t.work)));
+    const a = await call(t.socket, r.method, params);
+    // What the pane shows is the test's to give: the fake runs cat, but draws no screen.
+    if (r.method === "layout.apply") await call(t.socket, "fake.set_screen", { pane_id: a.result.layout.root.pane_id, text: styled });
+    fake.push([r.method, seen(r.method, a)]);
+  }
+  expect(fake).toEqual(real);
+});
+
+const sending: { dir: string; msg: any }[] = readFileSync(join(import.meta.dir, "fixtures/herdr/send-input.jsonl"), "utf8")
+  .split("\n")
+  .filter(Boolean)
+  .map((l) => JSON.parse(l));
+
+test("#712: pane.send_input with text alone and pane.send_keys enter, as Herdr 0.9.5 did them (scripts/probes/herdr/probe-send-input.ts): the text in bracketed paste where the pane asked for it, its newlines as LF, no Enter; Enter a CR; a pane not there is pane_not_found for both; the fake answers alike, and draws the text in the box of a screen a test gave the pane, Enter emptying it", async () => {
+  const requests = sending.filter((l) => l.dir === ">>").map((l) => l.msg);
+  const answer = (id: string) => sending.find((l) => l.dir === "<<" && l.msg.id === id)!.msg;
+  const seen = (a: any) => (a.error ? a.error.code : shape(a.result));
+  const methods = ["pane.send_input", "pane.send_keys"];
+  const real = requests.filter((r) => methods.includes(r.method)).map((r) => [r.method, seen(answer(r.id))]);
+  expect(real).toEqual([...Array(2)].flatMap(() => [["pane.send_input", { type: "string" }], ["pane.send_keys", { type: "string" }]]).concat([["pane.send_input", "pane_not_found"], ["pane.send_keys", "pane_not_found"]]));
+  // What the reader in each pane printed: the paste one got it wrapped, the plain one as is, then a CR.
+  const screens = requests.filter((r) => r.method === "pane.read").map((r) => answer(r.id).result.read.text as string);
+  expect(screens[0]).toContain("b'\\x1b[200~[");
+  expect(screens[0]).toContain("]\\n");
+  expect(screens[0]).toContain("line three\\x1b[201~'");
+  expect(screens[1]).toContain("b'\\r'");
+  expect(screens[2]).not.toContain("200~");
+
+  const t = await setup();
+  const fake = [];
+  for (const r of requests.filter((r) => r.method !== "pane.read")) {
+    const params = JSON.parse(JSON.stringify(r.params).replaceAll('"/work"', JSON.stringify(t.work)));
+    const a = await call(t.socket, r.method, params);
+    if (methods.includes(r.method)) fake.push([r.method, seen(a)]);
+  }
+  expect(fake).toEqual(real);
+
+  // A pane with a screen: the box holds what was written, and Enter empties it.
+  const ws = (await call(t.socket, "workspace.create", { cwd: t.work, label: "s" })).result;
+  const pane = ws.root_pane.pane_id;
+  const rule = "─".repeat(20);
+  await call(t.socket, "fake.set_screen", { pane_id: pane, text: ["top", rule, "❯ ", rule, "  status"].join("\r\n") });
+  const box = async () => (await call(t.socket, "pane.read", { pane_id: pane, source: "recent", format: "ansi" })).result.read.text;
+  await call(t.socket, "pane.send_input", { pane_id: pane, text: "[来自 x]\nsecond", keys: [] });
+  expect(await box()).toBe(["top", rule, "❯ [来自 x]", "  second", rule, "  status"].join("\r\n"));
+  await call(t.socket, "pane.send_keys", { pane_id: pane, keys: ["enter"] });
+  expect(await box()).toBe(["top", rule, "❯ ", rule, "  status"].join("\r\n"));
+});
+
 const laying: { dir: string; msg: any }[] = readFileSync(join(import.meta.dir, "fixtures/herdr/layout-apply.jsonl"), "utf8")
   .split("\n")
   .filter(Boolean)

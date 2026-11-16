@@ -1,8 +1,8 @@
 // rh forget (product §5.11, architecture §9.9, #485): Rhodium forgets a chat of a bot, with its own
 // target, its settings and its messages in and out; the account writing again comes back as a new chat.
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -57,6 +57,7 @@ test("story 549: rh forget drops the chat, its own target and its messages in an
 }, 60_000);
 
 const dir = mkdtempSync(join(tmpdir(), "rhodium-test-rh-forget-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}"\n`, { mode: 0o600 });
 const config = { ...loadConfig(join(dir, "config.toml")), mainChat: { bot: "t", chat: "main" } };
 const ctx: Ctx = {
@@ -97,7 +98,7 @@ test("story 549: rh forget refuses a chat not on record, the main chat, one a ru
     "这是主窗口，不能忘掉。要换主窗口，改配置文件里的 mainChat。",
     "这个窗口开始的回合还在跑，等它跑完再忘掉。",
     "有推到这个窗口的提问还没答，先答掉，网页上也能答。",
-    "有从这个窗口发来的消息还在排队，等它交给 agent 再忘掉。",
+    "有从这个窗口发来的消息还在排队，等它交给 agent，或者到网页上删掉，再忘掉。",
     "这是你联系用户的窗口。",
     "已请用户确认：rh forget t/free。用户的决定会作为一条消息发给你，不用等；超时没确认视为拒绝。",
   ]);

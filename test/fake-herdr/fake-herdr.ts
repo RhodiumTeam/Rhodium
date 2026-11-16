@@ -10,7 +10,13 @@
 // - a new session id (/clear, /resume, pi's /new): call pane.report_agent_session, as Claude's hook
 //   and pi's Herdr extension do;
 // - a Herdr restart: stop() and start again; `resumeAgents` and `resumeDelay` set the auto-resume;
-// - Herdr gone just as the bridge has subscribed: `stopOnSubscribe`.
+// - Herdr gone just as the bridge has subscribed: `stopOnSubscribe`;
+// - what Herdr says the pane's agent is at, and the screen pane.read shows: fake.set_status, fake.set_screen.
+//   A pane with a screen set takes pane.send_input's text into the input box drawn there, and Enter empties
+//   it, as Claude's would, rather than writing either to its process; fake.on_input gives the screen
+//   (and status) the next text brings instead, a dialog say (architecture §10.5);
+// - a request that fails: fake.fail makes the next ones of a method answer an error, close without an
+//   answer, or never answer.
 // `herdr terminal session control` (architecture §10.4) attaches to a pane as its one operator, in the
 // shapes scripts/probes/herdr/probe-terminal.ts recorded; its screen is the fake's own, not the shell's.
 // Herdr lets it in 250 ms on, or as soon as any request comes, as Herdr does while idle (#380).
@@ -35,6 +41,18 @@ export type FakeHerdrConfig = {
    *  and the socket are gone. A Herdr going away just as the bridge starts to watch it. */
   stopOnSubscribe?: boolean;
 };
+
+/** The screen with the input box between its bottom two rules (the top one may hold a name) holding
+ *  text, as Claude draws it: its first line after ❯, the rest indented. */
+export function inBox(screen: string, text: string): string {
+  const lines = screen.split("\r\n");
+  const plain = lines.map((l) => l.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").trim());
+  const rules = plain.flatMap((l, i) => (/^─{8,}(?:.*─)?$/.test(l) ? [i] : []));
+  if (rules.length < 2) return screen;
+  const [top, bottom] = rules.slice(-2) as [number, number];
+  const box = text.split("\n").map((l, i) => (i === 0 ? `❯ ${l}` : `  ${l}`));
+  return [...lines.slice(0, top + 1), ...box, ...lines.slice(bottom)].join("\r\n");
+}
 
 /** Where Herdr puts a session's socket: `default` directly under ~/.config/herdr. */
 export function sessionDir(home: string, session: string) {
@@ -184,6 +202,14 @@ type Pane = {
   terminal: string;
   revision: number;
   agent?: string;
+  /** What fake.set_status made its agent's status; else idle with an agent, unknown with none. */
+  status?: string;
+  /** What fake.set_screen gave it to show, with ANSI styles, lines ended by \r\n: the fake draws no screen. */
+  screen?: string;
+  /** What fake.on_input gave the next text written to bring: with no screen, the text in the box. */
+  onInput?: { screen?: string; status?: string };
+  /** What fake.set_screen gave the pane to show once the next pane.read has read its screen. */
+  afterRead?: { screen: string; status?: string };
   session?: AgentSession;
   proc?: Bun.Subprocess<"pipe", "ignore", "inherit">;
   /** The agent process the session was last read from. */
@@ -278,6 +304,8 @@ function serve(home: string, session: string, config: FakeHerdrConfig) {
   const focused = (p: Pane) => tabFocused(p) && activePane(p.tab) === p;
   /** Every request but subscriptions, oldest first: fake.calls answers with them. */
   const calls: { method: string; params: object }[] = [];
+  /** By method, how its next requests fail (fake.fail). */
+  const failing = new Map<string, { how: "error" | "close" | "hang"; code: string; times: number; after?: string }>();
   const status = (ps: Pane[]) => (ps.some((p) => p.agent) ? "idle" : "unknown");
 
   const paneJson = (p: Pane) => ({
@@ -289,7 +317,7 @@ function serve(home: string, session: string, config: FakeHerdrConfig) {
     cwd: p.cwd,
     foreground_cwd: p.cwd,
     ...(p.agent && { agent: p.agent }),
-    agent_status: status([p]),
+    agent_status: p.status ?? status([p]),
     ...(p.session && { agent_session: p.session }),
     scroll: { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 40 },
     revision: p.revision,
@@ -370,12 +398,14 @@ function serve(home: string, session: string, config: FakeHerdrConfig) {
   }
 
   function type(p: Pane, text: string) {
+    if (p.screen !== undefined) return void (p.onInput ? (Object.assign(p, { screen: p.onInput.screen ?? inBox(p.screen, text) }, p.onInput.status && { status: p.onInput.status }), (p.onInput = undefined)) : (p.screen = inBox(p.screen, text)));
     p.proc!.stdin.write(text);
     p.proc!.stdin.flush();
   }
   function keys(p: Pane, keys: string[]) {
     for (const k of keys) {
-      if (k === "enter") type(p, "\n");
+      if (k === "enter" && p.screen !== undefined) p.screen = inBox(p.screen, "");
+      else if (k === "enter") type(p, "\n");
       else if (k === "ctrl+c") {
         // ponytail: any two presses quit Claude, however far apart; Claude's own window is unmeasured.
         if (++p.ctrlC < 2 && p.agent) continue;
@@ -495,6 +525,16 @@ function serve(home: string, session: string, config: FakeHerdrConfig) {
       return { type: "ok" };
     },
     "pane.get": ({ pane_id }) => ({ type: "pane_info", pane: paneJson(find(pane_id)) }),
+    // The screen a test gave the pane, in the shape scripts/probes/herdr/probe-pane-read.ts recorded:
+    // recent and visible as ansi keep the styles; text and detection, which is always plain text, drop
+    // them and end with a newline. ponytail: no lines, no scrolling; Rhodium reads the last 80 lines.
+    "pane.read": ({ pane_id, source = "recent", format = "text" }) => {
+      const p = find(pane_id);
+      const styled = p.screen ?? "";
+      const text = format === "ansi" && source !== "detection" ? styled : styled.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").replaceAll("\r\n", "\n") + "\n";
+      if (p.afterRead) Object.assign(p, { screen: p.afterRead.screen, afterRead: undefined }, p.afterRead.status && { status: p.afterRead.status });
+      return { type: "pane_read", read: { pane_id: p.id, workspace_id: p.ws, tab_id: p.tab, source, format, text, revision: 0, truncated: false } };
+    },
     // What the Herdr bridge calls once /rh_tui has opened the slot's pane (architecture §10.1).
     "workspace.focus": ({ workspace_id }) => {
       if (!workspaces.has(workspace_id)) throw new HerdrError("workspace_not_found", `workspace ${workspace_id} not found`);
@@ -514,6 +554,33 @@ function serve(home: string, session: string, config: FakeHerdrConfig) {
     },
     // The fake's own, for tests: the requests made so far.
     "fake.calls": () => ({ type: "fake_calls", calls }),
+    // The fake's own, for tests: the status pane.get reports of the pane's agent from now on. No event.
+    "fake.set_status": ({ pane_id, status }) => {
+      find(pane_id).status = status;
+      return { type: "ok" };
+    },
+    // The fake's own, for tests: the screen, and with status what its agent is at, that the next text
+    // written brings, in place of the text in the box; with no screen, the text in the box all the same.
+    "fake.on_input": ({ pane_id, text, status }) => {
+      find(pane_id).onInput = { ...(text !== undefined && { screen: text }), ...(status !== undefined && { status }) };
+      return { type: "ok" };
+    },
+    // The fake's own, for tests: the next `times` requests of the method (1 by default) answer the
+    // error code, close without an answer, or never answer; with after, only those once a request of
+    // that method came.
+    "fake.fail": ({ method, how, code = "internal", times = 1, after }) => {
+      failing.set(method, { how, code, times, after });
+      return { type: "ok" };
+    },
+    // The fake's own, for tests: what pane.read shows of the pane from now on, and with status what
+    // its agent is at too, so no read falls between the two; with then, that from the read after next on.
+    "fake.set_screen": ({ pane_id, text, status, then }) => {
+      const p = find(pane_id);
+      p.screen = text;
+      if (status !== undefined) p.status = status;
+      p.afterRead = then && { screen: then.text, ...(then.status !== undefined && { status: then.status }) };
+      return { type: "ok" };
+    },
     // Claude's SessionStart hook calls this, and pi's Herdr extension, which sends the session's file
     // when it has one; tests call it to act out /clear, /resume and pi's /new. No event, like Herdr.
     // A path report is kept as kind "path", the file's absolute path its value (architecture §10.3).
@@ -654,6 +721,13 @@ function serve(home: string, session: string, config: FakeHerdrConfig) {
         } else {
           const method = methods[req.method];
           if (req.method !== "fake.calls") calls.push({ method: req.method, params: req.params ?? {} });
+          for (const f of failing.values()) if (f.after === req.method) f.after = undefined;
+          const fails = failing.get(req.method);
+          if (fails && fails.after === undefined && fails.times-- > 0) {
+            if (fails.how === "close") s.end();
+            if (fails.how === "error") throw new HerdrError(fails.code, `${req.method} failed`);
+            continue;
+          }
           if (!method) throw new HerdrError("unknown_method", `unknown method ${req.method}`);
           answer = { id: req.id, result: method(req.params ?? {}) };
         }

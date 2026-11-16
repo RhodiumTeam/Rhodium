@@ -56,3 +56,14 @@ Codex 的录制在 `test/fixtures/codex/`，由 `scripts/probes/codex/probe.ts` 
   - 为什么：`~/.config/herdr/config.toml` 没关自动恢复的话，`rhodium-test` 会话里以前留下的 Claude pane，服务一起来就会被拉起来。拉起来的 Claude 可能带着插件，例如 Telegram 插件，和你自己窗口里的那个抢同一个 Bot。
 - 在测试 pane 里手动起真的 `claude`，要带上 `TELEGRAM_STATE_DIR=<一个空目录>`，和 Rhodium 给槽位的环境一样（`src/runner.ts`）。不带的话，它会拿你的 Bot token 去拉消息。
 - 用完关掉自己开的 tab，停掉这个服务。
+
+## 在真的 agent 终端里做实验
+
+真的 agent 终端和你共用 `~/.claude` 这类配置，设置对话框里按一下回车就写进去了。这类实验里：
+
+- 不打开 `/config`、`/model`、`/status` 这类设置对话框。
+- 除了正在测的那个对话框，别的对话框开着时不按回车。
+- 工作目录用临时的。它要是还没被信任过，会多一条信任记录，记下来报告。
+- Herdr 只用 `rhodium-test` 开头的会话，见 AGENTS.md 的 Isolate tests。
+- 测试里的假 agent 和假 Herdr 能回答的问题，不用真的终端。
+- 写到用户配置里的任何东西都要报告给用户。

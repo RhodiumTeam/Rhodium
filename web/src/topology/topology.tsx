@@ -12,12 +12,12 @@ import { Archive, ArchiveRestore, ArrowRight, ArrowRightLeft, Bot as BotIcon, Ch
 import { createContext, Fragment, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type TouchEvent as TouchStart } from "react";
 import { useLocation } from "wouter";
 import type { BoardAct } from "../../../src/contracts";
-import { AgentLogo, BoardHeader, ROOM, useMedia, useTheme, WIDE } from "../common";
+import { AgentLogo, BoardHeader, ROOM, useEdges, useMedia, useTheme, WIDE } from "../common";
 import { json, refresh, type Episode, type SlotData, type TopologyData } from "../data";
 import { connText, Face, Mark } from "../faces";
 import { addStep, below, clamp, drafted, drop, dropAt, editLit, editTap, endOf, grab, grabbed, LONG_PRESS, pressed, type Grab, type Step, fitTo, H, hidden, into, keep, key, known, least, MARGIN, NONE, pick, put, reachOf, readRoute, replaces, routeHash, seen, SHEET, stale, status, swap, toward, trail, undoOf, undoStep, union, view, type Bot, type Change, type Chat, type Data, type Edit, type Focus, type Graph, type Line, type Rect, type Route, type Slot, type Status, type View, type Viewport } from "./model";
 import "./topology.css";
-import { act, MenuAt, Pick, Spin, TakeBack, Toasts, ToTerminal, useAct, useEdges, type Choice } from "../write";
+import { act, MenuAt, Pick, Spin, TakeBack, Toasts, ToTerminal, useAct, type Choice } from "../write";
 import { useTerminalEntry } from "../settings";
 import { inTurn, Timeline } from "../timeline";
 import { toast } from "../toast";
@@ -54,7 +54,7 @@ function SlotMark({ slot, full }: { slot: Slot; full?: boolean }) {
     );
   if (slot.mode === "tui")
     return (
-      <span className="inline-flex shrink-0 items-center gap-1 text-running">
+      <span className={cn("inline-flex shrink-0 items-center gap-1", TEXT[s])}>
         <SquareTerminal role="img" aria-label="TUI 模式" className="size-3.5" />
         {full && "TUI"}
       </span>

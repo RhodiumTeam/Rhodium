@@ -37,7 +37,7 @@ const clean = {
   "scripts/publish/manifest.txt": "README.md\npackage.json\ndocs/**\nsrc/**\n!**/*.local.md\n",
   "package.json": '{ "version": "1.2.3" }\n',
   "README.md": `[a](${doc("a.md")})、[adr](${doc("adr/")})、[外面](https://example.com/x.md)、[本节](#约定)、[占位](地址)\n`,
-  [doc("a.md")]: "a\n",
+  [doc("a.md")]: "a\n`[例](src/gone.ts)` 和 `` [`x`](x.md) ``\n\n  ```\n  [图](/tmp/a.png)\n  ```\n",
   [doc("adr/0001.md")]: "adr\n",
   [doc("b.local.md")]: "this machine\n",
   [doc("C.LOCAL.MD")]: "this machine too\n",
@@ -85,7 +85,7 @@ test("#523: deny-list words in a file or its path, keys, this machine's home, an
     "src/z.ts": `// see ${doc("b.local.md")}, in ${process.env.HOME}/x and -home-${user}-Rhodium, from ${"alex"}@mail.com\n`,
     [`src/${word}.ts`]: "x\n",
     [`src/-home-${user}`]: "x\n",
-    [doc("c.md")]: `[私有](b.local.md)\n[没了](../${doc(`${word}.md`)})\n`,
+    [doc("c.md")]: `[私有](b.local.md)\n[没了](../${doc(`${word}.md`)})\n\`[例](x.md)\` 之后 [真](y.md)\n落单的 \` 号\n\n[真](z.md) 和 \`\n两个 \`\` 号之后 [真](w.md) 和 \`x\`\n`,
     "src/keys.ts": `const a = "${"gh"}p_${"a".repeat(36)}", b = "${"sk"}-ant-${"b".repeat(24)}";\n`,
     // Long base64: a name inside, plain and gzipped; a picture; ciphertext.
     "src/blob.ts": [
@@ -109,6 +109,9 @@ test("#523: deny-list words in a file or its path, keys, this machine's home, an
   expect(problems(r.err)).toEqual([
     `${doc("c.md")} 第 1 行：链接指向不导出的文件`,
     `${doc("c.md")} 第 2 行：链接指向不导出的文件`,
+    `${doc("c.md")} 第 3 行：链接指向不导出的文件`,
+    `${doc("c.md")} 第 6 行：链接指向不导出的文件`,
+    `${doc("c.md")} 第 7 行：链接指向不导出的文件`,
     `${doc("c.md")}: 关键词清单第 2 行`,
     `src/-home-${user}: 路径里有这台机器的家目录`,
     "src/blob.ts 第 1 行：长串里有关键词清单第 2 行",

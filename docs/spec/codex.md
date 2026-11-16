@@ -289,7 +289,7 @@ Codex 登录：ChatGPT（pro）
   - 没登录、也没配服务商：说在终端里跑 `codex login`，或者在 `~/.codex/config.toml` 里配 `model_provider`。
   - 服务商的令牌来自 `env_key` 指定的环境变量，Rhodium 服务的环境里却没有它：只写变量名，不打印值，提示改用服务商的 `auth` 命令（例如读一个 0600 的文件）或别的不靠环境变量的办法。
   - 不再收“每条都问”：带上 Codex 的原话，说审批开的 Codex 槽位起不来，关掉它们的审批或换回旧版 codex。
-  - 这三条都以“Codex”开头，升级 Rhodium 时不因它们退回旧版（[架构](../architecture.md) §12）。
+  - 这三条都以“Codex”开头，升级 Rhodium 时不因它们退回旧版；Codex 握手后应答出错的那条也是（[架构](../architecture.md) §12，2026-11-16 补，#733）。
 - 环境变量过滤不去掉 `OPENAI_*` 和服务商 `env_key` 指定的变量，只去 Claude 的、`HERDR_*` 和父 Codex 会话的，无头和终端都一样（[架构](../architecture.md) §6.4）。
 
 ### 配置

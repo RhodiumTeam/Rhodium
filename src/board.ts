@@ -10,26 +10,29 @@
 // pane, which the board passes on between the page's WebSocket and Herdr (architecture §10.4).
 import type { Server, ServerWebSocket } from "bun";
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { AGENTS } from "./agents";
+import { AGENTS, TYPING } from "./agents";
 import { askCard, askText, type AskCard, type AskPrompt } from "./asks";
 import { avatarDir } from "./avatars";
 import { frameUuid } from "./claude";
 import { log } from "./daemon";
-import { COMMON, SENT_AT, type AgentEvent, type AgentKind, type BoardAct, type Platform } from "./contracts";
-import { hasHerdr, owners, type BotConfig, type Config } from "./config";
+import { COMMON, FROM_BOARD, SENT_AT, type AgentEvent, type AgentKind, type BoardAct, type Platform } from "./contracts";
+import { hasHerdr, memoryText, owners, type BotConfig, type Config } from "./config";
 import { call, sessionSocket } from "./herdr";
 import { holderPaths } from "./holder";
 import { imageType, makeCopy, MAX_PIXELS, mediaLine, pictureType, saveMedia, withoutMedia, type Media } from "./media";
 import { moment } from "./panels";
 import { agentCommands } from "./commands";
-import { askGone, contactOf, resumeWaits, settingsOf, slotState, STATE, target, WEB_PAUSED, WEB_QUEUE, workspaceName, type Payload, type RhReply } from "./router";
+import { askGone, contactOf, IN_TUI, resumeWaits, settingsOf, slotState, STATE, target, WEB_PAUSED, WEB_QUEUE, workspaceName, type Payload, type RhReply } from "./router";
 import { namesOf, type Ask, type Bot, type Chat, type Conversation, type Event, type Outbound, type Slot, type Store, type Tx } from "./store";
 import { PLATFORMS } from "./platforms";
-import { withoutSource } from "./prompt";
-import { describe, fullText, lastSaid, messagePage, transcriptFile, type Block as Read } from "./transcript";
+import { splitSource, withoutSource } from "./prompt";
+import { codeRef } from "./local";
+import { checkLocal, localRefs, NEAR, readPicture, rowFor } from "./reply-images";
+import { describe, fullText, lastSaid, messagePage, transcriptFile, type Block as Read, type Local } from "./transcript";
 
 /** The page and its files as Vite built them: embedded in the built binary, and in web/dist when
  *  run from source. */
@@ -73,19 +76,24 @@ export type BoardData = {
 const DONE = 24 * 3_600_000;
 
 /** Product §4's groups. resuming: crashed, it is resumed once there is room under the running limit.
- *  One that failed to switch back from the terminal waits for you. */
+ *  One that failed to switch back from the terminal waits for you. One in the terminal runs, but for
+ *  one whose pane is open with Herdr there, saying its agent is idle or done: that one is grouped by
+ *  its last turn, as any other. */
 function groupOf(s: Slot, asked: boolean, resuming: boolean, now: number): Group {
-  if (asked || s.state === "waiting" || (s.state === "crashed" && !resuming) || slotState(s) === "没能切回无头") return "needsYou";
-  if (s.mode === "tui" || resuming || s.state === "starting" || s.state === "running" || s.state === "rate_limited") return "running";
+  const state = slotState(s);
+  if (asked || s.state === "waiting" || (s.state === "crashed" && !resuming) || state === "没能切回无头") return "needsYou";
+  const rests = state === "TUI 模式" && (s.tuiStatus === "idle" || s.tuiStatus === "done");
+  if ((s.mode === "tui" && !rests) || resuming || s.state === "starting" || s.state === "running" || s.state === "rate_limited") return "running";
   if (s.turnEndedAt !== null && now - s.turnEndedAt < DONE) return "done";
   return "idle";
 }
 
 /** The slot's state as the board shows it (product §4, §7): as rh ls has it, plus when one waiting for
- *  quota carries on, that a crashed one waits for room to resume, and the pane of one in the terminal. */
+ *  quota carries on, that a crashed one waits for room to resume, and the pane of one in the terminal,
+ *  or that a dialog is open there (#665). */
 function stateOf(s: Slot, now: number, resuming = false): string {
   const state = slotState(s);
-  if (state === "TUI 模式") return `TUI 模式（pane ${s.herdrPane}）`;
+  if (state === "TUI 模式") return s.tuiInput === "dialog" ? "被弹框挡住" : `TUI 模式（pane ${s.herdrPane}）`;
   if (state === STATE.rate_limited && s.resumeAt !== null) return `等额度，预计 ${moment(s.resumeAt, now)} 恢复`;
   return resuming && state === STATE.crashed ? "崩溃，有空位后自动恢复" : state;
 }
@@ -486,12 +494,52 @@ async function withMedia(store: Store, cfg: Config, slot: string, blocks: Block[
   return Promise.all(
     blocks.map(async (b): Promise<Block> => {
       if ((b.kind === "user" || b.kind === "result") && b.media) return { ...b, media: await shown(b.media) };
+      if (b.kind === "assistant" && b.local) {
+        const images = await Promise.all(Object.entries(b.local.images).map(async ([path, i]) => [path, "hash" in i ? (await shown([i]))[0]! : i] as const));
+        return { ...b, local: { ...b.local, images: Object.fromEntries(images) } };
+      }
       if (b.kind !== "tool") return b;
       const files = sent.get(b);
       const result = b.result?.media && { ...b.result, media: await shown(b.result.media) };
       return { ...b, ...(files && { send: { ...b.send!, media: await shown(files) } }), ...(result && { result }) };
     }),
   );
+}
+
+/** The blocks with what each thing the agent said refers to on this machine (spec web-images
+ *  "回复里的本机图片和文件链接"): a picture by its row in the reply picture table, the one of this block
+ *  (rowFor), as its copy or why it has none; one with no row is checked now, kept and its row written,
+ *  so what a slot in the terminal said, or an old conversation, shows too, and stays as first read.
+ *  Unless the slot is headless and the block not NEAR old: the main loop is likely checking it, and it
+ *  is pending. A link by the path check now: whether it gives a file. Done in one go, never awaiting:
+ *  two pages reading at once get the one row. A picture whose row cannot be written is pending. */
+function withLocal(store: Store, cfg: Config, at: { slot: string; conversation: string | null; dir: string }, blocks: Block[], now: number): Block[] {
+  const { conversation, dir } = at;
+  if (!conversation) return blocks;
+  const media = join(cfg.stateDir, "media");
+  return blocks.map((b): Block => {
+    const refs = b.kind === "assistant" ? localRefs(b.text) : [];
+    if (b.kind !== "assistant" || !refs.length) return b;
+    const local: Local = { images: {}, links: {} };
+    for (const { kind, path } of refs) {
+      if (kind !== "image") local.links[path] ??= kind === "code" ? "code" : "why" in checkLocal(dir, path, false) ? "none" : "file";
+      else
+        try {
+          local.images[path] ??= store.tx((tx) => {
+            const waits = b.time !== null && now - b.time < NEAR && tx.get("slot", at.slot)?.mode === "headless";
+            const row = rowFor(tx.find("replyImage", { conversation, path }), b.time) ?? (waits ? null : readPicture(tx, media, dir, conversation, path, b.time));
+            if (!row) return { pending: true };
+            return row.hash === null ? { why: row.why! } : existsSync(join(media, row.hash)) ? { kind: "image", hash: row.hash, name: row.name } : { gone: true };
+          });
+        } catch (e) {
+          // Its row could not be written, a full disk say: pending, as one whose copy could not be
+          // kept, and the conversation still reads.
+          log("reply picture not recorded", { slot: at.slot, error: String(e) });
+          local.images[path] = { pending: true };
+        }
+    }
+    return { ...b, local };
+  });
 }
 
 /** GET /api/messages. */
@@ -510,7 +558,7 @@ async function messages(store: Store, cfg: Config, q: URLSearchParams): Promise<
   const { slot, conversation, file, dir } = found;
   const media = join(cfg.stateDir, "media");
   const page = !file ? { blocks: [], start: 0, end: 0 } : after !== null ? await messagePage(file, after, "forward", dir, media) : await messagePage(file, before, "backward", dir, media);
-  const data: MessagesData = { conversation, ...page, blocks: await withMedia(store, cfg, slot, await withFrom(store, cfg, conversation, page.blocks)) };
+  const data: MessagesData = { conversation, ...page, blocks: await withMedia(store, cfg, slot, withLocal(store, cfg, found, await withFrom(store, cfg, conversation, page.blocks), Date.now())) };
   return Response.json(data, { headers: { "cache-control": "no-store" } });
 }
 
@@ -616,9 +664,16 @@ export type SlotData = {
   gone: { id: string; why: string }[];
   /** Your messages from the board still waiting for the agent, oldest first (spec web-write "待发队列"):
    *  each by the id of the request it came in, its words, how many it carries attached, and why it
-   *  waits: in the board's queue, paused there, or held by Rhodium for an interrupt, the quota or a stop. */
-  queue: { id: string; text: string; files: number; reason: Waits }[];
+   *  waits: in the board's queue, paused there, or held by Rhodium for an interrupt, the quota or a stop.
+   *  Then what waits for the switch back from the terminal, or to be typed there, or was typed and is not
+   *  known taken (tui, product §4.2): each by its own id, the first line of its words, and from, who
+   *  sent it as its source line says; yours from IM or the board, 你, with via the chat, and your words
+   *  whole with how many attached; wait, what it waits for, or where it is: 正在打进去, or
+   *  已投递，尚未确认收到, which unsure marks, as it may be sent again. */
+  queue: { id: string; text: string; files: number; reason: Waits; from?: string; via?: string; wait?: string; unsure?: true }[];
   process: Process | null;
+  /** Its holder unit held up over MemoryHigh: what the unit uses and its limit, 3.9G / 4G (#692). */
+  memory?: string;
   /** The conversations it has had, newest first. */
   timeline: Episode[];
   /** What its command palette offers (spec web-write "命令面板"). */
@@ -639,7 +694,7 @@ export const commandsFor = (agent: AgentKind | null): Command[] =>
     kind: c.list ? "pick" : "run",
   }));
 
-export type Waits = "web_queue" | "web_paused" | "after_interrupt" | "after_quota" | "stopping";
+export type Waits = "web_queue" | "web_paused" | "after_interrupt" | "after_quota" | "stopping" | "tui";
 /** Why the board's messages in the queue wait, as /api/slot says (SlotData). */
 const WAITS: Record<string, Waits> = { [WEB_QUEUE]: WEB_QUEUE, [WEB_PAUSED]: WEB_PAUSED, after_interrupt: "after_interrupt", after_quota: "after_quota" };
 
@@ -648,12 +703,51 @@ const WAITS: Record<string, Waits> = { [WEB_QUEUE]: WEB_QUEUE, [WEB_PAUSED]: WEB
 function queueOf(tx: Tx, s: Slot): SlotData["queue"] {
   if (!s.conversation) return [];
   const stopping = s.state !== "off" && s.state !== "crashed" && (tx.find("holder", { conversation: s.conversation })[0]?.stopRequested ?? 0) > 0;
-  return tx.find("agentInput", { conversation: s.conversation, status: "queued", source: "human" }).flatMap((i) => {
+  const mine = tx.find("agentInput", { conversation: s.conversation, status: "queued", source: "human" }).flatMap((i) => {
     const reason = i.queueReason === null ? (stopping ? "stopping" : undefined) : WAITS[i.queueReason];
     if (!i.trace || !reason || tx.get("inbound", i.trace)) return [];
     const { text, files } = withoutMedia(withoutSource(i.body ?? ""));
     return [{ id: i.trace, text, files, reason }];
   });
+  // What it waits for, as the terminal reads (architecture §10.5); an agent never typed into, the switch back.
+  const agent = tx.get("conversation", s.conversation)?.agent;
+  const waits =
+    s.mode !== "tui" || !agent || !TYPING[agent]
+      ? "切回无头才交给它"
+      : s.herdrLostAt !== null
+        ? "Herdr 正在重启"
+        : s.tuiInput === "dialog"
+          ? "等对话框关掉"
+          : s.tuiInput === "draft"
+            ? "等输入框空出来"
+            : s.tuiInput === "ready"
+              ? "" // typed at the next look, or once the one before it is confirmed
+              : "认不出画面";
+  // Those typed and not known taken stay with the conversation they were typed into, the slot back or not.
+  const convs = tx.find("conversation", { slot: s.id }).map((c) => c.id);
+  const typed = (["writing", "written", "unknown"] as const).flatMap((status) => convs.flatMap((c) => tx.find("agentInput", { conversation: c, status, queueReason: IN_TUI })));
+  const held = [...tx.find("agentInput", { conversation: s.conversation, status: "queued", queueReason: IN_TUI }), ...typed]
+    .sort((a, b) => (a.id < b.id ? -1 : 1))
+    .map((i) => {
+      const { source, text } = splitSource(i.body ?? "");
+      const unsure = i.status === "unknown";
+      // An internal one waits out a turn going back to you (architecture §10.6).
+      const wait = i.status === "queued" ? (i.source !== "human" && s.mode === "tui" && s.turnChat !== null ? "等这一回合回完你" : waits) : unsure ? "已投递，尚未确认收到" : "正在打进去";
+      const yours = i.source === "human" && withoutMedia(text);
+      // Yours with no source line is a command from the board, typed bare (#737).
+      const said = yours ? { text: yours.text, files: yours.files, from: "你", via: source ?? FROM_BOARD } : { text: text.split("\n", 1)[0]!, files: 0, from: (source ?? "").replace(/，经 rh send$/, "") };
+      return { id: i.id, ...said, reason: "tui" as const, wait, ...(unsure && { unsure: true as const }) };
+    });
+  return [...mine, ...held];
+}
+
+/** GET /api/held?id=<agent input id>: the whole of one waiting for the switch back (queueOf), but its
+ *  source line. The board's own page alone, as for a write (architecture §10.5). */
+function heldText(req: Request, store: Store, id: string): Response {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  const i = store.tx((tx) => tx.get("agentInput", id));
+  if (!i || i.status === "taken" || i.queueReason !== IN_TUI || i.body === null) return new Response("这条已经不在了。\n", { status: 404 });
+  return Response.json({ text: withoutSource(i.body ?? "") }, { headers: { "cache-control": "no-store" } });
 }
 
 /** A conversation in a slot's timeline. short: the start of the agent's session id, as /resume and rh
@@ -701,6 +795,7 @@ async function slotDetail(store: Store, cfg: Config, id: string): Promise<Respon
       ultracode: s.ultracode === 1,
       pane: s.mode === "tui" ? s.herdrPane : null,
       herdrLost: s.herdrLostAt !== null,
+      ...(slotState(s) === "内存阻塞" && { memory: memoryText(JSON.parse(s.memBlocked!)) }),
       asks: tx.find("ask", { slot: s.id, status: "open" }).map((a) => {
         const p = JSON.parse(a.prompt!) as AskPrompt;
         return { id: a.id, kind: a.kind, text: askText(a.kind, p, ""), card: askCard(a.kind, p), deadline: a.deadline };
@@ -845,6 +940,21 @@ async function media(req: Request, dir: string, q: URLSearchParams): Promise<Res
   return answer(Bun.file(copy ?? join(dir, hash)), 200, { "content-type": copy ? MADE[v as keyof typeof MADE].type : type });
 }
 
+/** GET /api/file?conversation=<id>&path=<path> (spec web-images "回复里的本机图片和文件链接"): the file a
+ *  link in what the conversation's agent said points to, as the disk has it now, from the board's own
+ *  page alone. path: as decoded, as the block's table has it; it passes the path check for its slot's
+ *  directory (checkLocal), no code reference, or 404. The board's one path that reads a file by a path
+ *  the request brings: a regular file in the slot's directory or /tmp, always as a download with no
+ *  type guessed, so never a page of the board's, and never kept by the browser. */
+async function file(req: Request, store: Store, q: URLSearchParams): Promise<Response> {
+  const answer = (body: string | Blob, status: number, headers: Record<string, string> = {}) => new Response(body, { status, headers: { "x-content-type-options": "nosniff", "cache-control": "no-store", ...headers } });
+  if (!ownPage(req)) return answer("只认看板自己的页面发来的请求。\n", 403);
+  const [found, path] = [await current(store, "", q.get("conversation") ?? ""), q.get("path") ?? ""];
+  const ok = found && path && !codeRef(path) ? checkLocal(found.dir, path, false) : null;
+  if (!ok || "why" in ok) return answer("文件不在了，或者不能下载。\n", 404);
+  return answer(Bun.file(ok.real), 200, { "content-type": "application/octet-stream", "content-disposition": "attachment" });
+}
+
 /** A file of the page, by its path; / is the page itself. Vite names the files under
  *  assets/ by their content, so the browser keeps those for good, and asks again for the rest. To a
  *  browser that takes br, one with a brotli built beside it (web/vite.config.ts) comes as that. The
@@ -870,14 +980,16 @@ async function webFile(web: string, path: string, accepts: string): Promise<Resp
 
 const LOOK = 500; // ms between looks at a followed transcript's size
 
-/** What hears a headless agent write (the runner's writing): the board, once it is up. */
-export type Hear = (conversation: string, e: Extract<AgentEvent, { type: "text_delta" | "item" | "exit" }>) => void;
+/** What hears a headless agent write (the runner's writing), and that the main loop wrote the rows of
+ *  the local pictures in what it said (pictures): the board, once it is up. */
+export type Hear = (conversation: string, e: Extract<AgentEvent, { type: "text_delta" | "item" | "exit" }> | { type: "pictures" }) => void;
 
 /** Follows slots' transcripts for the event streams that ask (architecture §7.7): follow(slot, tell)
  *  tells grew each time the slot's current transcript grows, or the slot moves on to another, until
  *  the function it returns is called. A transcript is looked at only while a stream follows it. And
  *  hear tells the streams following the slot what its agent writes: delta, a piece of text, and said,
- *  once the message is whole; exit, its process ended. tell takes them as server-sent events. */
+ *  once the message is whole; exit, its process ended; pictures, the checks of the local pictures in
+ *  what it said are in, for the page to read their blocks again. tell takes them as server-sent events. */
 function transcripts(store: Store) {
   const followed = new Map<string, { streams: Set<(event: string) => void>; timer: Timer }>();
   const follow = (slot: string, tell: (event: string) => void): (() => void) => {
@@ -910,7 +1022,7 @@ function transcripts(store: Store) {
   const hear: Hear = (conversation, e) => {
     if (!followed.size) return;
     const f = followed.get(store.tx((tx) => tx.get("conversation", conversation)?.slot) ?? "");
-    const event = e.type === "text_delta" ? `event: delta\ndata: ${JSON.stringify({ text: e.text })}\n\n` : `event: ${e.type === "item" ? "said" : "exit"}\ndata: {}\n\n`;
+    const event = e.type === "text_delta" ? `event: delta\ndata: ${JSON.stringify({ text: e.text })}\n\n` : `event: ${e.type === "item" ? "said" : e.type}\ndata: {}\n\n`;
     for (const t of f?.streams ?? []) t(event);
   };
   return { follow, hear };
@@ -1015,7 +1127,7 @@ function actOf(body: unknown): { id: string; act: BoardAct } | null {
   if (act.kind === "bind" && Array.isArray(act.changes) && act.changes.every(change) && (act.unarchive === undefined || text(act.unarchive))) return { id, act: act as BoardAct };
   if (act.kind === "answer" && text(act.ask) && text(act.text)) return { id, act: act as BoardAct };
   if (act.kind === "say" && text(act.slot) && text(act.text) && act.attachments === undefined) return { id, act: act as BoardAct };
-  if (act.kind === "queued" && text(act.slot) && (act.op === "now" || act.op === "drop") && (act.input === undefined ? act.op === "now" : text(act.input))) return { id, act: act as BoardAct };
+  if (act.kind === "queued" && text(act.slot) && (act.op === "now" || act.op === "drop" || act.op === "resend") && (act.input === undefined ? act.op === "now" : text(act.input))) return { id, act: act as BoardAct };
   if (act.kind === "verbose" && text(act.chat) && typeof act.on === "boolean") return { id, act: act as BoardAct };
   if (act.kind === "pin" && text(act.slot) && typeof act.on === "boolean") return { id, act: act as BoardAct };
   return null;
@@ -1308,6 +1420,8 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
         return messages(store, cfg, url.searchParams);
       case "/api/full":
         return full(store, url.searchParams);
+      case "/api/held":
+        return heldText(req, store, url.searchParams.get("id") ?? "");
       case "/api/slot":
         return slotDetail(store, cfg, url.searchParams.get("id") ?? "");
       case "/api/slot-events":
@@ -1329,6 +1443,8 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
         return sendWith(req, act, join(cfg.stateDir, "media"));
       case "/api/media":
         return media(req, join(cfg.stateDir, "media"), url.searchParams);
+      case "/api/file":
+        return file(req, store, url.searchParams);
       case "/api/terminal":
         return terminalUpgrade(req, server);
     }

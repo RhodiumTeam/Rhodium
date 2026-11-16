@@ -94,6 +94,7 @@ PR 合进来以后，可以交给开发用的 agent 直接升级，不用等你�
 3. 记下数据库现在的结构版本（schema 版本，每跑一步数据库迁移加一）。
 4. `current` 指向新版本，重启 `<实例>`，等它在一分钟内应答。
 5. 跑 `rh doctor`，打出报告。都没问题，就把 `previous` 留给原来的版本。
+6. 在主检出里写 `deploy/RUNNING.txt`：现在跑的版本、提交、目录、时间和 `-m` 的说明。从 worktree 跑脚本，也写到主检出。下次升级前看它就知道在跑哪个版本。git 不跟踪它。
 
 `rhodium` 没起来，或 `rh doctor` 报了错误级别的结果，脚本就把 `current` 切回原来的版本，重启，然后以 1 退出。
 
@@ -101,7 +102,7 @@ PR 合进来以后，可以交给开发用的 agent 直接升级，不用等你�
 - 看板的错误、你的 Codex 的错误（以“Codex”开头的）也不算，见[架构 §12](../docs/architecture.md#12-可观测性与运维) 的 `rh doctor`。
 - 新版加的配置项，升级成功后再写进配置文件。先写了，切回的旧版不认它，起不来。
 
-有一种情况不切回：新版本已经迁移了数据库。`rhodium` 遇到比自己新的数据库会拒绝启动，切回去旧版本也起不来。这时脚本让 `current` 留在新版本，以 1 退出，并说明结构版本从几变到了几。服务可能还在跑新版本，也可能已经停了。看日志修好原因，再装一个修好的提交。
+有一种情况不切回：新版本已经迁移了数据库。`rhodium` 遇到比自己新的数据库会拒绝启动，切回去旧版本也起不来。这时脚本让 `current` 留在新版本，照第 6 步写 `deploy/RUNNING.txt`，以 1 退出，并说明结构版本从几变到了几。服务可能还在跑新版本，也可能已经停了。看日志修好原因，再装一个修好的提交。
 
 - 不用在终端里跑，开发用的 agent 也能跑：`rh doctor` 谁都能用。
 - 脚本按实例名自己算 socket，不用你 shell 里的 `RHODIUM_SOCKET`。
@@ -130,6 +131,7 @@ systemctl --user restart <实例>
    - `[board]` 下的 `port`，和 `login`（你的 Tailscale 账号，例如 `you@example.com`）。
    - `[herdr] session`：TUI 开在哪个 Herdr 会话。
    - Bot 各带 `owner` 和 `target`。
+   - 可选：`memoryHigh = "4G"`，写在顶层，不在哪个段里。它是每个槽位的托管单元的内存上限，默认 4G，超了槽位会内存阻塞（[架构 §4.2](../docs/architecture.md#42-怎么拉起)）。改了以后重启实例，之后新起的托管单元才用新值；已经在跑的照旧，要马上改用 `systemctl --user set-property --runtime <单元> MemoryHigh=<值>`。
 3. 要单独的 Herdr 会话时，写 `~/.config/systemd/user/<实例>-herdr.service`：`ExecStart=%h/.local/bin/herdr --session <会话> server`、`Restart=on-failure`；然后 `systemctl --user enable --now <实例>-herdr`。
    - 这个 Herdr 可以用单独的一份配置，例如关掉 `resume_agents_on_restore`。你自己的 `~/.config/herdr/config.toml` 不改，你的会话照旧。
    - 配置：把 `~/.config/herdr/config.toml` 抄到 `~/.config/rhodium/<实例>/herdr.toml`（0600），末尾加上 `[session]` 和 `resume_agents_on_restore = false`。以后改了主配置，这份不会跟着变，要重抄。

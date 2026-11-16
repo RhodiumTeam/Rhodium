@@ -1,6 +1,6 @@
 {
   "name": "rhodium",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -35,6 +35,7 @@
     "ghostty-web": "0.4.0",
     "grammy": "^1.46.0",
     "lucide-react": "1.53.0",
+    "micromark-util-sanitize-uri": "2.0.1",
     "qrcode-terminal": "0.12.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",

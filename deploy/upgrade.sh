@@ -16,7 +16,8 @@
 # does not come back within a minute or rh doctor reports an error, but of the board or your codex, current goes
 # back to the version before, the service restarts on it, and the script exits 1. But a rhodium refuses a
 # database newer than itself, so once the new one has migrated the database, current stays on it
-# and the script exits 1 all the same. With no service installed yet, it only installs.
+# and the script exits 1 all the same. With no service installed yet, it only installs. Once the
+# service runs the new version, deploy/RUNNING.txt in the main checkout says which, when and why.
 #
 # Versions are never deleted: holders started by one run its rh-hold till their agents exit (§4.7).
 # <opt> is ~/.local/opt/<instance>, and rh reaches rhodium at $XDG_RUNTIME_DIR/<instance>/rh.sock,
@@ -63,6 +64,24 @@ up() {
     sleep 0.5
   done
   return 1
+}
+
+# Says which version the instance runs now, for whoever upgrades next, in deploy/RUNNING.txt
+# of the main checkout, even when this runs from a linked worktree that may be deleted. Git ignores it.
+running() {
+  local main
+  main=$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)")
+  {
+    echo "# $instance 在跑的版本"
+    echo
+    echo "这篇回答：$instance 现在跑的是哪个版本。deploy/upgrade.sh 每次换了服务跑的版本后重写它，别手改。"
+    echo
+    echo "- 版本：${build%-*}"
+    echo "- 提交：${build##*-}"
+    echo "- 目录：$opt/versions/$name"
+    echo "- 时间：$(date '+%F %H:%M')"
+    [[ -z $note ]] || echo "- 说明：$note"
+  } >"$main/deploy/RUNNING.txt"
 }
 
 # Runs rh doctor and prints its report; false if it could not run or found an error. Not one of the
@@ -112,13 +131,17 @@ point current "versions/$name"
 
 if up && healthy; then
   [[ -z $old ]] || point previous "$old"
+  running
   echo "$instance now runs $name."
   exit 0
 fi
 [[ -n $old ]] || die "$name does not work, and there is no version before it to go back to: see journalctl --user -u $instance"
 after=$(schema) || after=unknown
-[[ $after == "$before" ]] || die "$name does not work, but it has moved the database from schema $before to $after," \
-  "which ${old#versions/} cannot open, so $instance stays on $name: see journalctl --user -u $instance"
+[[ $after == "$before" ]] || {
+  running
+  die "$name does not work, but it has moved the database from schema $before to $after," \
+    "which ${old#versions/} cannot open, so $instance stays on $name: see journalctl --user -u $instance"
+}
 echo "upgrade: $name does not work; going back to ${old#versions/}" >&2
 point current "$old"
 up || die "${old#versions/} does not come back either: see journalctl --user -u $instance"

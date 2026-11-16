@@ -35,6 +35,7 @@ export type Slot = Row & {
   askTimeout: number | null; // 0 = never time out
   crashResume: Flag | null;
   autoContinue: Flag | null;
+  typeIn: Flag | null; // your own messages typed into its terminal (architecture §10.5)
   // The turn in progress was started by this inbound message in this chat: its final reply goes
   // there and nowhere else (architecture §3). Both null for a turn an internal message started.
   turnChat: string | null;
@@ -77,8 +78,22 @@ export type Slot = Row & {
   // Its agent in the terminal is one Rhodium launched by the slot's settings, so what you changed there
   // is told against them once back (architecture §10.1). Not one Herdr resumed by itself, nor an imported pane's.
   tuiLaunched: Flag | null;
+  // In TUI mode: what Herdr last said the agent in the pane is at (idle, working, blocked, done,
+  // unknown), which the board groups the slot by (product §4). Null until Herdr was asked, and once
+  // back to headless.
+  tuiStatus: string | null;
+  // In TUI mode: whether its terminal takes typing now, from what Herdr says and the bottom of the pane's
+  // screen (architecture §10.5): a dialog open there, which its card says (product §4), text in the input
+  // box, ready, or unknown. Null until first read, and once back to headless.
+  tuiInput: "unknown" | "dialog" | "draft" | "ready" | null;
   // When the Herdr bridge lost Herdr's socket, while the slot is in the terminal; null once it is back.
   herdrLostAt: number | null;
+  // In TUI mode: when you were told what waits for the switch back has waited durations.tuiHeld
+  // (architecture §10.5); cleared once back to headless. The next one to wait with none before tells again.
+  tuiHeldNotice: number | null;
+  // Headless, its holder unit held up over MemoryHigh (architecture §4.2, #692): JSON of { current, high },
+  // what the unit uses and its limit in bytes, high null for none. Null while it is not.
+  memBlocked: string | null;
   // Waiting for Claude's quota (rate_limited): when it carries on, the reset staggered among the
   // slots waiting (architecture §7.6).
   resumeAt: number | null;
@@ -104,12 +119,10 @@ export type Slot = Row & {
   activeAt: number | null;
   // When you pinned it on the board, null for not (product §7); kept while it is archived.
   pinnedAt: number | null;
-  // When it last took a message of yours from the board: rh send me goes there if that is later than
-  // the chat it would go to was written in (product §5.9).
+  // When it last took a message of yours from the board, and from IM: rh send me is not pushed to IM
+  // while the board's is the later and a page of it is in front (product §5.9).
   webAt: number | null;
-  // It sent to you this turn with rh send to a destination named, so its report need not say it told
-  // you nothing (architecture §9.3); a new turn clears it.
-  turnToldYou: Flag | null;
+  imAt: number | null;
   // Its plan ask timed out this turn, unapproved, and it stops to wait for you: as a child, its turn's
   // end reports it stuck, not done (product §6.1); a new turn clears it.
   turnPlanTimedOut: Flag | null;
@@ -155,6 +168,12 @@ export type AgentInput = Row & {
   body: string | null; // what to write; cleared once taken (architecture §7.1)
   trace: string | null;
   images: string | null; // JSON [{path, mimeType}]: stored pictures to show the agent with body; cleared with it
+  // Typed into the slot's terminal (architecture §10.5): when, and what, cleared once taken; when it
+  // was sent again from the board, till it is typed again; when you heard it is not known to have got there.
+  typedAt: number | null;
+  typed: string | null;
+  resentAt: number | null;
+  noticedAt: number | null;
 };
 
 // The bot's token lives in the config file under [bots.<name>], never here.
@@ -249,6 +268,20 @@ export type Quota = Row & {
 // Small key-value facts such as the boot number; id is the key.
 export type Meta = Row & { value: string };
 
+// A local picture in what an agent said, checked once (architecture §8.3): the conversation, the path
+// as decoded, and what the check gave, the copy's hash in media/ or why it did not pass. by: the main
+// loop as the message was whole, at when it checked; or the board as it read a block with no row, at
+// when the block was written, null for a block with no time. name: the file's, to save it by.
+export type ReplyImage = Row & {
+  conversation: string;
+  path: string;
+  at: number | null;
+  by: "loop" | "board";
+  hash: string | null;
+  why: string | null;
+  name: string;
+};
+
 export type Tables = {
   workspace: Workspace;
   slot: Slot;
@@ -262,6 +295,7 @@ export type Tables = {
   ask: Ask;
   quota: Quota;
   meta: Meta;
+  replyImage: ReplyImage;
 };
 type T = keyof Tables;
 
@@ -525,6 +559,46 @@ ALTER TABLE slot ADD COLUMN turnToldYou INTEGER;
   `
 ALTER TABLE slot ADD COLUMN turnPlanTimedOut INTEGER;
 `,
+  // What Herdr says the agent of a slot in the terminal is at (#664).
+  `
+ALTER TABLE slot ADD COLUMN tuiStatus TEXT;
+`,
+  // Where you last wrote to a slot goes by the slot on both sides (#668): imAt, beside webAt. What webAt
+  // kept was compared with a chat's time: it goes, so rh send me is pushed till you next write on the
+  // board. turnToldYou is read no more.
+  `
+ALTER TABLE slot ADD COLUMN imAt INTEGER;
+UPDATE slot SET webAt = NULL;
+`,
+  // The local pictures in what agents said, each checked once (#669).
+  `
+CREATE TABLE replyImage (id TEXT PRIMARY KEY, machine TEXT NOT NULL,
+  conversation TEXT NOT NULL, path TEXT NOT NULL, at INTEGER, by TEXT NOT NULL, hash TEXT, why TEXT, name TEXT NOT NULL);
+CREATE INDEX replyImage_path ON replyImage (conversation, path);
+`,
+  // Whether the terminal of a slot in TUI mode takes typing now (#710).
+  `
+ALTER TABLE slot ADD COLUMN tuiInput TEXT;
+`,
+  // You hear once of what waits long for the switch back (#709).
+  `
+ALTER TABLE slot ADD COLUMN tuiHeldNotice INTEGER;
+`,
+  // What is typed into a slot's terminal (#712).
+  `
+ALTER TABLE agentInput ADD COLUMN typedAt INTEGER;
+ALTER TABLE agentInput ADD COLUMN typed TEXT;
+ALTER TABLE agentInput ADD COLUMN resentAt INTEGER;
+ALTER TABLE agentInput ADD COLUMN noticedAt INTEGER;
+`,
+  // Whether your own messages are typed into a slot's terminal (#722).
+  `
+ALTER TABLE slot ADD COLUMN typeIn INTEGER;
+`,
+  // A slot whose holder unit is held up over MemoryHigh (#692).
+  `
+ALTER TABLE slot ADD COLUMN memBlocked TEXT;
+`,
 ];
 
 /** Sets the meta row id to value, adding the row the first time. */
@@ -592,6 +666,9 @@ export function ulid(): string {
   for (const d of lastRand) s += B32[d];
   return s;
 }
+
+/** When a ULID was made, in ms since the epoch: its first 10 digits. */
+export const madeAt = (id: string): number => [...id.slice(0, 10)].reduce((t, c) => t * 32 + B32.indexOf(c), 0);
 
 // ---- The store. ----
 

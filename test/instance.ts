@@ -75,9 +75,10 @@ export type Instance = {
    *  from the first start() on, when the instance was made with the herdr option; stop() and start()
    *  restart it, as a Herdr restart does. Its auto-resume finds the fake claude on its PATH. */
   herdr: { session: string; socket: string; stop(): Promise<void>; start(): Promise<void> };
-  /** Starts a rhodium on this instance; resolves once it is ready, rejects with its log if it exits first.
+  /** Starts a rhodium on this instance; resolves once it is ready, rejects with its log if it exits first,
+   *  or kills it and rejects with its log if it is not ready within readyMs.
    *  command: the rhodium it runs, this checkout's by default. */
-  start(command?: string[]): Promise<Daemon>;
+  start(command?: string[], readyMs?: number): Promise<Daemon>;
   /** Stops every rhodium this instance started. */
   stop(): Promise<void>;
   /** kill -9 every rhodium this instance started, by the PIDs it recorded, and waits for them to die. */
@@ -350,11 +351,12 @@ export function newInstance(opts: InstanceOptions = {}): Instance {
   const socket = join(socketDir, "rh.sock");
   // Everything else under HOME comes from the sandbox too. XDG_RUNTIME_DIR stays: systemd-run needs it.
   // The tests may run in your Herdr pane or Claude or Codex session; rhodium must not see any of them.
-  const leaks = /^(XDG_(CONFIG|DATA|STATE|CACHE)_HOME|RHODIUM_|HERDR_|CLAUDE|CODEX_)/;
+  // FORCE_COLOR: Bun colors console output even with NO_COLOR set (#741).
+  const leaks = /^(XDG_(CONFIG|DATA|STATE|CACHE)_HOME|RHODIUM_|HERDR_|CLAUDE|CODEX_|FORCE_COLOR$)/;
   const env: Record<string, string | undefined> = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !leaks.test(k)),
   );
-  Object.assign(env, opts.env, { HOME: home, CODEX_HOME: join(home, ".codex"), RHODIUM_SOCKET: socket });
+  Object.assign(env, { NO_COLOR: "1" }, opts.env, { HOME: home, CODEX_HOME: join(home, ".codex"), RHODIUM_SOCKET: socket });
   const daemons: Daemon[] = [];
   const serviceUnit = `${unitPrefix}rhodium`;
   let cleaned = false;
@@ -366,7 +368,7 @@ export function newInstance(opts: InstanceOptions = {}): Instance {
     herdr = await startFakeHerdr(herdrBin, herdrSession, { ...Object.fromEntries(serverEnv), PATH: `${bin}:${env.PATH}` });
   }
 
-  async function start(command = [process.execPath, main]): Promise<Daemon> {
+  async function start(command = [process.execPath, main], readyMs = 30_000): Promise<Daemon> {
     await holderBuild.built;
     if (opts.herdr && !herdr) await startHerdr();
     const proc = Bun.spawn([...command, "--config", config], { env, stdout: "ignore", stderr: "pipe" });
@@ -386,11 +388,22 @@ export function newInstance(opts: InstanceOptions = {}): Instance {
         }
       }
     })();
+    // Without a deadline a rhodium that never logs ready outlives its test, and they pile up (#741).
+    let late = false;
+    const timer = setTimeout(() => {
+      late = true;
+      proc.kill("SIGKILL");
+    }, readyMs);
     const exited = proc.exited.then(async (code) => {
       await reading;
-      throw new Error(`rhodium exited with ${code} before it was ready:\n${d.logs.map((l) => JSON.stringify(l)).join("\n")}`);
+      const why = late ? `was not ready after ${readyMs} ms, so it was killed` : `exited with ${code} before it was ready`;
+      throw new Error(`rhodium ${why}:\n${d.logs.map((l) => JSON.stringify(l)).join("\n")}`);
     });
-    await Promise.race([ready, exited]);
+    try {
+      await Promise.race([ready, exited]);
+    } finally {
+      clearTimeout(timer);
+    }
     exited.catch(() => {}); // it exits later, on stop
     return d;
   }

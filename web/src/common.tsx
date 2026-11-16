@@ -2,7 +2,7 @@
 // way back, a slot's top bar, headings and text boxes, a file's row.
 import { cn } from "cn";
 import { Activity, ChevronLeft, FileText, Plus, Settings } from "lucide-react";
-import { createContext, lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject, type UIEvent } from "react";
 import { Link, useLocation } from "wouter";
 import type { AgentKind } from "../../src/contracts";
 import { request, settled } from "./data";
@@ -386,11 +386,66 @@ export function Title({ children, sub }: { children: ReactNode; sub: string }) {
 
 export const Heading = ({ children }: { children: ReactNode }) => <h3 className="mt-5 mb-1.5 text-sm font-semibold text-muted-foreground">{children}</h3>;
 
-/** Text as written, such as a log, in a box that scrolls; a phone's floating bar, which Chromium draws
- *  over a scroller's own round corners, clipped to them (#646). */
-export const Box = ({ children, className }: { children: ReactNode; className?: string }) => (
-  <pre className={cn("card-scroll max-h-[60vh] overflow-auto rounded-lg border bg-card px-2.5 py-2 font-mono text-xs/relaxed whitespace-pre-wrap wrap-anywhere [clip-path:border-box]", className)}>{children}</pre>
-);
+/** Writes how far a scroller can still go left and right, up and down, how wide its upright bar is and
+ *  how high the one under it, none where bars lie over what scrolls, for its edge-fade or edge-fade-y
+ *  (index.css). */
+export const edges = (el: HTMLElement) => {
+  el.style.setProperty("--os", `${el.scrollLeft}px`);
+  el.style.setProperty("--oe", `${el.scrollWidth - el.clientWidth - el.scrollLeft}px`);
+  el.style.setProperty("--ot", `${el.scrollTop}px`);
+  el.style.setProperty("--ob", `${el.scrollHeight - el.clientHeight - el.scrollTop}px`);
+  el.style.setProperty("--bar", `${el.offsetWidth - el.clientWidth}px`);
+  el.style.setProperty("--under", `${el.offsetHeight - el.clientHeight}px`);
+};
+/** A scroller's ref and onScroll that keep its edge-fade up to date: on a scroll, and as the scroller or
+ *  what it holds changes size, a line or a row still being written, a part swapped for another or
+ *  opened included (#638); the scroller may come later than its component. A message box holds no
+ *  element: it reads them again as its text changes. box: a ref that gets the scroller too. */
+export function useEdges<T extends HTMLElement>(box?: RefObject<T | null>) {
+  const ref = useCallback((el: T | null) => {
+    if (box) box.current = el;
+    if (!el) return;
+    const sized = new ResizeObserver(() => edges(el));
+    const watch = () => {
+      sized.disconnect();
+      for (const n of [el, ...el.children]) sized.observe(n);
+    };
+    const swapped = new MutationObserver(watch);
+    swapped.observe(el, { childList: true });
+    watch();
+    return () => {
+      sized.disconnect();
+      swapped.disconnect();
+      if (box) box.current = null;
+    };
+  }, []);
+  return { ref, onScroll: (e: UIEvent<T>) => edges(e.currentTarget) };
+}
+/** Text as written, such as a log, in a box that scrolls: its ends faded while there is more that way, so
+ *  no line shows cut in half (#656). The border and ground are on a box round the scroller, which the
+ *  fade's mask would fade too; className goes on that box, a max-h- included. A phone's floating bar,
+ *  which Chromium draws over a scroller's own round corners, clipped to them (#646). */
+export function Box({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn("flex max-h-[60vh] flex-col rounded-lg border bg-card", className)}>
+      <Scrolls className="px-2.5 py-2 text-xs/relaxed">{children}</Scrolls>
+    </div>
+  );
+}
+
+/** Text as written, scrolling inside a box round it whose height bounds it, its ends faded (#656). */
+export function Scrolls({ children, className }: { children: ReactNode; className?: string }) {
+  const box = useRef<HTMLPreElement>(null);
+  const scroller = useEdges(box);
+  // Its text is one text node, which no observer of useEdges sees change: at its full height, a log
+  // grown on a refresh would keep its old fade. Read again as the text changes, as a message box's is.
+  useLayoutEffect(() => void (box.current && edges(box.current)), [children]);
+  return (
+    <pre {...scroller} className={cn("card-scroll edge-fade-y min-h-0 overflow-auto rounded-[inherit] font-mono whitespace-pre-wrap wrap-anywhere [clip-path:border-box]", className)}>
+      {children}
+    </pre>
+  );
+}
 
 /** Your words, each run of 24 or more ASCII characters with no space (a path, a hash, a URL) set to
  *  break anywhere: else it breaks only at its few hyphens, leaving a line of a few characters (#512).

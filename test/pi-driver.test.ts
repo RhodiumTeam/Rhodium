@@ -438,6 +438,36 @@ describe("the driver on its own", () => {
     expect(w.events.flatMap((e) => (e.type === "taken" ? [e.inputId] : []))).toEqual(["in-1", "in-2"]);
   });
 
+  test("#672: a turn whose last model call failed, as one out of the provider's quota, says why; one that got through on a retry does not", () => {
+    const w = wired();
+    const said = (m: object) => w.feed({ type: "message_end", message: { role: "assistant", content: [], ...m } });
+    const refused = { stopReason: "error", errorMessage: "429 You exceeded your current quota" };
+    w.feed({ type: "agent_start" });
+    said(refused);
+    w.feed({ type: "agent_settled" });
+    expect(w.events.filter((e) => e.type === "protocol_error")).toEqual([{ conv: "conv-1", proc: 1, type: "protocol_error", reason: "unexpected", detail: "pi: 429 You exceeded your current quota" }]);
+    expect(brief(w.events).slice(-3)).toEqual(["error:unexpected", "state:idle", "turn_end"]);
+
+    w.feed({ type: "agent_start" });
+    said(refused);
+    said({ content: [{ type: "text", text: "done" }], stopReason: "stop" });
+    w.feed({ type: "agent_settled" });
+    expect(w.events.filter((e) => e.type === "protocol_error")).toHaveLength(1);
+
+    // Interrupted while pi waited to retry: pi says so itself, and no new message follows the refused one.
+    w.feed({ type: "agent_start" });
+    said(refused);
+    w.feed({ type: "auto_retry_end", success: false, attempt: 1, finalError: "Retry cancelled" });
+    w.feed({ type: "agent_settled", aborted: true });
+    expect(w.events.filter((e) => e.type === "protocol_error")).toHaveLength(1);
+
+    // A failure that only reads like an interrupt is still told.
+    w.feed({ type: "agent_start" });
+    said({ stopReason: "error", errorMessage: "The operation was aborted due to timeout" });
+    w.feed({ type: "agent_settled", aborted: false });
+    expect(w.events.flatMap((e) => (e.type === "protocol_error" ? [e.detail] : []))).toEqual(["pi: 429 You exceeded your current quota", "pi: The operation was aborted due to timeout"]);
+  });
+
   test("a message pi takes in after a restart says so; one fed again from before the restart took nothing", () => {
     const w = wired();
     w.driver.untaken(["in-old"]);

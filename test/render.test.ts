@@ -499,3 +499,11 @@ test("#397: QQ takes a line's # as a heading with no space after it, so there it
   );
   expect(markdown(md, TELEGRAM_CAPABILITIES)).toBe(md);
 });
+
+test("a message cut inside a local picture still being written loses none of what follows it", () => {
+  // No line break, so the cut falls inside the picture's mark; whole, the mark is rewritten shorter.
+  const text = `${"字".repeat(4050)}![说明](/srv/proj/a-long-enough-name-to-cross-the-limit.png)最后几个字。`;
+  const cut = text.indexOf(")") - 3;
+  const { messages } = telegram([delta(text.slice(0, cut)), delta(text.slice(cut)), message(text)]);
+  expect(messages.map((m) => m.text).join("").slice(-6)).toBe("最后几个字。");
+});

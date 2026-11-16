@@ -5,7 +5,7 @@ import { afterEach, expect, test } from "bun:test";
 import type { Posted } from "../src/fake-im";
 import { dirname } from "node:path";
 import { installFakeAgent, type Step } from "./fake-agent/fake-agent";
-import { rateLimited } from "./fake-agent/scripts";
+import { endTurn, on, rateLimited, rejected, selfStart, startTurn } from "./fake-agent/scripts";
 import { BOARD_LOGIN, newInstance, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
 
 const ME = "you-openid";
@@ -317,4 +317,55 @@ test("#234: your message while the slot waits, after the refused turn used rh se
   expect(told()).toEqual(["work", "later"]);
   await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
   expect(await rhodium.ok("trace", work.messageId)).toMatch(/^ {2}.* final_reply w\/a$/m);
+}, 30_000);
+
+// #684: a subagent in the background is refused while the slot is idle, so the refusal's event comes
+// between turns; the slot's next turn is then refused with the assistant message alone.
+const REFUSAL = "You've hit your weekly limit";
+const refusal = endTurn(REFUSAL, { error: "rate_limit" });
+const plain: Step[] = [...startTurn, ...endTurn("fake reply")];
+/** Plays steps, then plain turns for good. */
+function script(steps: Step[]) {
+  installFakeAgent(dirname(rhodium.claude.path), { script: { on, steps: [...steps, ...plain, { goto: steps.length }] } });
+}
+const soon = (s: number) => Math.ceil(Date.now() / 1000) + s;
+
+test("#684: refused while idle, then a turn Claude began by itself is refused with the message alone: the slot waits, you get the notice, and it carries on at the reset", async () => {
+  await slotA();
+  const resetsAt = soon(3);
+  script([...startTurn, ...endTurn("first"), { sleep: 300 }, { emit: [rejected(resetsAt)] }, selfStart, ...refusal]);
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "work" });
+  const [, notice] = await posts(2);
+  expect(notice!.text).toStartWith(`w/a 用完了 Claude 额度，${clock(resetsAt)} 恢复`);
+  expect(await rhodium.state("w/a")).toBe("等额度");
+
+  await until(() => told().length === 2, 15_000);
+  expect(Date.now()).toBeGreaterThanOrEqual(resetsAt * 1000);
+  expect(told()).toEqual(["work", "继续"]);
+  await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => p.text)).not.toContain(REFUSAL);
+}, 30_000);
+
+test("#684: refused while idle, then your turn is refused with the message alone: you get the notice instead of the refusal, and the turn's reply at the reset", async () => {
+  await slotA();
+  const resetsAt = soon(4);
+  script([...startTurn, ...endTurn("first"), { emit: [rejected(resetsAt)] }, ...startTurn, ...refusal]);
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "work" });
+  await posts(1);
+  await Bun.sleep(300); // the event came by now, the slot idle
+  const again = await rhodium.im.inject("q", { chat: ME, sender: ME, text: "again" });
+  const [, notice, reply] = await posts(3);
+  expect(notice!.text).toStartWith(`w/a 用完了 Claude 额度，${clock(resetsAt)} 恢复`);
+  expect(reply).toMatchObject({ text: "fake reply", replyTo: again.messageId });
+  expect(told()).toEqual(["work", "again", "继续"]);
+}, 30_000);
+
+test("#684: a turn refused with the message alone and no refusal's reset known ends as any other, the refusal its reply", async () => {
+  await slotA();
+  // The reset a warning names is not one to wait for: nothing was refused until then. And the
+  // warning coming after a refusal means that refusal is over: its reset is forgotten.
+  script([{ emit: [rejected(soon(3600)), rejected(soon(5 * 86400), "allowed_warning")] }, ...startTurn, ...refusal]);
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: "work" });
+  expect((await posts(1))[0]!.text).toBe(REFUSAL);
+  await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
 }, 30_000);

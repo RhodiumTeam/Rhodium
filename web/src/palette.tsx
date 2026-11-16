@@ -9,12 +9,11 @@ import { AGENT_KINDS } from "../../src/agents";
 import type { AgentKind } from "../../src/contracts";
 import type { Candidate } from "../../src/panels";
 import type { RhReply } from "../../src/router";
-import { AgentLogo, agentName, ModelName } from "./common";
+import { AgentLogo, agentName, ModelName, useEdges } from "./common";
 import { CardFrame } from "./card";
 import { buttonVariants } from "./components/ui/button";
 import type { Command } from "./data";
 import { toast } from "./toast";
-import { useEdges } from "./write";
 
 /** The commands for what you typed after the /: those whose name starts with it first, then those
  *  whose name has it, then those whose summary does (story 296), each in the order given. */

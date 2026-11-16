@@ -196,6 +196,7 @@ export class ClaudeDriver implements AgentDriver {
   readonly unknown = new Map<string, number>();
   private contextTokens: number | undefined;
   private usage: TokenUsage | null = null; // the last turn's, for /status
+  private quotaReset: number | null = null; // the reset the last rate_limit_event named, if it was a refusal
   // The answer to this process's initialize: its models, for /model and /effort.
   private hello: Promise<Json> = Promise.resolve({});
   private effort: string | null = null; // the level /effort set in this process; Claude does not say it
@@ -331,6 +332,8 @@ export class ClaudeDriver implements AgentDriver {
       case "rate_limit_event": {
         const info = m.rate_limit_info ?? {};
         const resetsAt = typeof info.resetsAt === "number" ? info.resetsAt * 1000 : null;
+        // Only a refusal's: a warning names a reset too, days ahead, and nothing is refused until then.
+        this.quotaReset = info.status === "rejected" ? resetsAt : null;
         return this.emit({ type: "usage", quota: { exhausted: info.status === "rejected", resetsAt } });
       }
       case "command_lifecycle": {
@@ -773,6 +776,10 @@ export class ClaudeDriver implements AgentDriver {
     if (m.parent_tool_use_id != null) return;
     const u = m.message?.usage;
     if (u) this.contextTokens = inputTokens(u);
+    // The model call was refused for quota, and this message is the refusal. Its rate_limit_event
+    // may have come between turns, when a subagent in the background was refused first (#684), so
+    // the turn is reported as refused here too, until the reset last heard of.
+    if (m.error === "rate_limit") this.emit({ type: "usage", quota: { exhausted: true, resetsAt: this.quotaReset } });
     const content: Json[] = m.message?.content ?? [];
     const text = content
       .filter((b) => b.type === "text")

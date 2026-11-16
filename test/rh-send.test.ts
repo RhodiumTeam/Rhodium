@@ -84,6 +84,28 @@ for (const like of ["qq", "telegram"] as const)
     expect(told("w/b").some((t) => t.includes("to a"))).toBe(false);
   }, 30_000);
 
+test("story 592: a child a chat is bound to has the final reply of a turn rh send began sent there, with no report; QQ out of active messages, it goes through another bot led by the child's name, and your quote of it goes back to the child", async () => {
+  await begin({ bots: { q: { like: "qq", owner: ME, target: "w/a" }, t: { like: "telegram", owner: ME, target: "w/a" } }, toml: "[limits]\nqqActive = 1" });
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan(["spawn", "c", plan()]) });
+  await until(() => frames("w/a").length === 2, 15_000); // its task, and c's report
+  await until(async () => (await rhodium.state("w/a")) === "空闲" && (await rhodium.state("w/c")) === "空闲", 15_000);
+  const use = await rhodium.im.inject("q", { chat: ME, sender: ME, text: "/rh_use c" });
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.replyTo === use.messageId), 15_000);
+  const before = (await rhodium.im.log("q", ME)).length;
+  await rhodium.ok("send", "w/c", plan());
+  // One message, the reply alone, not a reply to any of yours; its parent hears nothing.
+  expect((await texts(before + 1)).slice(before)).toEqual(["done"]);
+  expect((await rhodium.im.log("q", ME))[before]!.replyTo).toBeUndefined();
+  await until(async () => (await rhodium.state("w/c")) === "空闲", 15_000);
+  await rhodium.ok("send", "w/c", plan());
+  const [moved] = await texts(1, "t");
+  expect(moved).toEndWith("那边发不出去，改发在这里。\n\n〔w/c〕\ndone");
+  const ref = (await rhodium.im.log("t", ME))[0]!.messageId;
+  await rhodium.im.inject("t", { chat: ME, sender: ME, text: "and the rest?", quote: { ref, text: moved! } });
+  await until(() => told("w/c").some((t) => t.endsWith("and the rest?")), 15_000);
+  expect(frames("w/a")).toHaveLength(2);
+}, 30_000);
+
 test("story 90: a child's report reaches its parent once the child is done; with a background task running it waits for the turn that task wakes", async () => {
   // Each turn runs its rh calls, starts a background task and ends with "started"; the task then
   // wakes the session for a turn ending with "background task done".

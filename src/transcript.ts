@@ -120,7 +120,7 @@ const list = (v: unknown): any[] => (Array.isArray(v) ? v : []);
 // Its other lines are not the conversation: response_item is what it sends the model.
 function fromCodex(v: any): any {
   const p = v.payload;
-  if (v.type === "session_meta") return { type: "session", timestamp: v.timestamp, cwd: p?.cwd, subagent: Boolean(p?.source?.subagent) };
+  if (v.type === "session_meta") return { type: "session", timestamp: v.timestamp, cwd: p?.cwd, subagent: Boolean(p?.source?.subagent), branch: p?.git?.branch };
   if (v.type !== "event_msg") return v;
   if (p?.type === "turn_aborted") return { type: "system", subtype: "turn_aborted", timestamp: v.timestamp };
   const item = p?.type === "item_completed" ? p.item : undefined;
@@ -305,20 +305,9 @@ function blocksOf(offset: number, raw: string, max: number, dir: string, keep?: 
       for (const r of items.filter((i) => i?.type === "tool_result")) {
         add({ kind: "result", id: String(r.tool_use_id), ...clipped(joined(r.content), max), error: r.is_error === true, ...inlined(r.content) });
       }
-      // Nor what Claude writes in tags, as typedText skips: a task's notice, a slash command and its output,
-      // IDE context. What you pasted is in tags too, and is yours.
-      // ponytail: text you typed starting with "<" is skipped too.
-      const all = texts(msg.content);
-      // Claude's note that you pressed Esc, alone on its line.
-      if (all.length === 1 && /^\[Request interrupted by user( for tool use)?\]$/.test(all[0]!)) {
-        add({ kind: "system", title: "你打断了回合", text: "" });
-        break;
-      }
-      const said = unwrapped(all.filter((t) => !/^\s*<(?!pasted_content\b)/.test(t)).join("\n\n"));
-      if (!said.trim()) break;
-      const { source, text: body } = splitSource(said);
-      const { text, media } = withoutMedia(body);
-      add({ kind: "user", text, source, ...(media.length && { media }), ...(typeof v.uuid === "string" && { id: v.uuid }) });
+      const w = yourWords(msg);
+      if (w === "interrupted") add({ kind: "system", title: "你打断了回合", text: "" });
+      else if (w) add({ kind: "user", text: w.text, source: w.source, ...(w.media.length && { media: w.media }), ...(typeof v.uuid === "string" && { id: v.uuid }) });
       break;
     }
     case "assistant":
@@ -355,6 +344,40 @@ function blocksOf(offset: number, raw: string, max: number, dir: string, keep?: 
       break;
   }
   return blocks;
+}
+
+/** What you said on a user line that is yours (not isMeta nor isCompactSummary), as its block has it:
+ *  its words, the source line gone, and the files it carried; "interrupted" for Claude's note that you
+ *  pressed Esc; null for none. Not what Claude writes in tags, as typedText skips: a task's notice, a
+ *  slash command and its output, IDE context. What you pasted is in tags too, and is yours. */
+// ponytail: text you typed starting with "<" is skipped too.
+function yourWords(msg: any): "interrupted" | { text: string; source: string | null; media: Media[] } | null {
+  const all = texts(msg.content);
+  // Claude's note that you pressed Esc, alone on its line.
+  if (all.length === 1 && /^\[Request interrupted by user( for tool use)?\]$/.test(all[0]!)) return "interrupted";
+  const said = unwrapped(all.filter((t) => !/^\s*<(?!pasted_content\b)/.test(t)).join("\n\n"));
+  if (!said.trim()) return null;
+  const { source, text: body } = splitSource(said);
+  const { text, media } = withoutMedia(body);
+  return { text, source, media };
+}
+
+/** What you and the agent said on a line, parsed (parseObject), each as its block has it (architecture
+ *  §7.10 "哪些字算正文"): your words, the agent's text. No tool call or result, thought, picture or
+ *  metadata. */
+function spoken(v: any): { role: "user" | "assistant"; text: string }[] {
+  const msg = v.message && typeof v.message === "object" ? v.message : {};
+  switch (v.type === "message" ? msg.role : v.type) {
+    case "user": {
+      const w = v.isMeta || v.isCompactSummary ? null : yourWords(msg);
+      return w && w !== "interrupted" ? [{ role: "user", text: w.text }] : [];
+    }
+    case "assistant":
+      return list(msg.content)
+        .filter((i) => i?.type === "text" && typeof i.text === "string" && i.text.trim())
+        .map((i) => ({ role: "assistant", text: i.text }));
+  }
+  return [];
 }
 
 /** The pictures in a tool result's content, Claude's image blocks with a base64 source and pi's with
@@ -524,6 +547,29 @@ export async function lastSaid(file: string): Promise<(Message & { at: number | 
   }
 }
 
+/** Whether a user message's source line names you, as the board's list has it (architecture §7.7):
+ *  none, or not another slot's (槽位 …) nor Rhodium's own (a report, a confirm's result). */
+export const fromYou = (source: string | null | undefined) => !/^(槽位 |Rhodium)/.test(source ?? "");
+
+/** Gives take what you said in file (fromYou), newest first, as your words alone: no source line,
+ *  quote or files; till take says it has enough, or past deadline (ms since the epoch). Reads back
+ *  from the end only as far as that. Says whether take wants more. */
+export async function yoursSaid(file: string, take: (words: string) => boolean, deadline: number): Promise<boolean> {
+  for (let at = Infinity; ; ) {
+    const page = await readPage(file, at, 50, "backward");
+    for (const e of page.entries.toReversed()) {
+      for (const b of blocksOf(e.offset, e.raw, Infinity, "").toReversed()) {
+        if (b.kind !== "user" || !fromYou(b.source)) continue;
+        const words = (quoteOf(b.text)?.rest ?? b.text).trim();
+        if (words && !take(words)) return false;
+      }
+    }
+    if (Date.now() > deadline) return false;
+    if (page.start === 0 || !page.entries.length) return true;
+    at = page.start;
+  }
+}
+
 /** What Claude ran the newest turn in file on, by the turn's first reply of the agent's own (not a
  *  subagent's): its effort level and full model id. Later replies may be at the level of a skill the
  *  turn loaded, and a turn begun with a slash command, which may start a skill, is passed over. Of
@@ -614,6 +660,62 @@ export async function codexSettings(file: string, since: number, side: "after" |
   }
 }
 
+/** What a transcript says of its context and, Codex's, of the quota (architecture §7.11): the context of
+ *  the newest answer's request, none once compacted after it; the limit only where the file has it
+ *  (Codex's). rateLimits: the bucket of Codex's newest token_count, no older than its newest answer's,
+ *  named as account/rateLimits/read names one. at: the line's time, ms. */
+export type TranscriptMeter = {
+  context?: { usedTokens: number; maxTokens: number | null; at: number };
+  rateLimits?: { bucket: Record<string, unknown>; at: number };
+};
+
+const num = (v: unknown) => (typeof v === "number" ? v : 0);
+/** A Codex rate_limits window as account/rateLimits/read has it. */
+const codexWindow = (w: any) => w && { usedPercent: w.used_percent, windowDurationMins: w.window_minutes, resetsAt: w.resets_at };
+
+/** What file, the agent's transcript, says of its context and quota, read back from its end (TranscriptMeter). */
+export async function meterIn(file: string, agent: AgentKind): Promise<TranscriptMeter> {
+  const found: TranscriptMeter = {};
+  for (let at = Infinity; ; ) {
+    const page = await readPage(file, at, 100, "backward");
+    for (const e of page.entries.toReversed()) {
+      let v: any;
+      try {
+        v = JSON.parse(e.raw);
+      } catch {
+        continue;
+      }
+      const time = Date.parse(v?.timestamp);
+      if (agent === "codex") {
+        const p = v?.type === "event_msg" && v.payload?.type === "token_count" ? v.payload : undefined;
+        if (!p) continue;
+        const r = p.rate_limits;
+        if (!found.rateLimits && r) {
+          const c = r.credits;
+          const bucket = { limitId: r.limit_id ?? "codex", primary: codexWindow(r.primary), secondary: codexWindow(r.secondary), ...(c && { credits: { hasCredits: c.has_credits, balance: c.balance } }) };
+          found.rateLimits = { bucket, at: time };
+        }
+        // Stop at the newest answer's count: a quota older than it is stale, and on an API key, where no
+        // line has one, going on would read the whole file on every change to it.
+        const last = p.info?.last_token_usage;
+        if (last) return { ...found, context: { usedTokens: num(last.total_tokens), maxTokens: p.info.model_context_window ?? null, at: time } };
+        continue;
+      }
+      // A compaction since the newest answer: what that answer carried is no longer what the context holds.
+      if (v?.type === "compaction" || (v?.type === "system" && v.subtype === "compact_boundary")) return found;
+      const m = v?.message;
+      const u = m?.role === "assistant" ? m.usage : undefined;
+      // pi's errored and aborted answers carry no real count, as pi's own getAssistantUsage holds.
+      if (!u || v.isSidechain || m.model === "<synthetic>" || m.stopReason === "error" || m.stopReason === "aborted") continue;
+      const used = agent === "claude" ? num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens) + num(u.output_tokens) : (u.totalTokens ?? num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite));
+      if (!used) continue;
+      return { context: { usedTokens: used, maxTokens: null, at: time } };
+    }
+    if (page.start === 0 || !page.entries.length) return found;
+    at = page.start;
+  }
+}
+
 /** The whole text of the block at `at` in file, where a page gives only its start: a tool call's
  *  arguments, a result, a thought, a system line. null if there is no block there. */
 export async function fullText(file: string, at: string): Promise<string | null> {
@@ -690,15 +792,22 @@ const FORMATS: Record<AgentKind, Format> = {
  *  it is named (codex-cli 0.162.1; its terminal names its threads itself). Its records have none. */
 // ponytail: reads the whole index, a short line a name; read it from its end if it grows large.
 async function codexName(id: string): Promise<string | undefined> {
+  return (await codexNames(id)).get(id);
+}
+
+/** The names Codex keeps for its threads, the newest of each, by thread id: of only the one that has
+ *  id, if given. */
+async function codexNames(id?: string): Promise<Map<string, string>> {
   const index = await Bun.file(join(codexHome(userHome()), "session_index.jsonl"))
     .text()
     .catch(() => ""); // none yet
-  let name: string | undefined;
+  const names = new Map<string, string>();
   for (const line of index.split("\n")) {
-    const v = line.includes(id) ? parseObject(line) : undefined;
-    if (v?.id === id && typeof v.thread_name === "string") name = oneLine(v.thread_name) || undefined;
+    const v = !id || line.includes(id) ? parseObject(line) : undefined;
+    const name = typeof v?.thread_name === "string" && oneLine(v.thread_name);
+    if (typeof v?.id === "string" && (!id || v.id === id)) name ? names.set(v.id, name) : names.delete(v.id);
   }
-  return name;
+  return names;
 }
 
 /** What the agent ran on in its transcript file, of the lines since `since` or before it: claudeSettings, piSettings, codexSettings. */
@@ -891,4 +1000,269 @@ function typedText(content: unknown, source = false): string | undefined {
     .filter((t) => !t.startsWith("<"))
     .join(" ");
   return line || undefined;
+}
+
+// ---- What the import list shows of a conversation, and searching it (architecture §7.10). ----
+
+/** What the board keeps of a transcript file it read, by its path: how far it read, and the file's size
+ *  and time of change then; the sources of its title; how many things you and the agent said; the git
+ *  branch it was on; what you last said, on one line, and the start of the agent's last reply; the
+ *  directory it was started in, and for Codex whether it is a subagent's. */
+type Summary = {
+  read: number;
+  size: number;
+  mtime: number;
+  custom?: string;
+  ai?: string;
+  named?: string;
+  first?: string;
+  count: number;
+  branch?: string;
+  you?: string;
+  reply?: string;
+  cwd?: string;
+  subagent?: boolean;
+};
+
+// ponytail: about 1KB a file read, never dropped; drop the least used if thousands of files make it big.
+const summaries = new Map<string, Summary>();
+
+const MB = 1 << 20;
+const YOU = 200; // characters of what you last said kept
+const REPLY = 400; // characters of the start of the agent's last reply kept
+/** How Claude's metadata lines start (api-request, last-prompt, its titles…); what you and it said start {"parentUuid". */
+const META = Buffer.from('{"type":"');
+
+/** Calls fn with each complete line of file from byte offset from, and its offset, till fn says stop
+ *  (true). Gives the offset just past the last line read. Throws once signal aborts, checked before
+ *  each block. */
+async function eachLine(file: string, from: number, fn: (line: Buffer, at: number) => boolean | void, signal?: AbortSignal): Promise<number> {
+  const fh = await open(file, "r");
+  try {
+    let carry = Buffer.alloc(0);
+    let at = from; // where carry starts
+    for (let pos = from; ; ) {
+      if (signal?.aborted) throw signal.reason;
+      const buf = Buffer.alloc(MB);
+      const { bytesRead } = await fh.read(buf, 0, MB, pos);
+      if (!bytesRead) return at;
+      pos += bytesRead;
+      const all = carry.length ? Buffer.concat([carry, buf.subarray(0, bytesRead)]) : buf.subarray(0, bytesRead);
+      let start = 0;
+      for (let nl = all.indexOf(NL); nl !== -1; nl = all.indexOf(NL, start)) {
+        if (fn(all.subarray(start, nl), at + start)) return at + nl + 1;
+        start = nl + 1;
+      }
+      carry = Buffer.from(all.subarray(start));
+      at += start;
+    }
+  } finally {
+    await fh.close();
+  }
+}
+
+/** Takes in one line of agent's transcript into s. */
+function takeIn(s: Summary, agent: AgentKind, line: Buffer): void {
+  // Claude's metadata, but its titles, unparsed: api-request lines carry the whole history.
+  if (agent === "claude" && line.subarray(0, META.length).equals(META) && !/^\{"type":"(ai|custom)-title"/.test(line.toString("latin1", 0, 30))) return;
+  const v = parseObject(line.toString("utf8"));
+  if (!v) return;
+  if (s.cwd === undefined && typeof v.cwd === "string") s.cwd = v.cwd;
+  if (v.type === "session" && v.subagent) s.subagent = true;
+  // Claude's on most lines, HEAD when detached; Codex's on its first.
+  if (typeof v.gitBranch === "string" || (v.type === "session" && typeof v.branch === "string")) s.branch = v.gitBranch ?? v.branch;
+  if (v.type === "custom-title" && typeof v.customTitle === "string") s.custom = oneLine(v.customTitle) || undefined;
+  if (v.type === "ai-title" && typeof v.aiTitle === "string") s.ai = oneLine(v.aiTitle) || undefined;
+  if (v.type === "session_info" && typeof v.name === "string") s.named = oneLine(v.name) || undefined;
+  for (const m of spoken(v)) {
+    s.count++;
+    if (m.role === "assistant") s.reply = clip(m.text.trim(), REPLY, "…");
+    const words = m.role === "user" && oneLine(m.text);
+    if (!words) continue;
+    s.first ??= clip(words, OPENING, "…");
+    s.you = clip(words, YOU, "…");
+  }
+}
+
+/** The summary of agent's transcript file, read on from where it was last read if the file only grew,
+ *  else afresh. Throws for a file that cannot be read, and once signal aborts, keeping nothing read. */
+async function summaryOf(file: string, agent: AgentKind, signal?: AbortSignal): Promise<Summary> {
+  const { size, mtimeMs } = await stat(file);
+  let s = summaries.get(file);
+  if (!s || size < s.size || mtimeMs < s.mtime) s = { read: 0, size: 0, mtime: 0, count: 0 };
+  if (size !== s.size || mtimeMs !== s.mtime) {
+    const n: Summary = { ...s, size, mtime: mtimeMs };
+    n.read = await eachLine(file, s.read, (line) => takeIn(n, agent, line), signal);
+    s = n;
+  }
+  summaries.set(file, s);
+  return s;
+}
+
+/** Files known to have something you or the agent said; of the others, the size and time of change they had when found with none. */
+const spoke = new Map<string, true | string>();
+
+/** Whether agent's transcript file has something you or the agent said, read only as far as the first:
+ *  the folder's counts (GET /api/folder) need no more. */
+async function hasMessage(file: string, agent: AgentKind): Promise<boolean> {
+  if (spoke.get(file) === true || (summaries.get(file)?.count ?? 0) > 0) return true;
+  const { size, mtimeMs } = await stat(file);
+  const stamp = `${size} ${mtimeMs}`;
+  if (spoke.get(file) === stamp) return false;
+  let found = false;
+  const s: Summary = { read: 0, size: 0, mtime: 0, count: 0 };
+  await eachLine(file, 0, (line) => (takeIn(s, agent, line), (found = s.count > 0)));
+  spoke.set(file, found || stamp);
+  return found;
+}
+
+/** A conversation's title as the import list has it (architecture §7.10): Claude's /rename name, else
+ *  the one it gave it; pi's session name; Codex's thread name (named); else what you said first. */
+const titleOf = (s: Summary, named?: string) => s.custom ?? s.ai ?? s.named ?? named ?? s.first ?? "";
+
+/** text with ASCII letters lower-cased, its length kept: search is blind to their case alone. */
+const fold = (text: string) => text.replace(/[A-Z]+/g, (c) => c.toLowerCase());
+
+/** Where a full-text search hit, in what you or the agent said: about 30 characters before the words
+ *  and 60 after, on one line, … where cut; the words from from to to. */
+export type Hit = { text: string; from: number; to: number };
+
+/** The bit of text around words at, length n long, that a hit shows. */
+export function hitIn(text: string, at: number, n: number): Hit {
+  const [from, to] = [Math.max(0, at - 30), Math.min(text.length, at + n + 60)];
+  const flat = (t: string) => t.replace(/\s+/g, " ");
+  const before = (from > 0 ? "…" : "") + flat(text.slice(from, at)).trimStart();
+  const words = flat(text.slice(at, at + n));
+  return { text: before + words + flat(text.slice(at + n, to)).trimEnd() + (to < text.length ? "…" : ""), from: before.length, to: before.length + words.length };
+}
+
+/** Finds the bytes of the words, as written in a JSON string, in a block of lines: a function giving
+ *  where, from an offset on, -1 for nowhere. Any hit may be in the wrong case, or in no message: a
+ *  sieve for what is checked after. */
+function sieve(words: string): (block: Buffer, from: number) => number {
+  const raw = Buffer.from(JSON.stringify(words).slice(1, -1));
+  const bytes = raw.toString("latin1");
+  // No ASCII letter, as most Chinese words: the bytes themselves.
+  if (!/[A-Za-z]/.test(bytes)) return (block, from) => block.indexOf(raw, from);
+  // The longest run with no letter, of three bytes at least (a Chinese character): those bytes.
+  const run = bytes.split(/[A-Za-z]+/).reduce((a, b) => (b.length > a.length ? b : a));
+  if (run.length >= 3) {
+    const part = Buffer.from(run, "latin1");
+    return (block, from) => block.indexOf(part, from);
+  }
+  // Letters and short marks: a regex blind to case over the block read as latin1, a byte a character.
+  const re = new RegExp(bytes.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+  let text = "";
+  let of: Buffer | null = null;
+  return (block, from) => {
+    if (of !== block) [of, text] = [block, block.toString("latin1")];
+    re.lastIndex = from;
+    return re.exec(text)?.index ?? -1;
+  };
+}
+
+/** Where words are in what you or the agent said in agent's transcript file, the first place: the bit
+ *  around them, or null for none. Reads it 1MB at a time, giving way between them; stops once signal
+ *  aborts. A sieve first, then the line it hit is parsed and its messages searched. */
+async function hitInFile(file: string, agent: AgentKind, words: string, signal?: AbortSignal): Promise<Hit | null> {
+  const find = sieve(words);
+  const folded = fold(words);
+  const fh = await open(file, "r");
+  try {
+    let carry = Buffer.alloc(0);
+    for (let pos = 0; ; ) {
+      if (signal?.aborted) throw signal.reason;
+      const buf = Buffer.alloc(MB);
+      const { bytesRead } = await fh.read(buf, 0, MB, pos);
+      if (!bytesRead) return null;
+      pos += bytesRead;
+      const all = carry.length ? Buffer.concat([carry, buf.subarray(0, bytesRead)]) : buf.subarray(0, bytesRead);
+      const end = all.lastIndexOf(NL) + 1; // complete lines; the rest waits for the next block
+      const block = all.subarray(0, end);
+      carry = Buffer.from(all.subarray(end));
+      for (let i = find(block, 0); i !== -1; ) {
+        const start = block.lastIndexOf(NL, i) + 1;
+        const nl = block.indexOf(NL, i);
+        i = find(block, nl + 1);
+        if (agent === "claude" && block.subarray(start, start + META.length).equals(META)) continue;
+        const v = parseObject(block.toString("utf8", start, nl));
+        for (const m of v ? spoken(v) : []) {
+          const at = fold(m.text).indexOf(folded);
+          if (at !== -1) return hitIn(m.text, at, words.length);
+        }
+      }
+      await new Promise((r) => setImmediate(r));
+    }
+  } finally {
+    await fh.close();
+  }
+}
+
+/** A conversation as the import list has it: its id and file; the directory it was started in, if its
+ *  record says; its title, when it last changed, how many things you and the agent said, its branch,
+ *  what you last said and the start of the agent's last reply; where a search hit the words in a
+ *  message. */
+export type Listed = { id: string; file: string; dir?: string; title: string; at: number; count: number; branch?: string; you?: string; reply?: string; hit?: Hit };
+
+/** A search: its words, trimmed, and whether it looks in what was said too, not only the title. */
+export type Search = { words: string; full: boolean };
+
+/** agent's conversation in file as listed, if search (if any) finds it; else null. names: Codex's
+ *  thread names. */
+export async function listed(file: string, agent: AgentKind, search?: Search, names?: Map<string, string>, signal?: AbortSignal): Promise<Listed | null> {
+  const s = await summaryOf(file, agent, signal);
+  const id = FORMATS[agent].idOf(file);
+  const title = titleOf(s, names?.get(id));
+  let hit: Hit | null = null;
+  if (search && !fold(title).includes(fold(search.words)) && !(search.full && (hit = await hitInFile(file, agent, search.words, signal)))) return null;
+  const branch = s.branch === "HEAD" ? undefined : s.branch;
+  return { id, file, title, at: s.mtime, count: s.count, ...(s.cwd && { dir: s.cwd }), ...(branch && { branch }), ...(s.you && { you: s.you }), ...(s.reply && { reply: s.reply }), ...(hit && { hit }) };
+}
+
+/** How many conversations an import list page has. */
+const PAGE = 10;
+
+/** A page of agent's conversations to import (architecture §7.10): started in the absolute dir, or in
+ *  any directory with no dir; with something said, not one skip names, found by search if any; the
+ *  newest first. From after cursor, a page's own, on. Stops past budget ms with what it has found,
+ *  partial then, having looked at one file at least; on signal aborting, throws. cursor: where the next
+ *  page starts, while there are more files. */
+export async function importable(
+  agent: AgentKind,
+  o: { dir?: string; search?: Search; cursor?: string; skip: (id: string) => boolean; signal?: AbortSignal; budget?: number },
+): Promise<{ list: Listed[]; cursor?: string; partial?: true }> {
+  const until = Date.now() + (o.budget ?? 2_000);
+  const paths = o.dir ? await startedThere(o.dir, agent) : await globbed(agent, "");
+  const files = (await Promise.all(paths.map(async (file) => ({ file, mtime: (await stat(file).catch(gone))?.mtimeMs }))))
+    .filter((f): f is { file: string; mtime: number } => f.mtime !== undefined)
+    .sort((a, b) => b.mtime - a.mtime || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+  const [mtime, after] = o.cursor ? [Number(o.cursor.slice(0, o.cursor.indexOf(" "))), o.cursor.slice(o.cursor.indexOf(" ") + 1)] : [Infinity, ""];
+  const rest = files.filter((f) => f.mtime < mtime || (f.mtime === mtime && f.file > after));
+  const names = agent === "codex" ? await codexNames() : undefined;
+  const list: Listed[] = [];
+  const cursor = (f: { file: string; mtime: number }) => `${f.mtime} ${f.file}`;
+  for (const [i, f] of rest.entries()) {
+    if (list.length === PAGE) return { list, cursor: cursor(rest[i - 1]!) };
+    if (o.signal?.aborted) throw o.signal.reason;
+    if (!o.skip(FORMATS[agent].idOf(f.file))) {
+      const c = await listed(f.file, agent, o.search, names, o.signal).catch(gone);
+      // A Codex subagent's thread is its parent's (startedThere leaves it out of a directory's).
+      if (c && c.count > 0 && !summaries.get(f.file)?.subagent) list.push(c);
+    }
+    if (Date.now() > until && i + 1 < rest.length) return { list, cursor: cursor(f), partial: true };
+  }
+  return { list };
+}
+
+/** How many of agent's conversations started in the absolute dir have something said and are not ones
+ *  skip names, and when the newest last changed, as GET /api/folder has them. None for none. */
+export async function conversationsIn(dir: string, agent: AgentKind, skip: (id: string) => boolean): Promise<{ count: number; at: number } | undefined> {
+  let [count, at] = [0, 0];
+  for (const file of await startedThere(dir, agent)) {
+    if (skip(FORMATS[agent].idOf(file))) continue;
+    const mtime = await stat(file).then((s) => s.mtimeMs, gone);
+    if (mtime === undefined || !(await hasMessage(file, agent).catch(gone))) continue;
+    [count, at] = [count + 1, Math.max(at, mtime)];
+  }
+  return count ? { count, at } : undefined;
 }

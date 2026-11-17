@@ -8,7 +8,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { BaseEdge, Handle, Position, ReactFlow, ReactFlowProvider, useReactFlow, useStore, useStoreApi, ViewportPortal, type Edge, type EdgeProps, type Node, type NodeProps } from "@xyflow/react";
 import { cn } from "cn";
-import { Archive, ArchiveRestore, ArrowRight, ArrowRightLeft, Bot as BotIcon, Check, Plus, ChevronDown, ChevronRight, ChevronUp, Ellipsis, Folder, GitFork, Hourglass, House, MessageCircleQuestionMark, Pencil, Power, Send, Square, SquareTerminal, Star, TriangleAlert, Undo2, UnfoldVertical, Wrench, X } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, ArrowRightLeft, Bot as BotIcon, Check, Plus, ChevronDown, ChevronRight, ChevronUp, Ellipsis, Folder, GitFork, Hourglass, House, Import, MessageCircleQuestionMark, Pencil, Power, Send, Square, SquarePlus, SquareTerminal, Star, TriangleAlert, Undo2, UnfoldVertical, Wrench, X } from "lucide-react";
 import { createContext, Fragment, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type TouchEvent as TouchStart } from "react";
 import { useLocation } from "wouter";
 import type { BoardAct } from "../../../src/contracts";
@@ -21,7 +21,8 @@ import { act, MenuAt, Pick, Spin, TakeBack, Toasts, ToTerminal, useAct, type Cho
 import { useTerminalEntry } from "../settings";
 import { inTurn, Timeline } from "../timeline";
 import { toast } from "../toast";
-import { NewSlot } from "../create";
+import { newBot, NewSlot, Sheets } from "../create";
+import { BotMenu } from "../bots";
 
 const TEXT: Record<Status, string> = { needs: "text-needs", running: "text-running", idle: "text-idle" };
 const BG: Record<Status, string> = { needs: "bg-needs", running: "bg-running", idle: "bg-idle" };
@@ -124,7 +125,7 @@ const Handles = () => (
 type P<K extends Data["kind"]> = NodeProps<Node<Extract<Data, { kind: K }>>>;
 
 const BotNode = ({ id, data: { bot } }: P<"bot">) => (
-  <div data-node="bot" className={cn("relative size-full cursor-pointer rounded-xl border bg-muted/70 hover:bg-muted", useLook(id))}>
+  <div data-node="bot" className={cn("relative size-full cursor-pointer rounded-xl border bg-muted/70 [-webkit-touch-callout:none] hover:bg-muted", useLook(id))}>
     {/* Its end and start on the right of its title. */}
     <div className="flex h-10 items-center gap-1.5 pr-[18px] pl-2">
       <BotIcon role="img" aria-label="Bot" className="size-4 shrink-0 text-muted-foreground" />
@@ -279,8 +280,14 @@ type CanvasProps = {
   /** A line tapped, by its start. */
   onLine: (of: string) => void;
   onMenu: (slot: Slot, at: { x: number; y: number }) => void;
+  /** A Bot's menu, at where it was right-clicked or held (story 681). */
+  onBotMenu: (bot: Bot, at: { x: number; y: number }) => void;
+  /** The empty canvas's menu, where it was right-clicked or held (spec web-bots story 670). */
+  onBlank: (at: { x: number; y: number }) => void;
+  /** Whether that menu is open. */
+  blankUp: boolean;
 };
-function Canvas({ v, focus, sel, archived, unfold, wide, refit, relaid, sliding, edit, onTap, onLine, onMenu }: CanvasProps) {
+function Canvas({ v, focus, sel, archived, unfold, wide, refit, relaid, sliding, edit, onTap, onLine, onMenu, onBotMenu, onBlank, blankUp }: CanvasProps) {
   const theme = useTheme();
   // While editing, what is selected lights; else the focus lights what it is related to.
   const lit = edit ? (edit.lit?.nodes ?? null) : sel ? v.lit : null;
@@ -455,10 +462,62 @@ function Canvas({ v, focus, sel, archived, unfold, wide, refit, relaid, sliding,
     },
     [],
   );
+  // A finger held still 500ms on a Bot, not editing, opens its menu (story 681), as a row's on the list
+  // (#504); moved over 10px first, it pans.
+  type Hold = { x: number; y: number; timer?: ReturnType<typeof setTimeout>; shown?: boolean };
+  const hold = useRef<Hold | null>(null);
+  /** The Bot at screen x, y: in its box, not on one of its chats. */
+  const botAt = (x: number, y: number) => {
+    const at = flow(x, y);
+    const on = (id: string) => {
+      const r = v.rects.get(id);
+      return !!r && at.x >= r.x && at.x <= r.x + r.w && at.y >= r.y && at.y <= r.y + r.h;
+    };
+    if (v.nodes.some((n) => n.data.kind === "chat" && on(n.id))) return undefined;
+    const n = v.nodes.find((n) => n.data.kind === "bot" && on(n.id));
+    return n?.data.kind === "bot" ? n.data.bot : undefined;
+  };
+  // The browser's own right click for a held finger, after ours, lands on the menu: not its menu over ours.
+  useEffect(() => {
+    const no = (e: Event) => hold.current?.shown && e.preventDefault();
+    addEventListener("contextmenu", no);
+    return () => removeEventListener("contextmenu", no);
+  }, []);
+  const letGo = () => hold.current && !hold.current.shown && (clearTimeout(hold.current.timer), (hold.current = null));
+  // A finger held still 500ms on the empty canvas, not editing, opens its menu, as a row's on the list
+  // (#504); moved over 10px first, it pans. shown: it opened the menu.
+  const blank = useRef<Hold | null>(null);
+  const unhold = () => blank.current && !blank.current.shown && (clearTimeout(blank.current.timer), (blank.current = null));
+  // The browser's own right click for that press, after ours, lands on the menu: not its menu over ours.
+  // That one only: the next, as in a box of the wizard the menu opened, is the browser's again.
+  useEffect(() => {
+    const no = (e: Event) => void (blank.current?.shown && (e.preventDefault(), (blank.current = null)));
+    addEventListener("contextmenu", no);
+    return () => removeEventListener("contextmenu", no);
+  }, []);
+  // Android's own right click may come before our 500ms, and none after: the menu closed lets go of the hold.
+  useEffect(() => void (!blankUp && blank.current?.shown && (blank.current = null)), [blankUp]);
   const pointers = {
     onPointerDown: (e: PointerEvent) => {
       // A press of its own is a tap again: only the click of the line let go of is quiet.
       quiet.current = 0;
+      clearTimeout(hold.current?.timer);
+      hold.current = null;
+      if (blank.current) clearTimeout(blank.current.timer);
+      blank.current = null;
+      const t = e.target as Element;
+      const b = !edit && !press.current && e.pointerType === "touch" ? botAt(e.clientX, e.clientY) : undefined;
+      if (b) {
+        const { clientX: x, clientY: y } = e;
+        const h: Hold = { x, y };
+        hold.current = h;
+        h.timer = setTimeout(() => ((h.shown = true), onBotMenu(b, { x, y })), 500);
+      } else if (!edit && !press.current && e.pointerType === "touch" && t.closest(".react-flow__pane") && !t.closest(".react-flow__node")) {
+        const { clientX: x, clientY: y } = e;
+        const h: Hold = { x, y };
+        h.timer = setTimeout(() => ((h.shown = true), (quiet.current = Date.now() + 600), onBlank({ x, y })), 500);
+        blank.current = h;
+      }
       // A second finger, a pinch, is not a press.
       if (press.current) return void (!press.current.drawing && (clearTimeout(press.current.timer), (press.current = null)));
       if (!edit || e.button > 0) return;
@@ -472,6 +531,8 @@ function Canvas({ v, focus, sel, archived, unfold, wide, refit, relaid, sliding,
       if (!mouse) press.current.timer = setTimeout(() => press.current && !press.current.drawing && begin(), LONG_PRESS);
     },
     onPointerMove: (e: PointerEvent) => {
+      if (hold.current && Math.hypot(e.clientX - hold.current.x, e.clientY - hold.current.y) > 10) letGo();
+      if (blank.current && Math.hypot(e.clientX - blank.current.x, e.clientY - blank.current.y) > 10) unhold();
       const p = press.current;
       if (!p || e.pointerId !== p.id) return;
       [p.x, p.y] = [e.clientX, e.clientY];
@@ -484,8 +545,11 @@ function Canvas({ v, focus, sel, archived, unfold, wide, refit, relaid, sliding,
       const at = flow(p.x, p.y);
       edit?.move(at.x, at.y, 1 / getViewport().zoom);
     },
-    onPointerUp: (e: PointerEvent) => up(e, false),
-    onPointerCancel: (e: PointerEvent) => up(e, true),
+    onPointerUp: (e: PointerEvent) => (letGo(), unhold(), up(e, false)),
+    onPointerCancel: (e: PointerEvent) => (letGo(), unhold(), up(e, true)),
+    // A held finger's lift is no tap on the Bot. Android's right click came while it was down: past the
+    // lift, the page's right clicks are the browser's again. In capture: d3-zoom stops it where it listens.
+    onTouchEndCapture: (e: TouchStart) => void (hold.current?.shown && (e.cancelable && e.preventDefault(), (hold.current = null))),
     // In capture, as d3-zoom stops it where it listens.
     onTouchStartCapture: (e: TouchStart) => e.target.addEventListener("touchmove", still as EventListener, { passive: false }),
     // A long press draws, and opens no menu.
@@ -508,9 +572,22 @@ function Canvas({ v, focus, sel, archived, unfold, wide, refit, relaid, sliding,
         onNodeContextMenu={(e, n) => {
           const d = n.data as Data;
           if (press.current) return;
+          if (d.kind === "bot") {
+            e.preventDefault();
+            // Android's long press is a right click too: the menu once, whichever comes first.
+            if (hold.current?.shown) return;
+            if (hold.current) (clearTimeout(hold.current.timer), (hold.current.shown = true));
+            return onBotMenu(d.bot, { x: e.clientX, y: e.clientY });
+          }
           if (d.kind !== "slot") return;
           e.preventDefault();
           onMenu(d.slot, { x: e.clientX, y: e.clientY });
+        }}
+        // The empty canvas's menu (story 670); Android's long press is a right click too: the menu once.
+        onPaneContextMenu={(e) => {
+          e.preventDefault();
+          if (edit || press.current || blank.current?.shown) return;
+          onBlank({ x: e.clientX, y: e.clientY });
         }}
         onMoveStart={(_, vp) => (zoomedFrom.current = vp.zoom)}
         // On a phone, a pinch or wheel lets go of what the screen showed, taken at another zoom, and ends
@@ -1137,11 +1214,17 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
   // The slot right-clicked, and where; the slot a dialog asks about.
   const [menu, setMenu] = useState<{ id: string; at: { x: number; y: number } } | null>(null);
   const menuSlot = menu && g.slots.find((s) => s.id === menu.id);
+  // The Bot whose menu is or was open, kept as it closes for what it opened.
+  const [botMenu, setBotMenu] = useState<{ id: string; at: { x: number; y: number } | null } | null>(null);
+  const menuBot = botMenu && g.bots.find((b) => b.id === botMenu.id);
   const [asking, setAsking] = useState<Asking | null>(null);
   const asked = asking && g.slots.find((s) => s.id === asking.slot);
   const shut = (open: boolean) => open || setAsking(null);
   // The workspace whose 新槽位 sheet is open.
   const [making, setMaking] = useState<string | null>(null);
+  // Where the empty canvas's menu is open, and the sheet it opened.
+  const [blank, setBlank] = useState<{ x: number; y: number } | null>(null);
+  const [fromBlank, setFromBlank] = useState<"new" | "import" | "bot" | null>(null);
 
   // 总览 glides back to the whole, even when it is already the overview.
   const [refit, setRefit] = useState(0);
@@ -1229,7 +1312,21 @@ function Topology({ g, onPreview }: { g: Graph; onPreview: (slot: string | null)
               onTap={onTap}
               onLine={(id) => tap({ kind: "line", id })}
               onMenu={(s, at) => setMenu({ id: s.id, at })}
+              onBotMenu={(b, at) => setBotMenu({ id: b.id, at })}
+              onBlank={setBlank}
+              blankUp={blank !== null}
             />
+            <MenuAt
+              at={blank}
+              close={() => setBlank(null)}
+              choices={[
+                { icon: SquarePlus, label: "新建槽位", run: () => setFromBlank("new") },
+                { icon: Import, label: "导入", run: () => setFromBlank("import") },
+                newBot(g.slots.some((s) => !s.archived), () => setFromBlank("bot")),
+              ]}
+            />
+            <Sheets open={fromBlank} close={() => setFromBlank(null)} done={openSlot} />
+            {menuBot && <BotMenu key={menuBot.id} bot={menuBot} at={botMenu!.at} close={() => setBotMenu((m) => m && { ...m, at: null })} />}
             {menuSlot && <SlotMenu key={menuSlot.id} s={menuSlot} at={menu.at} close={() => setMenu(null)} ask={setAsking} />}
             <TakeBack slot={asking?.slot ?? ""} open={!!asking?.back} onOpenChange={shut} />
             <ToTerminal slot={asking?.slot ?? ""} turn={!!asked && inTurn(asked)} open={asking?.back === false} onOpenChange={shut} />

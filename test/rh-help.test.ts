@@ -7,7 +7,7 @@ afterAll(() => rhodium.cleanup());
 
 // The commands shipped so far, and who may run them (docs/spec/v1.md "rh 命令").
 const shipped = ["ls", "ws", "new", "spawn", "stop", "archive", "unarchive", "rm", "rename", "agent", "tui", "release", "import", "send", "read", "set", "doctor", "use", "bind", "bot", "pair", "trace", "forget"].sort();
-const onlyYou = ["rm", "set", "bot", "trace"];
+const onlyYou = ["rm", "set", "trace"];
 
 test("rh --help and rh --skill list the same commands, from one definition", async () => {
   const help = await rhodium.rh(["--help"]);

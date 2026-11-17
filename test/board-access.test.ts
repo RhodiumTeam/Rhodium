@@ -16,7 +16,7 @@ async function withBoard(board: string, fn: (at: string, port: number) => Promis
   const dir = mkdtempSync(join(tmpdir(), "rhodium-test-access-"));
   writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}/state"\n[herdr]\nsession = "rhodium-test-none"\n[board]\nport = 0\n${board}\n`, { mode: 0o600 });
   const store = openStore(join(dir, "rh.db"));
-  const server = serveBoard(store, loadConfig(join(dir, "config.toml")));
+  const server = serveBoard(store, loadConfig(join(dir, "config.toml"))).servers[0]!;
   try {
     await fn(`http://${server.hostname}:${server.port}`, server.port!);
   } finally {
@@ -94,7 +94,7 @@ test("ADR-0013: a [board] written wrong closes the board: every path, to anyone,
   });
 });
 
-const fine: Config["board"] = { port: 7800, login: "you@example.com", bind: "127.0.0.1", auth: "tailscale", hosts: [], closed: null };
+const fine: Config["board"] = { port: 7800, login: "you@example.com", bind: "127.0.0.1", auth: "tailscale", hosts: [], closed: null, extra: [] };
 const never = async (url: string): Promise<Response> => {
   throw new Error(`asked ${url}`);
 };

@@ -52,8 +52,8 @@ export type Daemon = { proc: Subprocess; logs: Record<string, unknown>[] };
 export type RhResult = { code: number; out: string; err: string; screen?: string };
 /** How a test runs rh. tty: false runs it as a caller rhodium cannot recognize. type: text typed
  *  into rh's terminal once rh has asked for it on stderr; several, each at the next time it writes
- *  there. preload: a module bun loads before rh, to swap out a package that talks to the outside world. */
-export type RhOptions = { cwd?: string; tty?: boolean; type?: string | string[]; preload?: string };
+ *  there. */
+export type RhOptions = { cwd?: string; tty?: boolean; type?: string | string[] };
 
 export type Instance = {
   dir: string;
@@ -456,7 +456,7 @@ export function newInstance(opts: InstanceOptions = {}): Instance {
     },
     async rh(args, opts = {}) {
       const own = opts.type === undefined ? undefined : pty();
-      const proc = Bun.spawn([process.execPath, ...(opts.preload ? ["--preload", opts.preload] : []), main, "rh", ...args], {
+      const proc = Bun.spawn([process.execPath, main, "rh", ...args], {
         env,
         cwd: opts.cwd ?? dir,
         stdin: opts.tty === false ? "ignore" : (own?.slave ?? terminal()),

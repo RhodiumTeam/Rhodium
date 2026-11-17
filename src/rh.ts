@@ -25,14 +25,14 @@ export async function rh(args: string[], env: Record<string, string | undefined>
 
   const path = env.RHODIUM_SOCKET || `${defaultSocketDir(env)}/rh.sock`;
   const caller = { token: env.RHODIUM_TOKEN || null, pid: process.pid, tty: isatty(0), cwd: process.cwd() };
-  const ask: Ask = async (argv, credentials) => {
-    const req: RhRequest = { argv, caller, ...(credentials && { credentials }) };
+  const ask: Ask = async (argv, more) => {
+    const req: RhRequest = { argv, caller, ...more };
     return JSON.parse(await call(path, JSON.stringify(req) + "\n"));
   };
   let reply: RhReply;
   try {
-    // Loaded only here, with the QR and Telegram clients it brings.
-    if (args[0] === "bot") return await (await import("./bot")).bot(args.slice(1), ask);
+    // Loaded only here, with the QR code drawing it brings.
+    if (args[0] === "bot" && args[1] !== "rm") return await (await import("./bot")).bot(args.slice(1), ask);
     reply = await ask(args);
   } catch (err) {
     process.stderr.write(`rh: 连不上 rhodium（${path}）：${(err as Error).message}\n`);

@@ -40,6 +40,8 @@ async function posts(n = 1): Promise<Posted[]> {
 
 /** What each run of the fake codex was sent, parsed. */
 const sent = () => rhodium.codex.runs().map((r) => r.stdin.map((l) => JSON.parse(l)));
+// The quota ask Rhodium makes after a turn ends (#750).
+const METER = "account/rateLimits/read";
 /** Your messages in each run, as Codex got them. */
 const told = () => sent().map((run) => run.filter((m) => m.method === "turn/start").map((m) => withoutSource(m.params.input[0].text)));
 /** Makes the fake codex play another script from its next run on. */
@@ -210,14 +212,16 @@ test("stories 494, 495: approval on: each command and patch of Codex's comes to 
   await say("1");
   await find("renamed", at);
 
-  const [run, ...more] = sent();
+  const [all, ...more] = sent();
   expect(more).toEqual([]);
-  expect(run!.find((m) => m.method === "thread/start")!.params).toMatchObject({ approvalPolicy: "untrusted", sandbox: "danger-full-access" });
-  expect(answers(run!).map((m) => m.result.decision)).toEqual(["accept", "accept", "accept", "decline", "accept"]);
+  // The quota ask after a turn ends (#750) may land anywhere: it is not part of what is checked here.
+  const run = all!.filter((m) => m.method !== METER);
+  expect(run.find((m) => m.method === "thread/start")!.params).toMatchObject({ approvalPolicy: "untrusted", sandbox: "danger-full-access" });
+  expect(answers(run).map((m) => m.result.decision)).toEqual(["accept", "accept", "accept", "decline", "accept"]);
   // Codex's no takes no words: they go into the turn right after it.
-  const steer = run!.findIndex((m) => m.method === "turn/steer");
-  expect(run![steer - 1]).toEqual({ id: 3, result: { decision: "decline" } });
-  expect(run![steer].params.input).toEqual([{ type: "text", text: words, text_elements: [] }]);
+  const steer = run.findIndex((m) => m.method === "turn/steer");
+  expect(run[steer - 1]).toEqual({ id: 3, result: { decision: "decline" } });
+  expect(run[steer].params.input).toEqual([{ type: "text", text: words, text_elements: [] }]);
 }, 60_000);
 
 test("story 495: an approval nobody answers in time is declined, and the careful words go into the turn after it", async () => {
@@ -226,7 +230,7 @@ test("story 495: an approval nobody answers in time is declined, and the careful
   await say("build it");
   await find("要运行这条命令，允许吗？\n\nmake\n");
   await find("answered");
-  const run = sent()[0]!;
+  const run = sent()[0]!.filter((m) => m.method !== METER);
   const steer = run.findIndex((m) => m.method === "turn/steer");
   expect(run[steer - 1]).toEqual({ id: 1, result: { decision: "decline" } });
   expect(run[steer].params.input).toEqual([{ type: "text", text: "用户暂时无法回答，请按你的最佳判断继续", text_elements: [] }]);

@@ -57,16 +57,17 @@ export class TelegramAdapter implements ImAdapter {
   /** Call once. An update counts as read once the next one is asked for, by when rhodium has
    *  taken it in; only then is its offset saved. Never throws: a failed poll waits and tries again.
    *  The first poll, and the first after a failed one, comes back at once, so connected hears right away. */
-  async *messages(connected: Connected = () => {}): AsyncGenerator<InboundMessage> {
+  async *messages(connected: Connected = () => {}, stop?: AbortSignal): AsyncGenerator<InboundMessage> {
     let offset = this.opts.offset;
-    for (let failures = 0, first = true; ; ) {
+    for (let failures = 0, first = true; !stop?.aborted; ) {
       let updates: Update[];
       try {
-        updates = await this.api.getUpdates({ offset, timeout: first ? 0 : POLL_SECONDS, allowed_updates: ["message", "callback_query"] });
+        updates = await this.api.getUpdates({ offset, timeout: first ? 0 : POLL_SECONDS, allowed_updates: ["message", "callback_query"] }, stop as Parameters<Api["getUpdates"]>[1]);
         failures = 0;
         first = false;
         connected(true);
       } catch (e) {
+        if (stop?.aborted) return;
         first = true;
         const error = this.redact(e);
         connected(false, error);

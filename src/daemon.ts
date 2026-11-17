@@ -6,9 +6,10 @@ import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { AGENT_KINDS, AGENTS } from "./agents";
 import { avatarDir, errorKind, refreshAvatars } from "./avatars";
+import { botFlows } from "./bot-flow";
 import { inFront, serveBoard, type Fronts, type Hear } from "./board";
 import { version } from "../package.json";
-import { addBot, BUILD, COMMIT, fixedOwners, hasHerdr, loadConfig, owners, paired, renameTarget, type BotConfig, type Config } from "./config";
+import { addBot, BUILD, COMMIT, fixedOwners, hasHerdr, loadConfig, owners, paired, removeBot, renameTarget, setMainChat, type BotConfig, type Config } from "./config";
 import type { AdapterDeps, BoardAct, Connected, ImAdapter, InboundMessage, Input, Kept, OutboundMessage, Platform, RhCaller, SendResult } from "./contracts";
 import { createDoctor } from "./doctor";
 import { fakeBotFromConfig } from "./fake-im";
@@ -76,10 +77,11 @@ export function createLoop(opts: {
   capabilities?: Ctx["capabilities"]; // the adapters' capability tables, by bot row id
   front?: Ctx["front"]; // whether a page of the board is in front (board.ts's serveBoard)
   retarget?: Ctx["retarget"];
+  dropBot?: Ctx["dropBot"];
   stepped?: () => void; // after each batch of inputs has committed and its effects are handed off
   pictures?: (conversation: string) => void; // the rows of the local pictures in what its agent said are written (architecture §8.3)
 }): Loop {
-  const { store, config, perform, capabilities = () => undefined, stepped = () => {}, retarget = () => null, front = () => false } = opts;
+  const { store, config, perform, capabilities = () => undefined, stepped = () => {}, retarget = () => null, dropBot = () => {}, front = () => false } = opts;
   const queue: Batch[] = [];
   let draining = false;
   const media = join(config.stateDir, "media");
@@ -185,7 +187,7 @@ export function createLoop(opts: {
           const diskFree = () => freeDisk(config.stateDir);
           const herdr = () => hasHerdr(config);
           const inboundOf = (chat: string) => tx.find("inbound", { chat }).map((i) => i.id);
-          const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, herdr, front, retarget, inboundOf });
+          const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, herdr, front, retarget, dropBot, inboundOf });
           for (const w of d.writes) apply(tx, w);
           for (const e of d.events) tx.append(e);
           // A message of the agent's is whole: its local pictures are checked and kept now, as rh send's
@@ -296,8 +298,9 @@ const lockDir = (dir: string) => lock(join(dir, "rhodium.lock")) !== null;
 
 // ---- The rh socket: one JSON request line in, one JSON reply line out, per connection. ----
 
-/** What `rh` sends. credentials: rh bot's, from the scan or paste. */
-export type RhRequest = { argv: string[]; caller: RhCaller; credentials?: Record<string, string> };
+/** What `rh` sends. flow: rh bot's, on its bot-making flow (bot-flow.ts): start one for argv, or read,
+ *  cancel or hand credentials, what you pasted, to the one with id. */
+export type RhRequest = { argv: string[]; caller: RhCaller; flow?: { op: "start" } | { op: "get" | "cancel" | "credentials"; id: string }; credentials?: Record<string, string> };
 
 const MAX_REQUEST = 1 << 20;
 
@@ -315,9 +318,11 @@ function parseRequest(line: string): RhRequest | null {
       typeof c.tty === "boolean" &&
       typeof c.cwd === "string" &&
       c.cwd.startsWith("/") &&
-      (r.credentials === undefined || (typeof r.credentials === "object" && r.credentials !== null && Object.values(r.credentials).every((v) => typeof v === "string")));
+      (r.credentials === undefined || (typeof r.credentials === "object" && r.credentials !== null && Object.values(r.credentials).every((v) => typeof v === "string"))) &&
+      (r.flow === undefined || r.flow?.op === "start" || (["get", "cancel", "credentials"].includes(r.flow?.op) && typeof r.flow.id === "string"));
     if (!ok) return null;
     const req: RhRequest = { argv: r.argv, caller: { token: c.token, pid: c.pid, tty: c.tty, cwd: c.cwd } };
+    if (r.flow !== undefined) req.flow = r.flow.op === "start" ? { op: "start" } : { op: r.flow.op, id: r.flow.id };
     // fromEntries defines keys, so a credential named __proto__ stays one.
     if (r.credentials !== undefined) req.credentials = Object.fromEntries(Object.entries(r.credentials as Record<string, string>));
     return req;
@@ -647,6 +652,11 @@ export async function runDaemon(args: string[]): Promise<void> {
       if (done) log("config target renamed", { from, to, bots: done.bots, backup: done.backup });
       return done;
     },
+    dropBot(name) {
+      removeBot(configPath, name);
+      delete config.bots[name];
+      log("bot removed", { bot: name });
+    },
     perform(e) {
       switch (e.kind) {
         case "rh_reply":
@@ -668,8 +678,18 @@ export async function runDaemon(args: string[]): Promise<void> {
           avatars(id);
           // Never the table itself: it holds the bot's credentials.
           log("bot added", { bot: e.name, platform: bot.platform });
+          // The scan named you: with no main chat yet, your private chat with it is one (story 680).
+          const [you] = fixedOwners(bot);
+          if (you) mainChat(e.name, you);
           return;
         }
+        case "drop_bot":
+          stops.get(e.bot)?.abort();
+          stops.delete(e.bot);
+          adapters.delete(e.bot);
+          return;
+        case "main_chat":
+          return mainChat(e.bot, e.chat);
         case "avatars":
           return avatars(e.bot);
         case "forget_avatar":
@@ -850,10 +870,13 @@ export async function runDaemon(args: string[]): Promise<void> {
   }
 
   const recovered = Promise.withResolvers<void>();
+  // The board's entries that could not listen, by name, filled as the board starts (ADR-0014).
+  const deaf = new Map<string, string>();
   const doctor = createDoctor({
     cfg: config,
     store,
     ready: recovered.promise,
+    deaf,
     notify(text) {
       log("rh doctor found problems", { report: text }); // also for an instance with no main chat
       loop.enqueue({ kind: "notice", text: `rh doctor 自检：\n${text}` });
@@ -869,6 +892,7 @@ export async function runDaemon(args: string[]): Promise<void> {
     onVersion: (v) => doctor.versionSeen(v),
     inUse: tui.inUse,
     writing: (conversation, e) => hearing.forEach((hear) => hear(conversation, e)),
+    metered: (conversation, agent) => hearing.forEach((hear) => hear(conversation, { type: "meter", agent })),
   });
   // Timers live only in memory: each one-off slot's archive clock is set again from the slot table.
   for (const s of store.tx((tx) => tx.find("slot", { lifetime: "oneoff", archivedAt: null }))) {
@@ -886,6 +910,8 @@ export async function runDaemon(args: string[]): Promise<void> {
       const { id } = tx.find("bot", { name })[0] ?? tx.insert("bot", { platform: bot.platform, name, isMain: 0 });
       // The owners its config table names are owners as it says (owners()), not as a pairing did: one
       // paired before is dropped, so it is no owner once the config leaves it out (architecture §8.5).
+      // A row rh bot rm left, which this bot of its name takes over, may be another platform's (architecture §14.8).
+      tx.update("bot", { id }, { platform: bot.platform });
       const row = tx.get("bot", id)!;
       const fixed = fixedOwners(bot);
       if (paired(row).some((o) => fixed.includes(o))) tx.update("bot", { id }, { owners: JSON.stringify(paired(row).filter((o) => !fixed.includes(o))) });
@@ -956,9 +982,25 @@ export async function runDaemon(args: string[]): Promise<void> {
   // A message's bot and chat as Rhodium names them; a chat not yet routed to has no id yet.
   const named = (m: InboundMessage) =>
     store.tx((tx) => ({ bot: tx.get("bot", m.bot)?.name, chat: tx.find("chat", { bot: m.bot, platformChatId: m.chat })[0]?.id }));
+  /** With no main chat in the config, makes your private chat with the bot (its name) one, in the file
+   *  and as rhodium runs (architecture §8.5.1). One that can't be written is only logged. */
+  function mainChat(bot: string, chat: string): void {
+    if (config.mainChat) return;
+    try {
+      if (!setMainChat(configPath, bot, chat)) return log("main chat left: the config file has one", { bot });
+    } catch (err) {
+      return log("cannot write the main chat into the config", { bot, error: (err as Error).message });
+    }
+    config.mainChat = { bot, chat };
+    log("main chat set", { bot }); // never the chat's id (architecture §11)
+  }
+  // What ends each bot's listening (row id), as rh bot rm does.
+  const stops = new Map<string, AbortController>();
   /** Connects the bot (row id) taken in, and hands what comes to the main loop. */
   function listen(bot: string): void {
     const adapter = adapters.get(bot)!;
+    const stop = new AbortController();
+    stops.set(bot, stop);
     // Its failures in a row: at limits.botFailures the router marks it faulted and tells you, and the
     // first time it gets through after that, back (architecture §8.6).
     let failures = 0;
@@ -970,10 +1012,10 @@ export async function runDaemon(args: string[]): Promise<void> {
         log("bot keeps failing to reach its platform", { bot, failures, error });
         loop.enqueue({ kind: "connection", bot, up: false, error });
       }
-      connection(store, bot, up);
+      if (!stop.signal.aborted) connection(store, bot, up);
     };
     void (async () => {
-      for await (const m of adapter.messages(connected)) loop.enqueue({ kind: "im", message: yours(m) ? await storeAttachments(media, m, (msg, f) => log(msg, { ...named(m), ...f })) : m });
+      for await (const m of adapter.messages(connected, stop.signal)) if (!stop.signal.aborted) loop.enqueue({ kind: "im", message: yours(m) ? await storeAttachments(media, m, (msg, f) => log(msg, { ...named(m), ...f })) : m });
     })();
   }
   for (const bot of adapters.keys()) listen(bot);
@@ -987,13 +1029,33 @@ export async function runDaemon(args: string[]): Promise<void> {
   avatars();
   setInterval(() => avatars(), 86_400_000);
 
+  // Bot-making flows, rh bot's and the board's (architecture §8.5.1): each rh call they make goes to
+  // the main loop as rh's does, credentials and all, which go nowhere else.
+  const flows = botFlows(
+    (caller, argv, credentials) =>
+      new Promise<RhReply>((reply) => {
+        const id = ulid();
+        waiting.set(id, reply);
+        loop.enqueue({ kind: "rh", id, caller, argv, credentials });
+      }),
+    store,
+    (name) => config.bots[name]?.target,
+  );
+
   const socket = join(config.socketDir, "rh.sock");
   await serveRh(socket, (req, reply) => {
-    const id = ulid();
-    waiting.set(id, reply);
     const pid = req.caller.pid;
     const caller = { ...req.caller, unit: pid === null ? null : unitOf(pid), ancestors: pid === null ? [] : ancestors(pid) };
-    loop.enqueue({ kind: "rh", id, caller, argv: req.argv, credentials: req.credentials });
+    const f = req.flow;
+    if (f) {
+      const done =
+        f.op === "start" ? flows.start(req.argv.slice(1), caller) : f.op === "credentials" ? flows.credentials(f.id, req.credentials ?? {}) : f.op === "get" ? flows.get(f.id) : flows.cancel(f.id);
+      return void Promise.resolve(done).then(reply);
+    }
+    // What is pasted goes to a flow alone, which checks it first.
+    const id = ulid();
+    waiting.set(id, reply);
+    loop.enqueue({ kind: "rh", id, caller, argv: req.argv });
   });
   // IM and rh go on without the board. What its page writes comes to the main loop as rh does.
   let board = "";
@@ -1003,8 +1065,9 @@ export async function runDaemon(args: string[]): Promise<void> {
         waiting.set(id, reply);
         loop.enqueue({ kind: "board", id, act: a });
       });
-    const server = serveBoard(store, config, hearing, undefined, act, fronts);
-    board = `${server.hostname}:${server.port}`;
+    const started = serveBoard(store, config, hearing, undefined, act, fronts, { ask: (c, why) => void runner.meter(c, why), alive: runner.alive }, flows);
+    board = started.servers.map((s) => `${s.hostname}:${s.port}`).join(", ");
+    for (const [entry, why] of started.deaf) deaf.set(entry, why);
   } catch (err) {
     log("cannot start the board", { port: config.board.port, error: String(err) });
   }

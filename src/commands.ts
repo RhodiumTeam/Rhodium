@@ -231,13 +231,15 @@ export const COMMANDS: CommandDef[] = [
   },
   {
     name: "bot",
-    usage: `<名字> ${Object.keys(MADE).join("|")} [<工作区/槽位>] [--paste] [--api-root <地址>]`,
+    usage: `<名字> ${Object.keys(MADE).join("|")} [<工作区/槽位>] [--paste] [--api-root <地址>] | rm <名字>`,
     summary:
       "建 Bot，写进配置文件，绑定到这个槽位（不写就用主 Bot 的默认目标），当场生效，不重启 rhodium。" +
       (Object.keys(MADE) as Made[]).map((p) => `${amid(PLATFORMS[p].label).trimStart()}${MADE[p].how}。`).join("") +
       "之后照提示配对。" +
-      `--api-root 指向${series(Object.values(MADE).flatMap((b) => b.apiRoot ?? []), "或")}，只用于测试`,
-    who: "you",
+      `--api-root 指向${series(Object.values(MADE).flatMap((b) => b.apiRoot ?? []), "或")}，只用于测试。建 Bot 只有用户本人能用。` +
+      "rm 去掉 Bot：断开连接，从配置文件删掉它，当场生效；平台上的 Bot 本身还在。主窗口所在的主 Bot 去不掉。agent 调用 rm 要用户确认",
+    who: "both",
+    confirm: "some",
     options: { "api-root": { type: "string" }, paste: { type: "boolean" } },
   },
   {

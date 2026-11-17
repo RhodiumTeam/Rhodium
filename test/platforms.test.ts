@@ -2,7 +2,7 @@
 // rh bot makes it, its onboarding; the row loads no IM SDK, so neither does an ordinary rh call.
 import { expect, test } from "bun:test";
 import { getMaxUploadSize, MediaFileType } from "@tencent-connect/qqbot-nodejs";
-import { ONBOARD } from "../src/bot";
+import { ONBOARD } from "../src/bot-flow";
 import type { AdapterDeps, Platform } from "../src/contracts";
 import { ADAPTERS } from "../src/daemon";
 import { FakeBot } from "../src/fake-im";

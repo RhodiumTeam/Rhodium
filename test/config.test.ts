@@ -183,7 +183,7 @@ test("TUI panes open in your default Herdr session unless [herdr] names another"
 });
 
 test("the board listens on 127.0.0.1:7800 and lets nobody in until [board] names your Tailscale login; a config of port and login alone is as it was", () => {
-  const as = { bind: "127.0.0.1", auth: "tailscale" as const, hosts: [], closed: null };
+  const as = { bind: "127.0.0.1", auth: "tailscale" as const, hosts: [], closed: null, extra: [] };
   expect(loadConfig(configFile(""), env).board).toEqual({ port: 7800, login: "", ...as });
   const c = loadConfig(configFile('[board]\nport = 0\nlogin = "you@example.com"'), env);
   expect(c.board).toEqual({ port: 0, login: "you@example.com", ...as });
@@ -191,7 +191,7 @@ test("the board listens on 127.0.0.1:7800 and lets nobody in until [board] names
 
 test("ADR-0013: [board] may listen elsewhere and leave who gets in to a proxy in front, reached by the hosts named, exact lowercase names", () => {
   const c = loadConfig(configFile('[board]\nbind = "0.0.0.0"\nauth = "none"\nhosts = ["board.example.com", "b-2.example.com"]'), env);
-  expect(c.board).toEqual({ port: 7800, login: "", bind: "0.0.0.0", auth: "none", hosts: ["board.example.com", "b-2.example.com"], closed: null });
+  expect(c.board).toEqual({ port: 7800, login: "", bind: "0.0.0.0", auth: "none", hosts: ["board.example.com", "b-2.example.com"], closed: null, extra: [] });
   expect(loadConfig(configFile('[board]\nbind = "::1"\nauth = "none"'), env).board).toMatchObject({ bind: "::1", auth: "none", hosts: [], closed: null });
 });
 
@@ -217,12 +217,12 @@ test("ADR-0013: a [board] written wrong does not stop rhodium: it closes the boa
     // Listening on all addresses as given, but for what is wrong.
     const b = loadConfig(configFile(`[board]\n${toml.includes("bind") ? "" : 'bind = "0.0.0.0"\n'}port = 0\n${toml}`), env).board;
     expect([toml, b.closed]).toEqual([toml, expect.stringMatching(why)]);
-    expect([toml, b]).toEqual([toml, { port: 0, login: "", bind: "127.0.0.1", auth: "tailscale", hosts: [], closed: b.closed }]);
+    expect([toml, b]).toEqual([toml, { port: 0, login: "", bind: "127.0.0.1", auth: "tailscale", hosts: [], closed: b.closed, extra: [] }]);
   }
   // A port written wrong: closed on the default one.
   for (const port of ["-1", "65536", "1.5", '"7800"']) {
     const b = loadConfig(configFile(`[board]\nport = ${port}`), env).board;
-    expect([port, b]).toEqual([port, { port: 7800, login: "", bind: "127.0.0.1", auth: "tailscale", hosts: [], closed: expect.stringMatching(/board\.port/) }]);
+    expect([port, b]).toEqual([port, { port: 7800, login: "", bind: "127.0.0.1", auth: "tailscale", hosts: [], closed: expect.stringMatching(/board\.port/), extra: [] }]);
   }
   expect(loadConfig(configFile("board = 1"), env).board).toMatchObject({ port: 7800, closed: expect.stringMatching(/board.*1/) });
 });

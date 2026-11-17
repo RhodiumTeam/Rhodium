@@ -20,12 +20,12 @@ import { Details } from "./details";
 import { Carried } from "./media";
 import { Face, Mark } from "./faces";
 import { Stick, type Place } from "./stick";
-import { CopyKey, Fold, folded, KEY, MARKDOWN, Running, SaidOf, type Shown } from "./tools";
+import { Fold, folded, KEY, MARKDOWN, Running, SaidOf, type Shown } from "./tools";
 import { SettingsMenu, useTerminalEntry } from "./settings";
 import { useUnreadBut } from "./unread";
 import { Asks } from "./asks";
 import { inTurn } from "./timeline";
-import { act, attach, Composer, Connecting, givenBack, keep, kept, Pending, Pick, Queue, quote, Remove, Rename, TakeBack, told, Toasts, useAct, Words, type Choice } from "./write";
+import { act, attach, Composer, CopyKey, Connecting, givenBack, keep, kept, Pending, Pick, Queue, quote, Remove, Rename, TakeBack, told, Toasts, useAct, Words, type Choice } from "./write";
 
 // Its code, with ghostty-web's, comes only for a slot in the terminal (story 344).
 const TerminalView = lazy(() => import("./terminal"));
@@ -145,7 +145,7 @@ function fromCard(id: string): (SlotData & { blocks: Block[] }) | undefined {
     .find((c) => c.id === id);
   if (!c?.terminal) return undefined;
   const { ref, agent, state, archivedAt, lifetime, terminal } = c;
-  return { id, ref, agent, state, archivedAt, lifetime, mode: "tui", pane: terminal, herdrLost: false, dir: "", phase: "idle", settings: [], model: null, effort: null, ultracode: false, asks: [], gone: [], queue: [], process: null, timeline: [], commands: [], blocks: [] };
+  return { id, ref, agent, state, archivedAt, lifetime, mode: "tui", pane: terminal, herdrLost: false, dir: "", phase: "idle", settings: [], model: null, effort: null, ultracode: false, asks: [], gone: [], queue: [], process: null, timeline: [], commands: [], meter: { context: null, session: null, quota: null }, live: true, blocks: [] };
 }
 
 /** heardCount as each chat last heard: one drawn again at the same count missed nothing. */
@@ -697,8 +697,8 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
         {!terminal && d.queue.length > 0 && <Queue slot={d.id} queue={d.queue} spaced={!bottom && !d.asks.length} />}
         {/* Asks waiting on you take the place of where you type, the stop key on the top one (spec web-write "页面"). */}
         <Asks d={d} turn={turn} />
-        {bottom && <Composer key={d.id} slot={d.id} turn={turn} archived={d.archivedAt !== null} switchable={d.archivedAt === null && entry} log={log} changed={changed} commands={d.commands} agent={d.agent} model={d.model} effort={d.effort} ultracode={d.ultracode} />}
-        {reading && typesIn && <Composer key={d.id} slot={d.id} turn={false} archived={false} switchable={false} log={log} changed={changed} commands={[]} agent={d.agent} model={null} effort={null} ultracode={false} terminal />}
+        {bottom && <Composer key={d.id} slot={d.id} turn={turn} archived={d.archivedAt !== null} switchable={d.archivedAt === null && entry} log={log} changed={changed} commands={d.commands} agent={d.agent} model={d.model} effort={d.effort} ultracode={d.ultracode} meter={d.meter} live={d.live} />}
+        {reading && typesIn && <Composer key={d.id} slot={d.id} turn={false} archived={false} switchable={false} log={log} changed={changed} commands={[]} agent={d.agent} model={null} effort={null} ultracode={false} meter={d.meter} live={d.live} terminal />}
         {!bottom && !(reading && typesIn) && <div className="h-[env(safe-area-inset-bottom)]" />}
       </div>
     </div>
@@ -786,7 +786,7 @@ function Keys({ text, slot, quotes, last, className }: { text: string; slot: str
 /** A block of the conversation: what you said on the right, what the agent said as Markdown, its tool
  *  calls and thoughts folded. keys: in a slot's chat, 复制 under what was said, and 引用 under the
  *  agent's where quotes, last its last. */
-function Said({ b, conversation, keys }: { b: Shown; conversation: string; keys?: { slot: string; quotes: boolean; last: boolean } }) {
+export function Said({ b, conversation, keys }: { b: Shown; conversation: string; keys?: { slot: string; quotes: boolean; last: boolean } }) {
   const time = "time" in b && b.time !== null && <span className="text-xs text-muted-foreground tabular-nums">{clock(b.time)}</span>;
   switch (b.kind) {
     case "user": {

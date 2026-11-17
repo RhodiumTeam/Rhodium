@@ -49,7 +49,7 @@ async function withBoard(mode: Slot["mode"], fn: (b: Board) => Promise<void>) {
   writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}/state"\n[herdr]\nsession = "rhodium-test-none"\n[board]\nport = 0\nlogin = "${BOARD_LOGIN}"\n`, { mode: 0o600 });
   const cfg = loadConfig(join(dir, "config.toml"));
   let store = openStore(join(dir, "rh.db"));
-  let server = serveBoard(store, cfg, new Set(), join(dir, "web"));
+  let server = serveBoard(store, cfg, new Set(), join(dir, "web")).servers[0]!;
   const [id, conversation] = store.tx((tx) => {
     const id = tx.insert("slot", { workspace: tx.insert("workspace", { name: "w", dir: slot }).id, name: "pics", dir: slot, mode, state: "idle", lifetime: "longterm" }).id;
     const conversation = tx.insert("conversation", { slot: id, agent: "pi", sessionId: "s1", startedAt: Date.now() }).id;
@@ -76,7 +76,7 @@ async function withBoard(mode: Slot["mode"], fn: (b: Board) => Promise<void>) {
         void server.stop(true);
         store.close();
         store = openStore(join(dir, "rh.db"));
-        server = serveBoard(store, cfg, new Set(), join(dir, "web"));
+        server = serveBoard(store, cfg, new Set(), join(dir, "web")).servers[0]!;
       },
       rows: () => store.tx((tx) => tx.find("replyImage", {})).map(({ path, by, hash, why }) => ({ path, by, hash, why })),
     });

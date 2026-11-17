@@ -21,6 +21,7 @@ const ctx = (herdr: boolean): Ctx => ({
   front: () => false,
   herdr: () => herdr,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
 });
 // w/a's headless agent runs, idle: a switch would stop it first.

@@ -22,11 +22,12 @@ import { shortText } from "../src/tool-line";
 import { sendOf } from "../src/transcript";
 import { toast } from "../web/src/toast";
 import { act, byPage, draft, forAgent, frame, givenBack, keepDraft, keyMode, Toasts, withQuote } from "../web/src/write";
-import { InfoCard, resetsIn, tone } from "../web/src/card";
+import { InfoCard, resetsIn, Status, tone } from "../web/src/card";
 import type { InfoCard as Info } from "../src/router";
 import { answerText } from "../web/src/asks";
 import { cut } from "../web/src/terminal";
-import { AgentSheet, Answer, matching, ModelSheet } from "../web/src/palette";
+import { Answer, matching } from "../web/src/palette";
+import { greyOf, MeterBody, Ring, Strips } from "../web/src/meter";
 import { Face } from "../web/src/faces";
 
 /** The event streams the page opens. A stream the browser gives up on, as the HTML spec has it for
@@ -623,7 +624,7 @@ test("stories 139, 146: the slots that need you are in one card on top by their 
   // b's card first, the latest active; then the one c/solo and a/one share, the latest first.
   expect(flat(<BoardView data={data} />)).toBe("b/ask需要你d/fell崩溃bwork运行中restc/solo2分钟前结束a/one1小时前已归档1");
   expect(shown(<BoardView data={data} />)).not.toContain("/home/");
-  expect(flat(<BoardView data={{ bots: [], workspaces: [ws("gone", {}, [card({ name: "old", archivedAt: 0 }, "gone")])] }} />)).toBe("没有在用的槽位。已归档1");
+  expect(flat(<BoardView data={{ bots: [], workspaces: [ws("gone", {}, [card({ name: "old", archivedAt: 0 }, "gone")])] }} />)).toBe("暂无槽位新建或导入已有的会话以开始使用Rhodium新建导入已归档1");
 });
 
 /** The board's cards, as layout() has them: what needs you, what is pinned, then each card, a
@@ -634,6 +635,20 @@ const cardsOf = (data: BoardData) => {
   const names = (rows: Row[]) => rows.map((r) => " ".repeat(r.depth) + (r.full ? r.c.ref : r.c.name));
   return [names(needs), names(pinned), ...cards.map((x) => (x.name ? [`${x.name}:`, ...names(x.rows)] : names(x.rows))), names(archived)];
 };
+
+test("story 639: a live row is alone where its workspace has no name over a card, in 需要你 and 置顶 too; not where it has one, and not an archived row", () => {
+  const data: BoardData = {
+    bots: [],
+    workspaces: [
+      ws("b", { needsYou: [card({ name: "ask", state: "需要你" }, "b")], idle: [card({ name: "x", activeAt: ago(1) }, "b"), card({ name: "y", activeAt: ago(2) }, "b")] }),
+      ws("h", { needsYou: [card({ name: "dns", state: "需要你" }, "h")], idle: [card({ name: "pin", pinnedAt: 1 }, "h")] }),
+      ws("k", { idle: [card({ name: "solo", activeAt: ago(60) }, "k")] }, [card({ name: "old", archivedAt: ago(60) }, "k")]),
+    ],
+  };
+  const { needs, pinned, cards, archived } = steady(null, data);
+  const lone = (rows: Row[]) => rows.map((r) => `${r.c.ref}:${!!r.lone}`);
+  expect([lone(needs), lone(pinned), ...cards.map((x) => lone(x.rows)), lone(archived)]).toEqual([["b/ask:false", "h/dns:true"], ["h/pin:true"], ["b/x:false", "b/y:false"], ["k/solo:true"], ["k/old:false"]]);
+});
 
 test("#506: blocks go by their latest activity, the latest first: a workspace with two or more top-level slots under its name, each other slot's tree by full names, those side by side sharing a card; in a block no running first, the latest first; what needs you counts for none", () => {
   const data: BoardData = {
@@ -703,9 +718,20 @@ test("story 97: a child slot is right under its parent, indented, by its own nam
   expect(flat(<BoardView data={shared} />)).toBe("d/main1分钟前结束k1e/k2");
 });
 
-test("#664: a slot in the terminal whose agent rests is not said to run, and still says TUI 模式 under its name, in place of the last thing said", () => {
-  const data = boardWith({ done: [card({ name: "term", state: "TUI 模式（pane w1:p2）", turnEndedAt: ago(18), activeAt: ago(18), last: { role: "assistant", text: "改好了", at: ago(18) } })] });
-  expect(flat(<BoardView data={data} />)).toBe("w/term18分钟前结束TUI模式（panew1:p2）");
+test("story 659: a slot in the terminal has the last thing said under its name after a terminal icon, resting or running, not TUI 模式 nor its pane; with nothing said, the icon alone; switching, Herdr restarting or failing to switch back still say so", () => {
+  const last = { role: "assistant" as const, text: "改好了", at: ago(18) };
+  const data = boardWith({
+    needsYou: [card({ name: "stuck", mode: "tui", state: "没能切回无头", last })],
+    running: [card({ name: "works", mode: "tui", state: "TUI 模式（pane w1:p3）", activeAt: ago(1), last }), card({ name: "goes", mode: "tui", state: "正在切到 TUI", activeAt: ago(1), last }), card({ name: "lost", mode: "tui", state: "Herdr 重启中", activeAt: ago(1), last })],
+    done: [card({ name: "term", mode: "tui", state: "TUI 模式（pane w1:p2）", turnEndedAt: ago(18), activeAt: ago(18), last })],
+    idle: [card({ name: "mute", mode: "tui", state: "TUI 模式（pane w1:p4）", activeAt: ago(60 * 25) })],
+  });
+  const html = render(<BoardView data={data} />);
+  expect(flat(<BoardView data={data} />)).toBe("w/stuck需要你没能切回无头wworks运行中改好了goes运行中正在切到TUIlost运行中Herdr重启中term18分钟前结束改好了mute昨天");
+  // An icon before what term, works and mute say; no other row has one.
+  expect(html.match(/aria-label="在终端里"/g)?.length).toBe(3);
+  // A row not running a turn for all you can tell: no ripple.
+  expect(html.match(/animate-ripple/g)).toBeNull();
 });
 
 test("story 607: a slot whose terminal has a dialog open says 被弹框挡住 under its name in place of the last thing said, resting or running", () => {
@@ -1203,7 +1229,7 @@ test("stories 431, 449: in maximize mode the chat's top bar has 收起侧栏 in 
 });
 
 /** /api/slot's answer for slot S1, w/c. */
-const slot = (o: Partial<SlotData> = {}): SlotData => ({ id: "S1", ref: "w/c", dir: "/w", agent: "claude", mode: "headless", phase: "running", state: "运行中", archivedAt: null, lifetime: "longterm", settings: [], model: null, effort: null, ultracode: false, pane: null, herdrLost: false, asks: [], gone: [], queue: [], process: null, timeline: [], commands: [], ...o });
+const slot = (o: Partial<SlotData> = {}): SlotData => ({ id: "S1", ref: "w/c", dir: "/w", agent: "claude", mode: "headless", phase: "running", state: "运行中", archivedAt: null, lifetime: "longterm", settings: [], model: null, effort: null, ultracode: false, pane: null, herdrLost: false, asks: [], gone: [], queue: [], process: null, timeline: [], commands: [], meter: { context: null, session: null, quota: null }, live: false, ...o });
 type Ask = SlotData["asks"][number];
 /** A question waiting on you, with one question of these options. */
 const choice = (id: string, question: string, labels: string[], deadline: number | null = null): Ask => ({
@@ -2233,12 +2259,63 @@ test("story 391: what to pick from is an info card in the page, not over it: its
   expect(html.match(/aria-label="现在"/g)).toHaveLength(1);
 });
 
-test("story 391: the model sheet and the agent sheet are info cards too, there only while open", () => {
-  const send = () => new Promise<never>(() => {});
-  expect(renderToStaticMarkup(<ModelSheet open close={() => {}} send={send} />)).toMatch(/role="dialog" aria-label="模型"/);
-  expect(renderToStaticMarkup(<AgentSheet open close={() => {}} agent="claude" turn={false} send={send} />)).toMatch(/role="dialog" aria-label="Agent"/);
-  expect(renderToStaticMarkup(<ModelSheet open={false} close={() => {}} send={send} />)).toBe("");
-  expect(renderToStaticMarkup(<AgentSheet open={false} close={() => {}} agent="claude" turn={false} send={send} />)).toBe("");
+test("story 655: /usage and /context alone open the ring's popover; with more they go as typed", () => {
+  expect([byPage("/usage", "claude"), byPage("/context ", "pi"), byPage("/usage x", "claude"), byPage("/contexts", "claude")]).toEqual(["meter", "meter", null, null]);
+});
+
+/** The meter /api/slot gives, as heard at. */
+const METER = (at: number): SlotData["meter"] => ({
+  context: { usedTokens: 84_000, maxTokens: 200_000, categories: [{ name: "消息", tokens: 60_000 }], at },
+  session: { cost: 1.5, tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 84_000 }, at },
+  quota: { limits: [{ window: "5h", usedPercent: 28, resetsAt: null }, { window: "7d", usedPercent: 91, resetsAt: null }], at },
+});
+
+test("story 652: the ring and the strips go amber from 80%, red from 95%", () => {
+  const ring = (p: number) => renderToStaticMarkup(<Ring context={{ usedTokens: p, maxTokens: 100, at: 0 }} grey={false} open={false} toggle={() => {}} />);
+  const arc = (html: string) => /stroke-linecap="round"[^>]*class="([^"]*)"/.exec(html)![1];
+  expect([79, 80, 94, 95].map((p) => arc(ring(p)))).toEqual(["stroke-foreground", "stroke-needs", "stroke-needs", "stroke-destructive"]);
+  expect(ring(42)).toContain(">42%<");
+  const strips = renderToStaticMarkup(<Strips limits={[79, 80, 94, 95].map((usedPercent) => ({ window: "5h", usedPercent, resetsAt: null }))} grey={false} open={false} toggle={() => {}} />);
+  expect([...strips.matchAll(/h-full rounded-full (bg-[a-z-]+)"/g)].map((m) => m[1])).toEqual(["bg-foreground", "bg-needs", "bg-needs", "bg-destructive"]);
+  // The mouse over them: each window's name, how full.
+  for (const words of ["5 小时", "79%", "95%"]) expect(strips).toContain(words);
+  expect(renderToStaticMarkup(<Strips limits={[]} grey={false} open={false} toggle={() => {}} />)).toBe("");
+});
+
+test("stories 653, 654: the ring with no limit known is an empty circle and the tokens; with nothing heard, an empty circle alone", () => {
+  const only = renderToStaticMarkup(<Ring context={{ usedTokens: 84_000, maxTokens: null, at: 0 }} grey={false} open={false} toggle={() => {}} />);
+  expect(only).toContain(">84k<");
+  expect(only).not.toContain("stroke-linecap");
+  const none = renderToStaticMarkup(<Ring context={null} grey={false} open={false} toggle={() => {}} />);
+  expect(none).not.toContain("stroke-linecap");
+  expect(none).not.toContain("<span");
+});
+
+test("story 657: grey with the agent not running; running, the quota only once heard over 10 minutes ago", () => {
+  const now = 100 * 60_000;
+  expect(greyOf(false, now, now)).toEqual({ numbers: true, quota: true });
+  expect(greyOf(true, now - 9 * 60_000, now)).toEqual({ numbers: false, quota: false });
+  expect(greyOf(true, now - 11 * 60_000, now)).toEqual({ numbers: false, quota: true });
+  expect(greyOf(true, null, now)).toEqual({ numbers: false, quota: false });
+});
+
+test("story 654: the popover has the context with 压缩, the quota as /usage has it and this conversation's use; grey as greyOf says; with nothing heard, one line", () => {
+  const now = Date.now();
+  const html = renderToStaticMarkup(<MeterBody meter={METER(now)} live agent="claude" compact={() => {}} now={now} />);
+  for (const words of ["上下文", "84k / 200k", "42%", "压缩", "Claude 额度", "5 小时", "91%", "当前对话", "$1.50"]) expect(html).toContain(words);
+  expect(html).toContain("bg-needs");
+  expect(html).not.toContain("muted-foreground/45");
+  // Not running: every number grey; running with the quota old, the quota alone.
+  expect(renderToStaticMarkup(<MeterBody meter={METER(now)} live={false} agent="claude" now={now} />)).not.toContain("bg-needs");
+  const old = renderToStaticMarkup(<MeterBody meter={{ ...METER(now), quota: { ...METER(now).quota!, at: now - 11 * 60_000 } }} live agent="claude" now={now} />);
+  expect(old).not.toContain("bg-needs");
+  expect(old).toMatch(/text-lg font-semibold">42%/);
+  expect(old).not.toContain("压缩");
+  // Only what was heard; nothing at all, a line saying so.
+  const pi = renderToStaticMarkup(<MeterBody meter={{ ...METER(now), quota: null, session: null }} live agent="pi" now={now} />);
+  expect(pi).not.toContain("额度");
+  expect(pi).not.toContain("当前对话");
+  expect(renderToStaticMarkup(<MeterBody meter={{ context: null, session: null, quota: null }} live agent="claude" now={now} />)).toContain("还没有数字，agent 跑完一个回合后再看");
 });
 
 test("story 394: a bar goes amber from 80%, red from 95%", () => {
@@ -2247,7 +2324,7 @@ test("story 394: a bar goes amber from 80%, red from 95%", () => {
 
 test("story 400: /context's card is a bar, the tokens out of the window and the percentage, what holds them folded, and 压缩", () => {
   const html = renderToStaticMarkup(
-    <InfoCard card={{ command: "context", usedTokens: 186_000, maxTokens: 1_000_000, categories: [{ name: "消息", tokens: 132_000 }] }} close={() => {}} run={async () => {}} />,
+    <InfoCard anchor={{ current: null }} card={{ command: "context", usedTokens: 186_000, maxTokens: 1_000_000, categories: [{ name: "消息", tokens: 132_000 }] }} close={() => {}} run={async () => {}} />,
   );
   for (const words of ["上下文", "186k / 1M", "19%", "压缩"]) expect(html).toContain(words);
   expect(html).not.toContain("消息");
@@ -2262,7 +2339,7 @@ test("story 394: a window resets in how long within a day, at a moment further o
 
 test("story 407: Claude's default model shows on /status's card as 默认, the model it uses beside it in grey", () => {
   const card: Info = { command: "status", model: "默认（Opus 5.5）", effort: "high", context: null, ref: "w/a", agent: "claude", dir: "~/w", line: "空闲", actions: [] };
-  const html = renderToStaticMarkup(<InfoCard card={card} close={() => {}} run={async () => {}} />);
+  const html = renderToStaticMarkup(<Status s={card} run={async () => {}} />);
   expect(html).toMatch(/默认<span class="[^"]*text-muted-foreground[^"]*">Opus 5.5<\/span>/);
   expect(html).not.toContain("（");
 });
@@ -2280,28 +2357,28 @@ test("stories 393-396: Claude's /usage card is a bar for each window, Claude's o
     extra: { usedPercent: 24.6, used: 12.3, limit: 50, currency: "USD" },
     session: { ...SESSION, models: [{ name: "Opus 5.5", cost: 14.92, tokens: SESSION.tokens }] },
   };
-  const html = renderToStaticMarkup(<InfoCard card={card} close={() => {}} run={async () => {}} />);
+  const html = renderToStaticMarkup(<InfoCard anchor={{ current: null }} card={card} close={() => {}} run={async () => {}} />);
   for (const words of ["用量", "Claude 额度", "5 小时", "28%", "1 小时 46 分", "7 天 Fable", "91%", "额外用量", "$12.30 / $50.00", "当前对话", "$15.35", "等效 API 价格", "18.9M"]) expect(html).toContain(words);
   for (const folded of ["缓存读", "Opus 5.5"]) expect(html).not.toContain(folded);
   expect(html).not.toContain("压缩");
 });
 
 test("story 397: pi's /usage card is this conversation alone, its cost with nothing beside it", () => {
-  const html = renderToStaticMarkup(<InfoCard card={{ command: "usage", agent: "pi", limits: [], session: SESSION }} close={() => {}} run={async () => {}} />);
+  const html = renderToStaticMarkup(<InfoCard anchor={{ current: null }} card={{ command: "usage", agent: "pi", limits: [], session: SESSION }} close={() => {}} run={async () => {}} />);
   for (const words of ["当前对话", "$15.35", "18.9M"]) expect(html).toContain(words);
   for (const none of ["Claude 额度", "等效 API 价格"]) expect(html).not.toContain(none);
 });
 
 test("story 500: Codex's /usage card has its credits left to two places, and this conversation's tokens with no cost", () => {
   const card: Info = { command: "usage", agent: "codex", limits: [{ window: "7d", usedPercent: 35, resetsAt: null }], credits: 58572.7492495, session: { tokens: SESSION.tokens } };
-  const html = renderToStaticMarkup(<InfoCard card={card} close={() => {}} run={async () => {}} />);
+  const html = renderToStaticMarkup(<InfoCard anchor={{ current: null }} card={card} close={() => {}} run={async () => {}} />);
   for (const words of ["Codex 额度", "7 天", "35%", "credits 余额", "58572.75", "当前对话", "18.9M"]) expect(html).toContain(words);
   for (const none of ["费用", "$", "58,572"]) expect(html).not.toContain(none);
 });
 
 test("#419: the /usage card names the quota after the slot's agent, its logo beside it", () => {
   const card: Info = { command: "usage", agent: "pi", limits: [{ window: "5h", usedPercent: 28, resetsAt: null }], session: SESSION };
-  const html = renderToStaticMarkup(<InfoCard card={card} close={() => {}} run={async () => {}} />);
+  const html = renderToStaticMarkup(<InfoCard anchor={{ current: null }} card={card} close={() => {}} run={async () => {}} />);
   expect(html).toContain("pi 额度");
   expect(html).not.toContain("Claude");
 });
@@ -2523,6 +2600,11 @@ test("story 268: a toast with an undo has 撤销 and stays 8 s, a bar along its 
   expect(shown(<Toasts />)).toContain("已归档 w/c");
   jest.advanceTimersByTime(200);
   expect(shown(<Toasts />)).not.toContain("已归档");
+});
+
+test("#761: a toast is marked data-pop, so tapping it to dismiss it leaves an open popover open", () => {
+  toast("没切成 ultracode。", true);
+  expect(render(<Toasts />)).toMatch(/^<div data-pop="true" role="status"/);
 });
 
 test("story 257: a write whose answer is lost mid-body goes again with the same id; lost each time, it says 连不上", async () => {

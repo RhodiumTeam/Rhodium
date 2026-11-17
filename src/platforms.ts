@@ -1,7 +1,7 @@
 // The IM platforms Rhodium talks to, one row each (architecture §8.1). What differs by platform
 // outside its adapter is read from here: its name, its capability table and how rh bot makes one.
 // What needs the platform's SDK is a Record<Platform, …> beside the code that loads it: the adapter's
-// construction (daemon.ts's ADAPTERS), and rh bot's scan or paste (bot.ts's ONBOARD). A platform
+// construction (daemon.ts's ADAPTERS), and the bot-making flow's scan or check of a paste (bot-flow.ts's ONBOARD). A platform
 // missing from any of them does not compile. No imports but types: every rh call loads this.
 import type { BotConfig } from "./config";
 import type { Capabilities, Durations, Platform } from "./contracts";

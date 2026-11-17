@@ -20,7 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { claudeSettings, codexSettings, findConversations, fullText, piSettings, lastSaid, listConversations, messagePage, readPage, recentMessages, startedIn, type Block, type Page } from "../src/transcript.ts";
+import { claudeSettings, codexSettings, findConversations, fullText, hitIn, importable, listed, piSettings, lastSaid, listConversations, messagePage, meterIn, readPage, recentMessages, startedIn, type Block, type Page } from "../src/transcript.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures/transcripts");
 const PI_ID = "00000000-0000-4000-8000-4c4a2a950dc8";
@@ -1072,5 +1072,250 @@ describe("Codex's threads", () => {
       { role: "user", text: "Without running anything: did your last command finish? Reply yes, no, or unknown." },
       { role: "assistant", text: "unknown" },
     ]);
+  });
+});
+
+describe("the import list's summaries and search (architecture §7.10)", () => {
+  const home = join(tmp, "home-import");
+  const saved = { HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME };
+  beforeAll(() => Object.assign(process.env, { HOME: home, CODEX_HOME: join(home, ".codex") }));
+  afterAll(() => {
+    for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+  });
+
+  let n = 0;
+  /** A Claude transcript of its own in dir (/srv/<dir>), its lines as given, ids made up: its file. */
+  function claude(lines: object[], dir = "/srv/import"): string {
+    const folder = join(home, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-"));
+    mkdirSync(folder, { recursive: true });
+    const file = join(folder, `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}.jsonl`);
+    writeFileSync(file, lines.map((l) => JSON.stringify(l) + "\n").join(""));
+    return file;
+  }
+  // As Claude writes them: what you and it said start {"parentUuid", its metadata {"type".
+  const you = (text: unknown, more: object = {}) => ({ parentUuid: null, isSidechain: false, type: "user", message: { role: "user", content: text }, cwd: "/srv/import", gitBranch: "main", ...more });
+  const it = (content: object[], more: object = {}) => ({ parentUuid: "p", isSidechain: false, type: "assistant", message: { role: "assistant", content }, cwd: "/srv/import", gitBranch: "main", ...more });
+  const text = (t: string) => ({ type: "text", text: t });
+  const search = (words: string, full = true) => ({ words, full });
+  const found = async (file: string, words: string, full = true) => (await listed(file, "claude", search(words, full)))?.hit ?? (await listed(file, "claude", search(words, full))) !== null;
+
+  test("story 642: a Claude conversation is titled by its /rename name, else the one Claude gave it, else what you said first; the last of each counts", async () => {
+    const first = [you("fix the login page"), it([text("Done.")])];
+    expect((await listed(claude(first), "claude"))!.title).toBe("fix the login page");
+    expect((await listed(claude([...first, { type: "ai-title", aiTitle: "Login page fix", sessionId: "s" }]), "claude"))!.title).toBe("Login page fix");
+    expect((await listed(claude([...first, { type: "ai-title", aiTitle: "Login page fix" }, { type: "custom-title", customTitle: "login" }]), "claude"))!.title).toBe("login");
+    expect((await listed(claude([...first, { type: "custom-title", customTitle: "login" }, { type: "ai-title", aiTitle: "Login page fix" }]), "claude"))!.title).toBe("login");
+  });
+
+  test("story 642: pi's session name and Codex's thread name are the titles, as before", async () => {
+    const pi = join(home, ".pi/agent/sessions/--srv-pi--");
+    mkdirSync(pi, { recursive: true });
+    const piFile = join(pi, "2026-10-19T08-00-00-000Z_0199f000-0000-7000-8000-000000000009.jsonl");
+    writeFileSync(
+      piFile,
+      [
+        { type: "session", version: 3, id: "x", cwd: "/srv/pi" },
+        { type: "message", message: { role: "user", content: [text("fix the build")] } },
+        { type: "session_info", name: "build" },
+      ]
+        .map((l) => JSON.stringify(l) + "\n")
+        .join(""),
+    );
+    expect((await listed(piFile, "pi"))!.title).toBe("build");
+    const id = "00000000-0000-7000-8000-8d5c554c3185";
+    const day = join(home, ".codex/sessions/2026/10/27");
+    mkdirSync(day, { recursive: true });
+    const codexFile = join(day, `rollout-2026-10-27T16-30-54-${id}.jsonl`);
+    copyFileSync(join(FIXTURES, "codex/thread.jsonl"), codexFile);
+    writeFileSync(join(home, ".codex/session_index.jsonl"), JSON.stringify({ id, thread_name: "Make hello.txt" }) + "\n");
+    expect(await importable("codex", { skip: () => false, search: search("hello.txt", false) })).toEqual({ list: [expect.objectContaining({ id, title: "Make hello.txt", dir: "/tmp/codex-probe/work/project" })] });
+  });
+
+  test("stories 642, 643: how many things were said, the branch, what you last said and the start of the agent's last reply; a file grown is read on from where it was, as if read whole", async () => {
+    const file = claude([
+      you("aaaa first"),
+      it([text("one"), { type: "thinking", thinking: "hmm" }, { type: "tool_use", id: "t", name: "Bash", input: { command: "ls" } }]),
+      you([{ type: "tool_result", tool_use_id: "t", content: "out" }]),
+      it([text(`two ${"x".repeat(500)}`)]),
+      you("再看一下\n iPhone SE 的宽度"),
+    ]);
+    expect(await listed(file, "claude")).toEqual({ id: basename(file, ".jsonl"), file, dir: "/srv/import", title: "aaaa first", at: statSync(file).mtimeMs, count: 4, branch: "main", you: "再看一下 iPhone SE 的宽度", reply: `two ${"x".repeat(396)}…` });
+    // What was read is not read again: a change there (the same size) goes unseen once the file grows.
+    const before = readFileSync(file, "utf8");
+    writeFileSync(file, before.replace("aaaa first", "bbbb first"));
+    appendFileSync(file, JSON.stringify(it([text("在 320px 下量了一遍")], { gitBranch: "fix/login" })) + "\n");
+    utimesSync(file, new Date(), new Date(Date.now() + 1000));
+    const grown = await listed(file, "claude");
+    expect(grown).toMatchObject({ title: "aaaa first", count: 5, branch: "fix/login", reply: "在 320px 下量了一遍" });
+    // Read whole, an honest file says the same.
+    const whole = claude(readFileSync(file, "utf8").replace("bbbb first", "aaaa first").split("\n").filter(Boolean).map((l) => JSON.parse(l)));
+    expect({ ...(await listed(whole, "claude"))!, id: "", file: "", at: 0 }).toEqual({ ...grown!, id: "", file: "", at: 0 });
+  });
+
+  test("story 642: the branch is the last line's that has one; HEAD, detached, is none", async () => {
+    const lines = [you("go"), it([text("ok")], { gitBranch: "feat" }), { type: "ai-title", aiTitle: "Go" }, { type: "last-prompt", lastPrompt: "go" }];
+    expect((await listed(claude(lines), "claude"))!.branch).toBe("feat");
+    expect((await listed(claude([you("go", { gitBranch: "HEAD" })]), "claude"))!.branch).toBeUndefined();
+  });
+
+  test("story 644: a conversation with system lines alone, nothing you or the agent said, is not listed", async () => {
+    const dir = "/srv/empty";
+    claude([{ type: "queue-operation", operation: "enqueue" }, you("<command-name>/clear</command-name>"), { type: "system", subtype: "local_command", content: "x" }], dir);
+    const said = claude([you("hi")], dir);
+    expect((await importable("claude", { dir, skip: () => false })).list.map((c) => c.file)).toEqual([said]);
+  });
+
+  test("story 647: a title search finds words in the title alone, not in what was said", async () => {
+    const file = claude([you("rename the cache"), it([text("the quokka moved")])]);
+    expect(await found(file, "CACHE", false)).toBe(true);
+    expect(await found(file, "quokka", false)).toBe(false);
+  });
+
+  test("story 647: a full-text search finds what you and the agent said; not what is only in a tool's result, a thought, Claude's metadata, a picture's data or cwd; quotes, backslashes and newlines too; English in any case", async () => {
+    const file = claude([
+      you("用 \"引号\" 和 C:\\path\n换行"),
+      it([text("the Wombat sleeps"), { type: "thinking", thinking: "thinkword" }, { type: "tool_use", id: "t", name: "Bash", input: { command: "callword" } }]),
+      you([{ type: "tool_result", tool_use_id: "t", content: "resultword 结果词" }]),
+      you([{ type: "image", source: { type: "base64", media_type: "image/png", data: "imagedataword" } }, text("look")]),
+      { type: "api-request", body: "requestword 请求词" },
+      { type: "api-request-blob", blob: "blobword" },
+      { type: "last-prompt", lastPrompt: "promptword" },
+      you("in a dir", { cwd: "/srv/cwdword" }),
+    ]);
+    expect(await found(file, "wombat")).toMatchObject({ text: "the Wombat sleeps" });
+    expect(await found(file, "引号\" 和 C:\\path\n换")).toBeTruthy();
+    for (const w of ["thinkword", "callword", "resultword", "结果词", "imagedataword", "requestword", "请求词", "blobword", "promptword", "cwdword"]) expect([w, await found(file, w)]).toEqual([w, false]);
+  });
+
+  test("story 647: the sieve finds a Chinese word, one mixed with English, and an English one, in any case; and words across two 1MB blocks", async () => {
+    // Titled apart, so what is found is in what was said.
+    const file = claude([you("先修复login再说"), it([text("用 regex 匹配")]), { type: "custom-title", customTitle: "t" }]);
+    expect(await found(file, "修复")).toMatchObject({ text: "先修复login再说" });
+    expect(await found(file, "修复Login")).toMatchObject({ text: "先修复login再说" });
+    expect(await found(file, "REGEX")).toMatchObject({ text: "用 regex 匹配" });
+    // A message whose words straddle the first MB's end: it falls in 块, 4 bytes into them.
+    const line = JSON.stringify(you("跨块的词 straddle"));
+    const pad = you("x".repeat(2 ** 20 - (JSON.stringify(you("")).length + 1) - line.indexOf("跨") - 4));
+    expect(Buffer.byteLength(JSON.stringify(pad) + "\n" + line.slice(0, line.indexOf("跨")))).toBe(2 ** 20 - 4);
+    const big = claude([pad, you("跨块的词 straddle"), { type: "custom-title", customTitle: "t" }]);
+    expect(await found(big, "跨块的词")).toBeTruthy();
+    expect(await found(big, "STRADDLE")).toBeTruthy();
+  });
+
+  test("story 648: the bit a hit shows, 30 characters before the words and 60 after, on one line; … where cut", () => {
+    expect(hitIn("needle at the start", 0, 6)).toEqual({ text: "needle at the start", from: 0, to: 6 });
+    const long = `${"a".repeat(50)} needle\n${"b".repeat(100)}`;
+    const mid = hitIn(long, 51, 6);
+    expect(mid.text).toBe(`…${"a".repeat(29)} needle ${"b".repeat(59)}…`);
+    expect(mid.text.slice(mid.from, mid.to)).toBe("needle");
+    const end = hitIn("x".repeat(40) + "needle", 40, 6);
+    expect(end).toEqual({ text: `…${"x".repeat(30)}needle`, from: 31, to: 37 });
+  });
+
+  test("§7.10: reading a conversation's summary stops between blocks once the request is cancelled, and keeps nothing half read", async () => {
+    const file = claude([you("first"), it([text("x".repeat(3 * 2 ** 20))]), you("last")]);
+    // Aborted once the first block is read.
+    let checks = 0;
+    const signal = { get aborted() { return ++checks > 1; }, reason: new Error("cancelled") } as AbortSignal;
+    await expect(listed(file, "claude", undefined, undefined, signal)).rejects.toThrow("cancelled");
+    expect(checks).toBe(2);
+    expect(await listed(file, "claude")).toMatchObject({ count: 3, you: "last" });
+  });
+
+  test("story 648: past its time a page stops, partial, with where to go on; going on gives each once", async () => {
+    const dir = "/srv/budget";
+    const files = Array.from({ length: 5 }, (_, i) => {
+      const f = claude([you(`budget word ${i}`)], dir);
+      utimesSync(f, new Date(), new Date(Date.UTC(2026, 0, 1, 0, i)));
+      return f;
+    });
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let pages = 0; pages < 10; pages++) {
+      const page = await importable("claude", { dir, search: search("word"), cursor, skip: () => false, budget: 0 });
+      seen.push(...page.list.map((c) => c.file));
+      if (!page.cursor) break;
+      expect(page.partial).toBe(true);
+      cursor = page.cursor;
+    }
+    expect(seen).toEqual(files.toReversed());
+  });
+});
+
+describe("meterIn", () => {
+  const CODEX_THREAD = join(FIXTURES, "codex/thread.jsonl");
+  // Synthesis moves a fixture's times: read them off its lines, and put appended lines after them.
+  const lines = (file: string) => readFileSync(file, "utf8").split("\n").filter(Boolean);
+  const newest = (ls: string[], pick: (v: any) => boolean) => ls.map((l) => JSON.parse(l)).findLast(pick);
+  const answered = (v: any) => v.message?.role === "assistant" && v.message.usage && !v.isSidechain;
+  const tokenCount = (v: any) => v.payload?.type === "token_count" && v.payload.info;
+  const later = (iso: string, s: number) => new Date(Date.parse(iso) + s * 1000).toISOString();
+
+  test("story 658: Claude's context is its main conversation's last answer: input, cache read, cache write and output added up, a <synthetic> line's zeros and a subagent's lines passed over; no limit in the file", async () => {
+    const t = newest(lines(CLAUDE_FILE), answered).timestamp;
+    expect(await meterIn(CLAUDE_FILE, "claude")).toEqual({ context: { usedTokens: 28_687, maxTokens: null, at: Date.parse(t) } });
+    const file = join(tmp, "meter-claude.jsonl");
+    const zero = { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 };
+    const side = { input_tokens: 9, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 };
+    writeFileSync(
+      file,
+      readFileSync(CLAUDE_FILE, "utf8") +
+        JSON.stringify({ type: "assistant", isSidechain: true, timestamp: later(t, 1), message: { model: "claude-haiku-5-5", role: "assistant", usage: side } }) + "\n" +
+        JSON.stringify({ type: "assistant", timestamp: later(t, 2), message: { model: "<synthetic>", role: "assistant", usage: zero } }) + "\n",
+    );
+    expect(await meterIn(file, "claude")).toEqual({ context: { usedTokens: 28_687, maxTokens: null, at: Date.parse(t) } });
+    // After a compaction the last answer's count is no longer what the context holds.
+    appendFileSync(file, JSON.stringify({ type: "system", subtype: "compact_boundary", timestamp: later(t, 3) }) + "\n");
+    expect(await meterIn(file, "claude")).toEqual({});
+  });
+
+  test("story 658: pi's context is its last answer's tokens, an errored, aborted or zero-use answer passed over as pi passes it; none once it compacted after it", async () => {
+    const file = join(tmp, "meter-pi.jsonl");
+    const head = lines(PI_FILE).slice(0, 8);
+    const t = newest(head, answered).timestamp;
+    writeFileSync(file, head.join("\n") + "\n");
+    expect(await meterIn(file, "pi")).toEqual({ context: { usedTokens: 1_807, maxTokens: null, at: Date.parse(t) } });
+    const reply = (ts: string, stopReason: string, n: number) =>
+      JSON.stringify({ type: "message", timestamp: ts, message: { role: "assistant", content: [], usage: { input: n, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: n }, stopReason } }) + "\n";
+    appendFileSync(file, reply(later(t, 1), "error", 0) + reply(later(t, 2), "aborted", 5) + reply(later(t, 3), "stop", 0));
+    expect(await meterIn(file, "pi")).toEqual({ context: { usedTokens: 1_807, maxTokens: null, at: Date.parse(t) } });
+    expect(await meterIn(PI_FILE, "pi")).toEqual({});
+  });
+
+  test("story 658: Codex's context is the last token_count's last_token_usage out of its model_context_window, not the thread's total; its rate_limits named as account/rateLimits/read names them", async () => {
+    const last = newest(lines(CODEX_THREAD), tokenCount);
+    const at = Date.parse(last.timestamp);
+    expect(await meterIn(CODEX_THREAD, "codex")).toEqual({
+      context: { usedTokens: 17_532, maxTokens: 258_400, at },
+      rateLimits: {
+        bucket: { limitId: "codex", primary: { usedPercent: 35, windowDurationMins: 10080, resetsAt: last.payload.rate_limits.primary.resets_at }, secondary: null, credits: { hasCredits: true, balance: "1000.0000000000" } },
+        at,
+      },
+    });
+  });
+
+  test("story 658: a Codex token_count with no rate_limits, as on an API key, takes no older line's quota, which is stale by then", async () => {
+    const file = join(tmp, "meter-codex-api-key.jsonl");
+    const ls = lines(CODEX_THREAD);
+    // Up to the thread's token_count whose rate_limits is null; an older one carries some.
+    const cut = ls.findIndex((l) => { const v = JSON.parse(l); return tokenCount(v) && v.payload.rate_limits === null; });
+    expect(ls.slice(0, cut).some((l) => JSON.parse(l).payload?.rate_limits)).toBe(true);
+    writeFileSync(file, ls.slice(0, cut + 1).join("\n") + "\n");
+    const v = JSON.parse(ls[cut]!);
+    expect(await meterIn(file, "codex")).toEqual({ context: { usedTokens: v.payload.info.last_token_usage.total_tokens, maxTokens: 258_400, at: Date.parse(v.timestamp) } });
+  });
+
+  test("story 658: a Codex thread before its first answer has no context, though its token_count may carry the quota", async () => {
+    const file = join(tmp, "meter-codex-new.jsonl");
+    const [first] = lines(CODEX_THREAD);
+    const t = later(JSON.parse(first!).timestamp, 1);
+    const limits = { limit_id: "codex", primary: { used_percent: 20, window_minutes: 300, resets_at: 1767737000 }, secondary: { used_percent: 40, window_minutes: 10080, resets_at: 1767738000 }, credits: null };
+    writeFileSync(file, first + "\n" + JSON.stringify({ timestamp: t, type: "event_msg", payload: { type: "token_count", info: null, rate_limits: limits } }) + "\n");
+    expect(await meterIn(file, "codex")).toEqual({
+      rateLimits: {
+        bucket: { limitId: "codex", primary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 1767737000 }, secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1767738000 } },
+        at: Date.parse(t),
+      },
+    });
   });
 });

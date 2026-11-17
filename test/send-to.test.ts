@@ -35,6 +35,7 @@ const ctx = (o: Partial<Ctx> = {}): Ctx => ({
   herdr: () => true,
   front: () => false,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
   ...o,
 });
@@ -271,7 +272,7 @@ test("story 575: each page of the board open says whether it is in front, by its
   writeFileSync(file, `stateDir = "${dir}/state"\n[herdr]\nsession = "rhodium-test-none"\n[board]\nport = 0\nauth = "none"\n`, { mode: 0o600 });
   const store = openStore(join(dir, "board.db"));
   const fronts: Fronts = new Map();
-  const server = serveBoard(store, loadConfig(file), new Set(), join(dir, "none"), undefined, fronts);
+  const server = serveBoard(store, loadConfig(file), new Set(), join(dir, "none"), undefined, fronts).servers[0]!;
   const at = `http://127.0.0.1:${server.port}`;
   const say = (stream: string, front: string, site = "same-origin") => fetch(`${at}/api/front`, { method: "POST", headers: { "sec-fetch-site": site }, body: new URLSearchParams({ stream, front }) });
   const anyFront = () => inFront(fronts);

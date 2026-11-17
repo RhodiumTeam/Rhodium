@@ -96,21 +96,50 @@ const HOSTNAME = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a
 
 const isPort = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 65535;
 
-/** What is wrong with [board], laid over its defaults, as the closed board and rh doctor say it; null: nothing. */
-function boardWrong(w: Record<string, unknown>): string | null {
+/** One entry of the board (ADR-0014): [board], or a [[board.extra]] table, laid over the defaults. */
+export type BoardEntry = typeof board;
+
+/** The entry's name in what rh doctor and the closed board say: board, or board.extra 第 n 张 (from 1). */
+export const entryName = (i: number) => (i ? `board.extra 第 ${i} 张` : "board");
+/** How the entry's items are named before the item: "board." or "board.extra 第 n 张的 ". */
+export const itemPrefix = (i: number) => (i ? `${entryName(i)}的 ` : "board.");
+
+/** What is wrong with an entry, laid over its defaults, as the closed board and rh doctor say it; null:
+ *  nothing. p: how its items are named, "board." or "board.extra 第 n 张的 ". */
+function boardWrong(w: Record<string, unknown>, p = "board."): string | null {
   const said = (v: unknown) => `写的是 ${JSON.stringify(v)}`;
   const { port, login, bind, auth, hosts } = w;
   const unknown = Object.keys(w).find((k) => !Object.hasOwn(board, k));
-  if (unknown !== undefined) return `没有 board.${unknown} 这一项，只有 ${Object.keys(board).join("、")}`;
-  if (!isPort(port)) return `board.port ${said(port)}，要写 0 到 65535 的端口号`;
-  if (typeof login !== "string") return `board.login ${said(login)}，要写成字符串，例如 "you@example.com"`;
-  if (typeof bind !== "string" || !isIP(bind)) return `board.bind ${said(bind)}，要写 IP 地址，例如 "127.0.0.1"`;
-  if (auth !== "tailscale" && auth !== "none") return `board.auth ${said(auth)}，只能是 "tailscale" 或 "none"`;
-  if (!Array.isArray(hosts)) return `board.hosts ${said(hosts)}，要写成主机名的列表，例如 ["board.example.com"]`;
+  if (unknown !== undefined) return `没有 ${p}${unknown} 这一项，只有 ${Object.keys(board).join("、")}`;
+  if (!isPort(port)) return `${p}port ${said(port)}，要写 0 到 65535 的端口号`;
+  if (typeof login !== "string") return `${p}login ${said(login)}，要写成字符串，例如 "you@example.com"`;
+  if (typeof bind !== "string" || !isIP(bind)) return `${p}bind ${said(bind)}，要写 IP 地址，例如 "127.0.0.1"`;
+  if (auth !== "tailscale" && auth !== "none") return `${p}auth ${said(auth)}，只能是 "tailscale" 或 "none"`;
+  if (!Array.isArray(hosts)) return `${p}hosts ${said(hosts)}，要写成主机名的列表，例如 ["board.example.com"]`;
   const bad = hosts.find((h) => typeof h !== "string" || !HOSTNAME.test(h));
-  if (bad !== undefined) return `board.hosts 里的 ${JSON.stringify(bad)} 不是主机名：要小写，不带协议和端口，例如 "board.example.com"`;
+  if (bad !== undefined) return `${p}hosts 里的 ${JSON.stringify(bad)} 不是主机名：要小写，不带协议和端口，例如 "board.example.com"`;
   // In tailscale mode anyone a proxy brings in could write your Tailscale-User-Login.
-  if (auth === "tailscale" && hosts.length) return 'board.hosts 只在 auth = "none" 时用：tailscale 模式只认 tailnet 和本机的地址';
+  if (auth === "tailscale" && hosts.length) return `${p}hosts 只在 auth = "none" 时用：tailscale 模式只认 tailnet 和本机的地址`;
+  return null;
+}
+
+/** What is wrong with [board] and its [[board.extra]] tables (ADR-0014), each laid over the defaults;
+ *  null: nothing. Two entries may not listen on one address, port 0, any free one, aside. */
+function entriesWrong(entries: Record<string, unknown>[], extra: unknown): string | null {
+  if (extra !== undefined && !(Array.isArray(extra) && extra.every(isTable)))
+    return `board.extra 写的是 ${JSON.stringify(extra)}，要写成一张张 [[board.extra]] 表`;
+  const seen = new Map<string, string>();
+  for (const [i, e] of entries.entries()) {
+    const p = itemPrefix(i);
+    if (i && !Object.hasOwn((extra as object[])[i - 1]!, "port")) return `${p}port 要写`;
+    const wrong = boardWrong(e, p);
+    if (wrong) return wrong;
+    if (e.port === 0) continue;
+    const at = `${e.bind}:${e.port}`;
+    const before = seen.get(at);
+    if (before !== undefined) return `${entryName(i)}和 ${before} 都听 ${at}，每个入口要一个自己的端口`;
+    seen.set(at, entryName(i));
+  }
   return null;
 }
 
@@ -129,6 +158,12 @@ export const fixedOwners = (bot: BotConfig | undefined): string[] => bot?.owner?
 
 /** The bot's owners pairing added (rh pair). */
 export const paired = (bot: Pick<Bot, "owners">): string[] => (bot.owners ? JSON.parse(bot.owners) : []);
+
+// ponytail: the key is this process's, so the codes change when rhodium restarts; keep one on disk if a stable code matters.
+const OWNER_KEY = crypto.getRandomValues(new Uint8Array(32));
+/** The code the board shows and names an owner's account by, in place of the account (architecture
+ *  §8.5.1, §11): keyed, so it gives no account back, a Telegram one of a few digits say. */
+export const ownerCode = (account: string): string => new Bun.CryptoHasher("sha256", OWNER_KEY).update(account).digest("hex").slice(0, 8);
 
 export type Config = {
   stateDir: string; // rh.db and hold/<conversation>/
@@ -153,7 +188,8 @@ export type Config = {
   programs: typeof programs;
   // closed: what is wrong in [board], which closes the board alone; it then listens on 127.0.0.1, on
   // the port given, or the default if that is what is wrong.
-  board: typeof board & { closed: string | null };
+  // extra: the [[board.extra]] entries (ADR-0014), none while closed.
+  board: BoardEntry & { closed: string | null; extra: BoardEntry[] };
   herdr: typeof herdr;
 };
 
@@ -272,8 +308,10 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
     if (!Number.isSafeInteger(v) || v < 0) throw new Error(`config: limits.${k} must be a whole number, 0 or more`);
   }
 
-  const web: Record<string, unknown> = { ...board, ...(isTable(w) ? w : {}) };
-  const closed = w === undefined || isTable(w) ? boardWrong(web) : `board 写的是 ${JSON.stringify(w)}，要写成 [board] 表`;
+  const { extra, ...first } = isTable(w) ? w : {};
+  const web: Record<string, unknown> = { ...board, ...first };
+  const entries = [web, ...(Array.isArray(extra) ? extra.map((e) => ({ ...board, ...(isTable(e) ? e : {}) })) : [])];
+  const closed = w === undefined || isTable(w) ? entriesWrong(entries, extra) : `board 写的是 ${JSON.stringify(w)}，要写成 [board] 表`;
 
   const tui = overlay("herdr.", herdr, h);
   if (!tui.session) throw new Error("config: herdr.session must name a Herdr session");
@@ -297,29 +335,82 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
     defaults: overlay("defaults.", defaults, t),
     bots,
     programs: progs,
-    board: closed ? { ...board, port: isPort(web.port) ? web.port : board.port, closed } : { ...(web as typeof board), closed },
+    board: closed
+      ? { ...board, port: isPort(web.port) ? web.port : board.port, closed, extra: [] }
+      : { ...(web as BoardEntry), closed, extra: entries.slice(1) as BoardEntry[] },
     herdr: tui,
   };
 }
 
-/** Appends a [bots.<name>] table to the config file (rh bot), leaving the rest as you wrote it. name
- *  must be a bare TOML key. The new file is written beside the old one, mode 0600, and takes its
- *  place only once it loads as a config. Returns the bot as the new file has it. */
-export function addBot(path: string, name: string, table: Record<string, string>): BotConfig {
-  const text = readFileSync(path, "utf8");
-  // JSON's string escapes are TOML's too.
-  const lines = [`[bots.${name}]`, ...Object.entries(table).map(([k, v]) => `${k} = ${JSON.stringify(v)}`)];
+/** Puts text in place of the config file: written beside it first, mode 0600, and taking its place
+ *  only once it loads as a config that check, which throws otherwise, finds as meant. Returns what
+ *  check does. */
+function rewrite<T>(path: string, text: string, check: (config: Config) => T): T {
   const next = `${path}.new`;
   rmSync(next, { force: true }); // left by a write that failed, maybe with another mode
   try {
-    writeFileSync(next, `${text}${text && !text.endsWith("\n") ? "\n" : ""}\n${lines.join("\n")}\n`, { mode: 0o600 });
-    const bot = loadConfig(next).bots[name]!;
+    writeFileSync(next, text, { mode: 0o600 });
+    const out = check(loadConfig(next));
     renameSync(next, path);
-    return bot;
+    return out;
   } catch (err) {
     rmSync(next, { force: true });
     throw err;
   }
+}
+
+/** Appends a [bots.<name>] table to the config file (rh bot), leaving the rest as you wrote it. name
+ *  must be a bare TOML key. Returns the bot as the new file has it. */
+export function addBot(path: string, name: string, table: Record<string, string>): BotConfig {
+  const text = readFileSync(path, "utf8");
+  // JSON's string escapes are TOML's too.
+  const lines = [`[bots.${name}]`, ...Object.entries(table).map(([k, v]) => `${k} = ${JSON.stringify(v)}`)];
+  return rewrite(path, `${text}${text && !text.endsWith("\n") ? "\n" : ""}\n${lines.join("\n")}\n`, (c) => c.bots[name]!);
+}
+
+/** The bot a line heads the table of, [bots.<name>] with the name bare or quoted; undefined: none. */
+function tableOf(line: string): string | undefined {
+  const m = /^\s*\[\s*bots\s*\.\s*(?:"([^"\\]*)"|'([^']*)'|([\w-]+))\s*\]\s*(?:#.*)?$/.exec(line);
+  return m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+}
+
+/** Takes the [bots.<name>] table out of the config file (rh bot rm, architecture §14.8): its header
+ *  line down to the last line of its own before the next table, comments and blank lines in front of
+ *  that one left to it, and one blank line before it, which addBot puts there. The rest stays as you
+ *  wrote it: the new file must load the same but for that bot. */
+export function removeBot(path: string, name: string): void {
+  const text = readFileSync(path, "utf8");
+  const was = loadConfig(path);
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => tableOf(l) === name);
+  if (start < 0) throw new Error(`找不到 [bots.${name}] 这一行`);
+  let end = lines.findIndex((l, i) => i > start && /^\s*\[/.test(l));
+  if (end < 0) end = lines.length;
+  while (end > start + 1 && /^\s*(#.*)?$/.test(lines[end - 1]!)) end--;
+  const from = start > 0 && !lines[start - 1]!.trim() ? start - 1 : start;
+  const { [name]: _, ...rest } = was.bots;
+  rewrite(path, [...lines.slice(0, from), ...lines.slice(end)].join("\n"), (now) => {
+    if (JSON.stringify(now) !== JSON.stringify({ ...was, bots: rest })) throw new Error(`Bot ${name} 不是单独一张 [bots.${name}] 表的写法，没法只删掉它`);
+  });
+}
+
+/** Writes mainChat = "<bot>/<chat>" into the config file (architecture §8.5.1), before its first
+ *  table, the rest as you wrote it. false: the file names a main chat already, and is left as it is. */
+export function setMainChat(path: string, bot: string, chat: string): boolean {
+  const text = readFileSync(path, "utf8");
+  if (loadConfig(path).mainChat) return false;
+  const lines = text.split("\n");
+  const first = lines.findIndex((l) => /^\s*\[/.test(l));
+  const top = first < 0 ? lines.length : first;
+  const line = `mainChat = ${JSON.stringify(`${bot}/${chat}`)}`;
+  // mainChat = "", which is none.
+  const empty = lines.findIndex((l, i) => i < top && /^\s*mainChat\s*=/.test(l));
+  if (empty >= 0) lines[empty] = line;
+  else lines.splice(top, 0, line);
+  return rewrite(path, lines.join("\n"), (c) => {
+    if (c.mainChat?.bot !== bot || c.mainChat.chat !== chat) throw new Error("写进去的 mainChat 读回来不对");
+    return true;
+  });
 }
 
 /** Points each bot whose target is the slot from at to instead (rh rename): the config file is

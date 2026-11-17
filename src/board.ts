@@ -14,25 +14,27 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { AGENTS, TYPING } from "./agents";
+import { AGENT_KINDS, AGENTS, TYPING } from "./agents";
 import { askCard, askText, type AskCard, type AskPrompt } from "./asks";
 import { avatarDir } from "./avatars";
+import type { BotFlows } from "./bot-flow";
 import { frameUuid } from "./claude";
 import { log } from "./daemon";
 import { COMMON, FROM_BOARD, SENT_AT, type AgentEvent, type AgentKind, type BoardAct, type Platform } from "./contracts";
-import { hasHerdr, memoryText, owners, type BotConfig, type Config } from "./config";
-import { call, sessionSocket } from "./herdr";
+import { entryName, fixedOwners, hasHerdr, itemPrefix, memoryText, ownerCode, owners, type BoardEntry, type BotConfig, type Config } from "./config";
+import { call, request, sessionSocket } from "./herdr";
 import { holderPaths } from "./holder";
 import { imageType, makeCopy, MAX_PIXELS, mediaLine, pictureType, saveMedia, withoutMedia, type Media } from "./media";
+import { fromTranscript, meterOf, type SlotMeter } from "./meter";
 import { moment } from "./panels";
 import { agentCommands } from "./commands";
-import { askGone, contactOf, IN_TUI, resumeWaits, settingsOf, slotState, STATE, target, WEB_PAUSED, WEB_QUEUE, workspaceName, type Payload, type RhReply } from "./router";
+import { AT_BOARD, askGone, contactOf, IN_TUI, resumeWaits, settingsOf, slotState, STATE, target, WEB_PAUSED, WEB_QUEUE, workspaceName, type Payload, type RhReply } from "./router";
 import { namesOf, type Ask, type Bot, type Chat, type Conversation, type Event, type Outbound, type Slot, type Store, type Tx } from "./store";
 import { PLATFORMS } from "./platforms";
 import { splitSource, withoutSource } from "./prompt";
 import { codeRef } from "./local";
 import { checkLocal, localRefs, NEAR, readPicture, rowFor } from "./reply-images";
-import { describe, fullText, lastSaid, messagePage, transcriptFile, type Block as Read, type Local } from "./transcript";
+import { conversationsIn, describe, findConversations, fullText, importable, lastSaid, listed, messagePage, meterIn, transcriptFile, yoursSaid, type Block as Read, type Hit, type Listed, type Local } from "./transcript";
 
 /** The page and its files as Vite built them: embedded in the built binary, and in web/dist when
  *  run from source. */
@@ -247,6 +249,128 @@ async function dirs(store: Store, path: string): Promise<DirsData> {
   };
 }
 
+/** GET /api/folder (architecture §7.10): the directory picker's info line for a folder, its git state
+ *  as `git status` has it: the branch it is on, none when detached; how far ahead of and behind its
+ *  upstream, none with no upstream; how many files are not committed, untracked too. None of them
+ *  outside a repository, with no git, or past 2 s. sessions: by agent, how many conversations started
+ *  there the import list would list from the disk, and when the newest last changed; none for none. */
+export type FolderData = { branch?: string; ahead?: number; behind?: number; changed?: number; sessions?: Partial<Record<AgentKind, { count: number; at: number }>> };
+
+/** An absolute path for one the page gives: ~/…, absolute, or empty for ~. */
+const pathOf = (path: string) => {
+  const home = process.env.HOME || homedir();
+  return resolve(home, path.replace(/^~(?=\/|$)/, home));
+};
+
+/** ~/… for a path under HOME, else the path. */
+const tilde = (p: string) => {
+  const home = process.env.HOME || homedir();
+  return p === home ? "~" : p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p;
+};
+
+/** The agents' session ids a slot has used, archived ones too: those are not imported again. */
+const used = (store: Store) => new Set(store.tx((tx) => tx.find("conversation", {})).flatMap((c) => (c.sessionId ? [c.sessionId] : [])));
+
+/** What GET /api/folder answers for path: ~/…, absolute, or empty for ~. Runs git there, taking no lock
+ *  (GIT_OPTIONAL_LOCKS=0): the terminal reaches the folder anyway (architecture §11). */
+async function folder(store: Store, path: string): Promise<FolderData> {
+  const cwd = pathOf(path);
+  const taken = used(store);
+  const counts = Promise.all(AGENT_KINDS.map(async (a) => [a, await conversationsIn(cwd, a, (id) => taken.has(id)).catch(() => undefined)] as const));
+  const git = (async (): Promise<FolderData> => {
+    try {
+      const git = Bun.spawn(["git", "status", "--porcelain=v2", "--branch"], { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 2000 });
+      const [out, code] = await Promise.all([new Response(git.stdout).text(), git.exited]);
+      if (code !== 0) return {};
+      const lines = out.split("\n").filter(Boolean);
+      const head = lines.find((l) => l.startsWith("# branch.head "))?.slice(14);
+      const ab = /^# branch\.ab \+(\d+) -(\d+)$/m.exec(out);
+      return { ...(head && head !== "(detached)" && { branch: head }), ...(ab && { ahead: +ab[1]!, behind: +ab[2]! }), changed: lines.filter((l) => !l.startsWith("#")).length };
+    } catch {
+      // No such folder, or no git.
+      return {};
+    }
+  })();
+  const sessions = Object.fromEntries((await counts).filter(([, c]) => c));
+  return { ...(await git), ...(Object.keys(sessions).length && { sessions }) };
+}
+
+/** A conversation the import list has (architecture §7.10): its session id, and the pane it is open in
+ *  in Herdr, if it is; the directory it was started in, ~/… under HOME; its title, when it last
+ *  changed, how many things were said, its branch; what you last said, the start of the agent's last
+ *  reply; where a full-text search hit, in a message. */
+export type ImportRow = { session: string; pane?: string; dir: string; title: string; at: number; count: number; branch?: string; you?: string; reply?: string; hit?: Hit };
+/** GET /api/importable: a page of the list; cursor, where the next starts, while there is more; partial,
+ *  that the page stopped as its time ran out. */
+export type ImportableData = { list: ImportRow[]; cursor?: string; partial?: true };
+
+/** What GET /api/importable answers (architecture §7.10): agent's conversations started in dir, or in
+ *  any with q and no dir; with q, those it finds, in what was said too with full=1. The first page
+ *  in a dir has first the agent's panes in Herdr that report one there, not a slot's. */
+async function importableAt(req: Request, store: Store, cfg: Config, herdrSocket: () => Promise<string>, p: URLSearchParams): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  const agent = p.get("agent") as AgentKind;
+  const words = (p.get("q") ?? "").trim();
+  if (!AGENT_KINDS.includes(agent) || (!p.get("dir") && !words)) return new Response("要 agent，和 dir 或 q。\n", { status: 400 });
+  const dir = p.get("dir") ? pathOf(p.get("dir")!) : undefined;
+  const search = words ? { words, full: p.get("full") === "1" } : undefined;
+  const taken = used(store);
+  // Its panes there: a slot's not, nor one with no conversation reported.
+  type Pane = { pane_id: string; agent_session?: { agent: string; value: string }; foreground_cwd?: string; cwd?: string };
+  const slotsPanes = new Set(store.tx((tx) => tx.find("slot", { mode: "tui" })).map((s) => s.herdrPane));
+  const panes =
+    dir && AGENTS[agent].paneImport && hasHerdr(cfg)
+      ? ((await herdrSocket()
+          .then((at) => request(at, "session.snapshot"))
+          .then((r) => r.snapshot.panes as Pane[], () => [])) as Pane[]).filter((x) => x.agent_session?.agent === agent && (x.foreground_cwd ?? x.cwd) === dir && !slotsPanes.has(x.pane_id) && !taken.has(x.agent_session.value))
+      : [];
+  const open = new Set(panes.map((x) => x.agent_session!.value));
+  const row = (c: Listed, pane?: string): ImportRow => {
+    const { id, file: _, dir: at, ...rest } = c;
+    return { session: id, ...(pane && { pane }), dir: tilde(at ?? dir ?? ""), ...rest };
+  };
+  try {
+    const page = await importable(agent, { dir, search, cursor: p.get("cursor") ?? undefined, skip: (id) => taken.has(id) || open.has(id), signal: req.signal });
+    const first =
+      dir && !p.get("cursor")
+        ? await Promise.all(
+            panes.map(async (x) => {
+              const id = x.agent_session!.value;
+              const file = await transcriptFile(dir, agent, id).catch(() => null);
+              const c = file ? await listed(file, agent, search, undefined, req.signal).catch(() => null) : search ? null : { id, file: "", title: "", at: Date.now(), count: 0 };
+              return c && row(c, x.pane_id);
+            }),
+          )
+        : [];
+    return Response.json({ ...page, list: [...first.filter((r) => r !== null), ...page.list.map((c) => row(c))] } satisfies ImportableData, { headers: { "cache-control": "no-store" } });
+  } catch (e) {
+    if (!req.signal.aborted) throw e;
+    log("import search stopped: the page went", { agent });
+    return new Response(null, { status: 499 });
+  }
+}
+
+/** GET /api/importable/messages: what you and the agent said on a page of a conversation to import;
+ *  before, where the page before it ends, while there is one. */
+export type ImportPreviewData = { blocks: Extract<Block, { kind: "user" | "assistant" }>[]; before?: number };
+
+/** What GET /api/importable/messages answers (architecture §7.10): a page back from before, the end
+ *  for none, of the agent's conversation session, by its whole id alone, in whatever directory it was
+ *  started; what you and the agent said on it, nothing else. Read only, of a slot's too. */
+async function importPreview(req: Request, p: URLSearchParams): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  const agent = p.get("agent") as AgentKind;
+  const session = p.get("session") ?? "";
+  const before = p.get("before") === null ? Infinity : count(p.get("before"));
+  if (!AGENT_KINDS.includes(agent) || Number.isNaN(before)) return new Response("要 agent，before 不对。\n", { status: 400 });
+  // findConversations takes hex digits and "-" alone: no path, no glob.
+  const file = /^[0-9a-f-]+$/i.test(session) ? (await findConversations(session)).find((c) => c.agent === agent && c.id === session)?.file : undefined;
+  if (!file) return new Response("没有这段对话。\n", { status: 404 });
+  const page = await messagePage(file, before, "backward", dirname(file));
+  const blocks = page.blocks.flatMap((b): ImportPreviewData["blocks"] => (b.kind === "user" && b.text ? [{ kind: b.kind, text: b.text, source: b.source, from: null, at: b.at, time: b.time }] : b.kind === "assistant" ? [{ kind: b.kind, text: b.text, at: b.at, time: b.time }] : []));
+  return Response.json({ blocks, ...(page.start > 0 && { before: page.start }) } satisfies ImportPreviewData, { headers: { "cache-control": "no-store" } });
+}
+
 /** The branch the work tree holding dir is on, by its HEAD, as git has it, with no git run: the first
  *  .git up from dir, a folder, or a worktree's file naming its own. None when detached, or in none. */
 async function branchOf(dir: string): Promise<string | undefined> {
@@ -304,6 +428,31 @@ async function avatarOf(cfg: Config, id: string): Promise<string | null> {
 
 /** Your name as kept for a chat (refreshAvatars); null for none. */
 const nameOf = async (cfg: Config, id: string) => (await readOnce("name", join(avatarDir(cfg), `${id}.name`), (f) => Bun.file(f).text()).catch(() => null))?.value ?? null;
+
+/** GET /api/bots/owners?bot=<id> (architecture §8.5.1): a bot's owners, the config's first, from the
+ *  board's own page alone. Each by its code (ownerCode), which rh pair --rm takes from the board; fixed:
+ *  the config's, which stay; chat: your private chat with it, with its name and avatar, where there is
+ *  one. No account (architecture §11). */
+export type OwnersData = { owners: { id: string; fixed: boolean; chat: string | null; name: string | null; avatar: string | null }[] };
+
+async function botOwners(req: Request, store: Store, cfg: Config, id: string): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  const found = store.tx((tx) => {
+    const bot = tx.get("bot", id);
+    return bot && Object.hasOwn(cfg.bots, bot.name) ? { bot, chats: tx.find("chat", { bot: bot.id }) } : null;
+  });
+  if (!found) return new Response("没有这个 Bot。\n", { status: 404 });
+  const fixed = fixedOwners(cfg.bots[found.bot.name]);
+  const data: OwnersData = {
+    owners: await Promise.all(
+      owners(found.bot, cfg).map(async (o) => {
+        const chat = found.chats.find((c) => c.platformChatId === o)?.id ?? null;
+        return { id: ownerCode(o), fixed: fixed.includes(o), chat, name: chat && (await nameOf(cfg, chat)), avatar: chat && (await avatarOf(cfg, chat)) };
+      }),
+    ),
+  };
+  return Response.json(data, { headers: { "cache-control": "no-store" } });
+}
 
 async function topology(store: Store, cfg: Config, now: number): Promise<TopologyData> {
   const data = topologyRows(store, cfg, now);
@@ -678,6 +827,10 @@ export type SlotData = {
   timeline: Episode[];
   /** What its command palette offers (spec web-write "命令面板"). */
   commands: Command[];
+  /** What Rhodium last heard of its conversation's context and use, and its agent's quota (architecture §7.11). */
+  meter: SlotMeter;
+  /** Its agent runs now: its headless process, or in the terminal. */
+  live: boolean;
 };
 
 /** A command in a slot's palette, as IM has it: its name, its arguments and what it does. kind: what
@@ -767,13 +920,41 @@ async function timeline(slot: Slot, conversations: Conversation[]): Promise<Epis
   return episodes.sort((a, b) => (b.lastWrite ?? b.startedAt) - (a.lastWrite ?? a.startedAt));
 }
 
+/** How many of what you said GET /api/history gives, and how long it reads for them. */
+const HISTORY = 100;
+const HISTORY_FOR = 1000;
+
+/** GET /api/history?slot=<id>: what you said in the slot, newest first, the same twice in a row once,
+ *  for the page's ↑ (architecture §7.10): from its current conversation back along its timeline. The
+ *  board's own page alone, as for /api/dirs: it is what you said (architecture §11). */
+async function history(req: Request, store: Store, id: string): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  const found = store.tx((tx) => {
+    const slot = tx.get("slot", id);
+    return slot && { slot, conversations: tx.find("conversation", { slot: id }) };
+  });
+  if (!found) return new Response("没有这个槽位。\n", { status: 404 });
+  const { slot, conversations } = found;
+  const episodes = (await timeline(slot, conversations)).sort((a, b) => Number(b.current) - Number(a.current));
+  const said: string[] = [];
+  const take = (words: string) => (said.at(-1) === words || said.push(words), said.length < HISTORY);
+  const deadline = Date.now() + HISTORY_FOR;
+  for (const e of episodes) {
+    const c = conversations.find((c) => c.id === e.id)!;
+    const file = c.sessionId ? await transcriptFile(slot.dir, c.agent, c.sessionId) : null;
+    if (file && !(await yoursSaid(file, take, deadline).catch(() => true))) break;
+  }
+  return Response.json({ said }, { headers: { "cache-control": "no-store" } });
+}
+
 /** How long an ask answered stays in a slot's gone, by its ask_answered event: past the next refresh
  *  of a page that showed it. Among the slot's last 20 events. */
 const GONE_FOR = 10_000;
 
 /** GET /api/slot?id=<id>: the slot (product §7) and its timeline; its events are on /api/slot-events.
  *  A headless slot also has its process. */
-async function slotDetail(store: Store, cfg: Config, id: string): Promise<Response> {
+async function slotDetail(store: Store, cfg: Config, id: string, alive: BoardMeter["alive"], hearing: Set<Hear>): Promise<Response> {
+  await terminalMeter(store, id, hearing);
   const detail = store.tx((tx) => {
     const s = tx.get("slot", id);
     if (!s) return null;
@@ -806,6 +987,8 @@ async function slotDetail(store: Store, cfg: Config, id: string): Promise<Respon
         return [{ id: ask, why: askGone({ bots: tx.find("bot", {}), chats: tx.find("chat", {}) }, { config: cfg }, by) }];
       }),
       queue: queueOf(tx, s),
+      meter: meterOf(tx, conv),
+      live: s.mode === "tui" || (s.conversation !== null && alive(s.conversation)),
       conversation: s.conversation,
       slot: s,
       conversations: tx.find("conversation", { slot: s.id }),
@@ -815,6 +998,19 @@ async function slotDetail(store: Store, cfg: Config, id: string): Promise<Respon
   const { conversation, slot, conversations, ...view } = detail;
   const data: SlotData = { ...view, process: view.mode === "headless" ? await processOf(store, cfg, conversation) : null, timeline: await timeline(slot, conversations), commands: commandsFor(view.agent) };
   return Response.json(data, { headers: { "cache-control": "no-store" } });
+}
+
+/** A slot in the terminal has no driver to ask: what its transcript says of the context, and Codex's of
+ *  the quota, is taken in (architecture §7.11), read again only once the file changes; hearing tells
+ *  every stream when it records anything. A transcript that cannot be read only leaves what was heard. */
+async function terminalMeter(store: Store, slot: string, hearing: Set<Hear>): Promise<void> {
+  const conv = store.tx((tx) => {
+    const s = tx.get("slot", slot);
+    return s?.mode === "tui" && s.conversation ? tx.get("conversation", s.conversation) : null;
+  });
+  const file = conv?.sessionId ? await current(store, slot).then((f) => f?.file ?? null) : null;
+  const found = file && (await readOnce(`meter ${conv!.agent}`, file, (f) => meterIn(f, conv!.agent)).catch(() => null));
+  if (found && store.tx((tx) => fromTranscript(tx, tx.get("conversation", conv!.id)!, found.value))) hearing.forEach((hear) => hear(conv!.id, { type: "meter", agent: conv!.agent }));
 }
 
 type Process = NonNullable<Awaited<ReturnType<typeof processOf>>>;
@@ -982,7 +1178,7 @@ const LOOK = 500; // ms between looks at a followed transcript's size
 
 /** What hears a headless agent write (the runner's writing), and that the main loop wrote the rows of
  *  the local pictures in what it said (pictures): the board, once it is up. */
-export type Hear = (conversation: string, e: Extract<AgentEvent, { type: "text_delta" | "item" | "exit" }> | { type: "pictures" }) => void;
+export type Hear = (conversation: string, e: Extract<AgentEvent, { type: "text_delta" | "item" | "exit" }> | { type: "pictures" } | { type: "meter"; agent: AgentKind }) => void;
 
 /** Follows slots' transcripts for the event streams that ask (architecture §7.7): follow(slot, tell)
  *  tells grew each time the slot's current transcript grows, or the slot moves on to another, until
@@ -1020,7 +1216,7 @@ function transcripts(store: Store) {
     };
   };
   const hear: Hear = (conversation, e) => {
-    if (!followed.size) return;
+    if (!followed.size || e.type === "meter") return;
     const f = followed.get(store.tx((tx) => tx.get("conversation", conversation)?.slot) ?? "");
     const event = e.type === "text_delta" ? `event: delta\ndata: ${JSON.stringify({ text: e.text })}\n\n` : `event: ${e.type === "item" ? "said" : e.type}\ndata: {}\n\n`;
     for (const t of f?.streams ?? []) t(event);
@@ -1033,7 +1229,7 @@ function transcripts(store: Store) {
  *  transcript and what its agent writes: with no id, as it is not in the event table. Each stream is
  *  a page open, in fronts by an id of its own, which its first event gives the page to say whether it
  *  is in front (POST /api/front); not in front till it says so, gone once it closes. */
-async function events(store: Store, req: Request, server: Server<Term>, follow: ReturnType<typeof transcripts>["follow"], web: string, fronts: Fronts): Promise<Response> {
+async function events(store: Store, req: Request, server: Server<Term>, follow: ReturnType<typeof transcripts>["follow"], web: string, fronts: Fronts, all: Set<(event: string) => void>, meter: BoardMeter): Promise<Response> {
   server.timeout(req, 0); // Bun drops a connection quiet for durations.boardIdle
   const entry = await entryOf(web);
   const last = Number(req.headers.get("Last-Event-ID") ?? NaN);
@@ -1049,8 +1245,13 @@ async function events(store: Store, req: Request, server: Server<Term>, follow: 
       const unsubscribe = store.subscribe(after, ({ machine, ...e }) => c.enqueue(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`));
       const slot = new URL(req.url).searchParams.get("slot");
       const unfollow = slot ? follow(slot, (event) => c.enqueue(event)) : () => {};
+      // A page opening the slot's chat: its running agent is asked for the meter (architecture §7.11).
+      const conversation = slot ? store.tx((tx) => tx.get("slot", slot)?.conversation) : null;
+      if (conversation) meter.ask(conversation, "open");
+      const tell = (event: string) => c.enqueue(event);
+      all.add(tell);
       const ping = setInterval(() => c.enqueue(": ping\n\n"), 25_000); // and proxies keep it open
-      stop = () => (unsubscribe(), unfollow(), clearInterval(ping), fronts.delete(stream));
+      stop = () => (unsubscribe(), unfollow(), clearInterval(ping), fronts.delete(stream), all.delete(tell));
       req.signal.addEventListener("abort", stop);
     },
     cancel: () => stop(),
@@ -1095,6 +1296,21 @@ async function front(req: Request, fronts: Fronts): Promise<Response> {
   const form = await req.formData().catch(() => null);
   const stream = form?.get("stream");
   if (typeof stream === "string" && fronts.has(stream)) fronts.set(stream, form!.get("front") === "1" ? Date.now() : 0);
+  return new Response(null, { status: 204 });
+}
+
+/** Asks a conversation's running agent for the meter, as a page opens its chat (open) or asks (ask);
+ *  and whether its process runs (architecture §7.11): the slot runner's. */
+export type BoardMeter = { ask(conversation: string, why: "open" | "ask"): void; alive(conversation: string): boolean };
+
+/** POST /api/meter: field slot, from the board's own page alone. Its running agent is asked for the
+ *  meter, answered at once; what it says comes as the event meter. None is started (architecture §7.11). */
+async function askMeter(req: Request, store: Store, meter: BoardMeter): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  if (req.method !== "POST") return new Response("只收 POST。\n", { status: 405, headers: { allow: "POST" } });
+  const slot = (await req.formData().catch(() => null))?.get("slot");
+  const conversation = typeof slot === "string" ? store.tx((tx) => tx.get("slot", slot)?.conversation) : undefined;
+  if (conversation) meter.ask(conversation, "ask");
   return new Response(null, { status: 204 });
 }
 
@@ -1159,6 +1375,50 @@ async function write(req: Request, act: Act): Promise<Response> {
   // The page confirms first: one that skipped its own dialog by mistake ends no agent in your terminal.
   if (found.act.kind === "rh" && found.act.argv[0] === "release" && !found.act.sure) return new Response("收回终端要先确认。\n", { status: 400 });
   return Response.json(await act(found.id, found.act), { headers: { "cache-control": "no-store" } });
+}
+
+/** The board's side of the bot-making flow (architecture §8.5.1), from the board's own page alone:
+ *  POST /api/bots/flow starts one, with JSON name, platform, target, paste and apiRoot (rh bot's
+ *  arguments, --api-root a test's); GET ?id= reads it; DELETE ?id= cancels it; POST
+ *  /api/bots/flow/credentials hands it what you pasted, JSON id and the credentials, which go no
+ *  further than the flow: not through /api/act, so never on the record of acts. Each answers as
+ *  /api/act does, the flow's state in flow, with no lines for rh's terminal. */
+async function botFlow(req: Request, flows: BotFlows | undefined, credentials: boolean): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  if (!flows) return Response.json({ ok: false, error: "这个看板只能看。" } satisfies RhReply);
+  const id = new URL(req.url).searchParams.get("id") ?? "";
+  const body = async (): Promise<Record<string, unknown> | null> => {
+    if (req.headers.get("content-type")?.split(";")[0]!.trim() !== "application/json") return null;
+    const b = await req.json().catch(() => null);
+    return typeof b === "object" && b !== null && !Array.isArray(b) ? b : null;
+  };
+  const strings = (b: Record<string, unknown>) => Object.values(b).every((v) => typeof v === "string");
+  let reply: RhReply;
+  if (credentials) {
+    if (req.method !== "POST") return new Response("只收 POST。\n", { status: 405, headers: { allow: "POST" } });
+    const b = await body();
+    if (!b || !strings(b) || typeof b.id !== "string") return new Response("请求体不对。\n", { status: 400 });
+    const { id: flow, ...pasted } = b as Record<string, string>;
+    reply = await flows.credentials(flow!, Object.fromEntries(Object.entries(pasted)));
+  } else if (req.method === "GET") reply = flows.get(id);
+  else if (req.method === "DELETE") reply = flows.cancel(id);
+  else if (req.method === "POST") {
+    const b = await body();
+    const { name, platform, target, paste, apiRoot } = b ?? {};
+    const str = (v: unknown) => v === undefined || typeof v === "string";
+    if (typeof name !== "string" || typeof platform !== "string" || !str(target) || !str(apiRoot) || !(paste === undefined || typeof paste === "boolean")) {
+      return new Response("请求体不对。\n", { status: 400 });
+    }
+    // As rh bot's arguments; a name starting with - is an option there, which the router turns down as such.
+    const argv = [name, platform, ...(target ? [target as string] : []), ...(paste ? ["--paste"] : []), ...(apiRoot ? ["--api-root", apiRoot as string] : [])];
+    reply = await flows.start(argv, AT_BOARD);
+  } else return new Response("只收 GET、POST 和 DELETE。\n", { status: 405, headers: { allow: "GET, POST, DELETE" } });
+  // rh's lines are the terminal's: the page has the state.
+  if (reply.ok && reply.flow) {
+    const { log: _, ...flow } = reply.flow;
+    reply = { ...reply, flow };
+  }
+  return Response.json(reply, { headers: { "cache-control": "no-store" } });
 }
 
 /** POST /api/send (spec web-write "写请求"): what you typed with what you attached, as multipart
@@ -1340,18 +1600,39 @@ function closeTerminal(ws: ServerWebSocket<Term>, code: number, reason: string, 
 /** Whether the request names as its host this machine, or what reaches the board from elsewhere: the
  *  tailnet (auth tailscale), or one of hosts, exactly (auth none). A page whose own name was made to
  *  point here, in a browser on this machine or behind the proxy, names its own, and gets nothing (spec web-write). */
-function ownHost(req: Request, b: Config["board"]): boolean {
+function ownHost(req: Request, b: BoardEntry): boolean {
   const name = new URL(req.url).hostname;
   return name === "127.0.0.1" || name === "localhost" || (b.auth === "tailscale" ? /(^|\.)ts\.net$/.test(name) : b.hosts.includes(name));
 }
 
-/** Starts the board on <board.bind>:<board.port>; throws if it cannot listen there. It joins hearing,
- *  told what the agents write. web: the page's files. act: does what the page writes; with none, the
- *  board only shows. fronts: the pages open, kept here. */
-export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(), web = WEB, act: Act = async () => ({ ok: false, error: "这个看板只能看。" }), fronts: Fronts = new Map()): Server<Term> {
+/** Starts the board on each of its entries (ADR-0014), [board] then each [[board.extra]], <bind>:<port>,
+ *  one server each over the same state. Each checks a request's host, auth and origin by its own
+ *  entry's items. One that cannot listen is logged and left out, in deaf by its entry's name with why;
+ *  the others go on. A closed board has [board]'s alone. It joins hearing, told what the agents write
+ *  and that a meter was recorded. web: the page's files. act: does what the page writes; with none, the
+ *  board only shows. fronts: the pages open, kept here. meter: the slot runner's; with none, no agent
+ *  runs. Returns the servers listening, in entry order. */
+export function serveBoard(
+  store: Store,
+  cfg: Config,
+  hearing = new Set<Hear>(),
+  web = WEB,
+  act: Act = async () => ({ ok: false, error: "这个看板只能看。" }),
+  fronts: Fronts = new Map(),
+  meter: BoardMeter = { ask: () => {}, alive: () => false },
+  flows?: BotFlows,
+): { servers: Server<Term>[]; deaf: Map<string, string> } {
   const startedAt = Date.now();
   const { follow, hear } = transcripts(store);
+  // Every event stream open: each hears of a meter recorded, with the agent and conversation, for a page
+  // on a slot of that agent to read /api/slot again (architecture §7.11); and of a bot-making flow
+  // changed, by its id alone, for a page on it to read it again (architecture §8.5.1).
+  const all = new Set<(event: string) => void>();
+  flows?.watch((id) => all.forEach((t) => t(`event: bot_flow\ndata: ${JSON.stringify({ id })}\n\n`)));
   hearing.add(hear);
+  hearing.add((conversation, e) => {
+    if (e.type === "meter") for (const t of all) t(`event: meter\ndata: ${JSON.stringify({ agent: e.agent, conversation })}\n\n`);
+  });
   /** Each slot's one page terminal open. */
   const terms = new Map<string, ServerWebSocket<Term>>();
   /** Herdr's socket, listed as a terminal first opens; listed again after a try that failed. */
@@ -1361,46 +1642,61 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
       socket = undefined;
       throw err;
     }));
-  return Bun.serve<Term>({
-    hostname: cfg.board.bind,
-    port: cfg.board.port,
-    idleTimeout: Math.ceil(cfg.durations.boardIdle / 1000),
-    maxRequestBodySize: SEND_MAX,
-    fetch: async (req, server) => {
-      const res = await route(req, server);
-      return res && gzipped(req, res);
-    },
-    websocket: {
-      // What the page sends is what you type, which it cuts to fit, a size, a scroll or a click (spec web-terminal).
-      maxPayloadLength: 64 * 1024,
-      // A page that reads too slowly is closed once 1MB waits for it, not left with frames dropped: it
-      // reconnects and gets a whole screen.
-      backpressureLimit: 1 << 20,
-      closeOnBackpressureLimit: true,
-      // Herdr's frames to the page, about a fifth as many bytes: a compressor of the socket's own keeps
-      // what it sent before, as each frame redraws much of the last. The page's few bytes stay as they are.
-      perMessageDeflate: { compress: "dedicated", decompress: false },
-      // Bun pings a page quiet this long, less 2 s: well before a proxy in front drops a socket quiet
-      // too long, Cloudflare's said to at 100 s, nginx's by default at 60 s.
-      idleTimeout: 30,
-      open: (ws) => void openTerminal(store, cfg, ws, terms, herdrSocket),
-      message: (ws, msg) => {
-        if (typeof msg !== "string") return ws.close(1003, "只收文本帧");
-        const line = herdrLine(msg);
-        if (line && ws.data.herdr?.exitCode === null) (ws.data.herdr.stdin.write(line + "\n"), ws.data.herdr.stdin.flush());
-      },
-      close: (ws, code, reason) => closeTerminal(ws, code, reason, terms),
-    },
-  });
+  const servers: Server<Term>[] = [];
+  const deaf = new Map<string, string>();
+  for (const [i, entry] of [cfg.board, ...cfg.board.extra].entries()) {
+    try {
+      servers.push(listen(entry, itemPrefix(i)));
+    } catch (err) {
+      deaf.set(entryName(i), String(err));
+      log("cannot start the board", { entry: entryName(i), bind: entry.bind, port: entry.port, error: String(err) });
+    }
+  }
+  return { servers, deaf };
 
-  function route(req: Request, server: Server<Term>): Response | Promise<Response> | undefined {
-    const b = cfg.board;
-    if (b.closed) return new Response(`看板关着：配置文件 [board] 写错了，${b.closed}。改好后重启 Rhodium。\n`, { status: 503 });
-    if (!ownHost(req, b)) return new Response(b.auth === "tailscale" ? "看板只认 tailnet 和本机的地址。\n" : "看板只认本机的地址和配置文件 [board] hosts 里的主机名。\n", { status: 403 });
+  /** p: how the entry's items are named in what it answers (itemPrefix). */
+  function listen(entry: BoardEntry, p: string): Server<Term> {
+    return Bun.serve<Term>({
+      hostname: entry.bind,
+      port: entry.port,
+      idleTimeout: Math.ceil(cfg.durations.boardIdle / 1000),
+      maxRequestBodySize: SEND_MAX,
+      fetch: async (req, server) => {
+        const res = await route(req, server, entry, p);
+        return res && gzipped(req, res);
+      },
+      websocket: {
+        // What the page sends is what you type, which it cuts to fit, a size, a scroll or a click (spec web-terminal).
+        maxPayloadLength: 64 * 1024,
+        // A page that reads too slowly is closed once 1MB waits for it, not left with frames dropped: it
+        // reconnects and gets a whole screen.
+        backpressureLimit: 1 << 20,
+        closeOnBackpressureLimit: true,
+        // Herdr's frames to the page, about a fifth as many bytes: a compressor of the socket's own keeps
+        // what it sent before, as each frame redraws much of the last. The page's few bytes stay as they are.
+        perMessageDeflate: { compress: "dedicated", decompress: false },
+        // Bun pings a page quiet this long, less 2 s: well before a proxy in front drops a socket quiet
+        // too long, Cloudflare's said to at 100 s, nginx's by default at 60 s.
+        idleTimeout: 30,
+        open: (ws) => void openTerminal(store, cfg, ws, terms, herdrSocket),
+        message: (ws, msg) => {
+          if (typeof msg !== "string") return ws.close(1003, "只收文本帧");
+          const line = herdrLine(msg);
+          if (line && ws.data.herdr?.exitCode === null) (ws.data.herdr.stdin.write(line + "\n"), ws.data.herdr.stdin.flush());
+        },
+        close: (ws, code, reason) => closeTerminal(ws, code, reason, terms),
+      },
+    });
+  }
+
+  /** The request's answer, its host, auth and origin checked by b, the entry it came in, whose items p names. */
+  function route(req: Request, server: Server<Term>, b: BoardEntry, p: string): Response | Promise<Response> | undefined {
+    if (cfg.board.closed) return new Response(`看板关着：配置文件 [board] 写错了，${cfg.board.closed}。改好后重启 Rhodium。\n`, { status: 503 });
+    if (!ownHost(req, b)) return new Response(b.auth === "tailscale" ? "看板只认 tailnet 和本机的地址。\n" : `看板只认本机的地址和配置文件 ${p}hosts 里的主机名。\n`, { status: 403 });
     // Every path, the page and its icons too: only tailscale serve reaches this port from outside. With
     // auth none whoever reaches it is let in, a Tailscale-User-Login they send no more than any header.
     if (b.auth === "tailscale" && (!b.login || req.headers.get("Tailscale-User-Login") !== b.login)) {
-      return new Response("只有配置文件 [board] login 里的 Tailscale 账号能看这个看板。\n", { status: 403 });
+      return new Response(`只有配置文件 ${p}login 里的 Tailscale 账号能看这个看板。\n`, { status: 403 });
     }
     const url = new URL(req.url);
     const path = url.pathname;
@@ -1410,12 +1706,14 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
     switch (path) {
       case "/api/board":
         return board(store, cfg, Date.now()).then((b) => Response.json(b, { headers: { "cache-control": "no-store" } }));
+      case "/api/bots/owners":
+        return botOwners(req, store, cfg, url.searchParams.get("bot") ?? "");
       case "/api/topology":
         return topology(store, cfg, Date.now()).then((t) => Response.json(t, { headers: { "cache-control": "no-store" } }));
       case "/api/avatar":
         return avatar(store, cfg, url.searchParams.get("id") ?? "");
       case "/api/events":
-        return events(store, req, server, follow, web, fronts);
+        return events(store, req, server, follow, web, fronts, all, meter);
       case "/api/messages":
         return messages(store, cfg, url.searchParams);
       case "/api/full":
@@ -1423,13 +1721,22 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
       case "/api/held":
         return heldText(req, store, url.searchParams.get("id") ?? "");
       case "/api/slot":
-        return slotDetail(store, cfg, url.searchParams.get("id") ?? "");
+        return slotDetail(store, cfg, url.searchParams.get("id") ?? "", meter.alive, hearing);
+      case "/api/history":
+        return history(req, store, url.searchParams.get("slot") ?? "");
       case "/api/slot-events":
         return slotEvents(store, url.searchParams);
       // Names anywhere on the disk: the board's own page alone, as for a write.
       case "/api/dirs":
         if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
         return dirs(store, url.searchParams.get("path") ?? "").then((d) => Response.json(d, { headers: { "cache-control": "no-store" } }));
+      case "/api/folder":
+        if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+        return folder(store, url.searchParams.get("path") ?? "").then((f) => Response.json(f, { headers: { "cache-control": "no-store" } }));
+      case "/api/importable":
+        return importableAt(req, store, cfg, herdrSocket, url.searchParams);
+      case "/api/importable/messages":
+        return importPreview(req, url.searchParams);
       // What the page times the round trip by (#286).
       case "/api/ping":
         return new Response(null, { status: 204 });
@@ -1439,6 +1746,8 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
         return write(req, act);
       case "/api/front":
         return front(req, fronts);
+      case "/api/meter":
+        return askMeter(req, store, meter);
       case "/api/send":
         return sendWith(req, act, join(cfg.stateDir, "media"));
       case "/api/media":
@@ -1447,6 +1756,9 @@ export function serveBoard(store: Store, cfg: Config, hearing = new Set<Hear>(),
         return file(req, store, url.searchParams);
       case "/api/terminal":
         return terminalUpgrade(req, server);
+      case "/api/bots/flow":
+      case "/api/bots/flow/credentials":
+        return botFlow(req, flows, path.endsWith("/credentials"));
     }
     // The URL parser has resolved any . and .. in the path.
     return webFile(web, path, req.headers.get("accept-encoding") ?? "");

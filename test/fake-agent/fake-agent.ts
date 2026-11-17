@@ -146,6 +146,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * actually chose. One the agent sent (say, the `request_id` of `can_use_tool`,
  * or the `id` of pi's `extension_ui_request`) must come back exactly.
  */
+const METER_ASKS = new Set(["get_usage", "get_context_usage", "get_session_stats", "account/rateLimits/read"]);
+/** An error answer to a meter ask, in its agent's protocol: Claude's control request, pi's command, Codex's request. */
+const notRecorded = (m: any) =>
+  m.request ? { type: "control_response", response: { subtype: "error", request_id: m.request_id, error: "not recorded" } } : m.method ? { id: m.id, error: { code: -32601, message: "not recorded" } } : { type: "response", id: m.id, command: m.type, success: false, error: "not recorded" };
+
 async function replay(fixture: string, lines: AsyncGenerator<string>, sourceLines: string[] = []) {
   const out = readFileSync(join(fixture, "out.log"));
   // Codex's recordings come from a probe, not from Rhodium: see codexMatch.
@@ -191,9 +196,21 @@ async function replay(fixture: string, lines: AsyncGenerator<string>, sourceLine
 
   const wasSent = (v: string) => out.subarray(0, sent).includes(JSON.stringify(v));
 
+  // What Rhodium asks a running agent for its meter, at each turn's end (architecture §7.11), comes
+  // wherever the recording has none: answered with an error, as an agent that cannot say.
+  const next = async (want?: string) => {
+    for (;;) {
+      const got = await lines.next();
+      const m = got.done ? undefined : (parse(got.value!) as any);
+      const w = want === undefined ? undefined : (parse(want) as any);
+      const kind = (v: any) => v?.request?.subtype ?? (v?.type === "get_session_stats" ? v.type : v?.method);
+      if (!METER_ASKS.has(kind(m)) || kind(m) === kind(w)) return got;
+      write(Buffer.from(JSON.stringify(notRecorded(m)) + "\n"));
+    }
+  };
   for (const [i, want] of inputs.entries()) {
     sendUpTo(want.at);
-    const got = await lines.next();
+    const got = await next(want.line);
     // The probe asked more than a client needs to, or answered what Codex no longer waited on, its
     // request resolved already (interrupt-pending-approval); one that stops before those lines is done.
     const resolved = (id: unknown) => out.subarray(0, sent).includes(`"requestId":${JSON.stringify(id)}}`);
@@ -203,7 +220,7 @@ async function replay(fixture: string, lines: AsyncGenerator<string>, sourceLine
     if (d) fail(`in.log line ${i + 1}: ${d}\nexpected\n  ${want.line}\ngot\n  ${got.value}`);
   }
   sendUpTo(out.length);
-  const extra = await lines.next();
+  const extra = await next();
   if (!extra.done) fail(`unexpected line after the recording ends:\n  ${extra.value}`);
   process.exit(0);
 }

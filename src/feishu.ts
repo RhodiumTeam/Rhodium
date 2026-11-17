@@ -121,7 +121,7 @@ export class FeishuAdapter implements ImAdapter {
    *  Feishu to push again (spec "长连接和回执"). Each time it is up, what you sent meanwhile is
    *  backfilled, ahead of what is pushed after (spec "补拉"). One rhodium took in already is acked
    *  and skipped, never read again. Ending the iteration closes the connection. */
-  messages(connected: Connected = () => {}): AsyncIterable<InboundMessage> {
+  messages(connected: Connected = () => {}, stop?: AbortSignal): AsyncIterable<InboundMessage> {
     const queue: Pending[] = [];
     let handed: Pending | undefined; // the message rhodium has, acked at its next ask
     let waiting: ((p: Pending | undefined) => void) | undefined;
@@ -207,6 +207,7 @@ export class FeishuAdapter implements ImAdapter {
     };
     void connect();
 
+    stop?.addEventListener("abort", () => void iterator.return!());
     const iterator: AsyncIterator<InboundMessage> = {
       next: async () => {
         handed?.took();

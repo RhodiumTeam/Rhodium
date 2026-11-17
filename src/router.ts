@@ -7,11 +7,12 @@ import { parseArgs } from "node:util";
 import { AGENT_KINDS, AGENTS, DEFAULT_AGENT, TYPING } from "./agents";
 import { askButtons, askLine, askText, parseAnswer, timeoutAnswer, type Answer, type AskKind, type AskPrompt, type ConfirmInput, type Said } from "./asks";
 import { COMMANDS, IM_COMMANDS, homeButtons, imCommand, imUsage, QQ_ROW, SETTINGS, slashMenu, SLOT_HINT, TELEGRAM_ROW, tilde, type Lists, type SettingKey, type SlotEntry } from "./commands";
-import { formatDuration, formatGB, fixedOwners, formatMB, gb, memoryText, owners, paired, parseDuration, type Config } from "./config";
+import { formatDuration, formatGB, fixedOwners, formatMB, gb, memoryText, ownerCode, owners, paired, parseDuration, type Config } from "./config";
 import { FROM_BOARD, parseCommand, quoteOf, quoting, type AgentAsk, type AgentEvent, type AgentKind, type BoardAct, type Button, type Capabilities, type Choice, type CommandResult, type CommonCommand, type Importable, type InboundMessage, type Input, type MenuItem, type PanelUi, type RowButton, type RhCaller, type TimerKind, type Used } from "./contracts";
 import { contextText, formatCommand, left, statusText, time, usageText, type SlotInfo } from "./im-commands";
 import { fileKind, mediaLine, withoutMedia, type Media } from "./media";
 import { buttonRows, CANCEL, layout, moment, PAGE, showPanel, span, unpaged, width, type Candidate, type Panel } from "./panels";
+import type { FlowView } from "./bot-flow";
 import { amid, MADE, PLATFORMS, series, type BotDef, type Made } from "./platforms";
 import { DECISION_LINE, REPORT_LINE, RESUME_PROMPT, sendLine, sourceLine, withoutSource } from "./prompt";
 import { forIm, localRefs, type Checked } from "./reply-images";
@@ -74,6 +75,8 @@ export type TurnProgress = Progress & { live?: string; chat?: string; left?: str
  *  front: whether a page of the board is in front on some device, as the pages tell it (product §5.9).
  *  retarget: points each bot whose target is the slot from at to, in the config file (config.ts's
  *  renameTarget) and in config; throws when the file cannot be changed so.
+ *  dropBot: takes [bots.<name>] out of the config file (config.ts's removeBot) and out of config;
+ *  throws when the file cannot be changed so (rh bot rm).
  *  inboundOf: the ids of the chat's inbound messages on record, read when asked (rh forget). */
 export type Ctx = {
   now: number;
@@ -86,6 +89,7 @@ export type Ctx = {
   herdr: () => boolean;
   front: () => boolean;
   retarget: (from: string, to: string) => { bots: string[]; backup: string } | null;
+  dropBot: (name: string) => void;
   inboundOf: (chat: string) => string[];
 };
 
@@ -100,7 +104,8 @@ export type Write = {
  *  it made, rh new's or an import's, whose chat the page opens; panel: on
  *  the board, what to pick from, as a panel shows it in IM, every candidate at once (spec web-write
  *  "面板回网页"): picked, its command goes as typed; head, the panel's lines, is text too. gone: an
- *  answer from the board to an ask that takes none any more, error saying where or why. */
+ *  answer from the board to an ask that takes none any more, error saying where or why. flow: a
+ *  bot-making flow's state, as rhodium answers rh bot and the board about it (bot-flow.ts). */
 /** A query's data, as the driver gave it, for the board's info card (spec info-commands "网页"); /usage's
  *  with the agent it is of, whose name its quota goes by. */
 export type InfoCard = Extract<CommandResult, { command: "context" }> | (Extract<CommandResult, { command: "usage" }> & { agent: AgentKind }) | StatusCard;
@@ -109,7 +114,7 @@ export type InfoCard = Extract<CommandResult, { command: "context" }> | (Extract
  *  run, none in the terminal (spec info-commands "网页"). */
 export type StatusCard = Extract<CommandResult, { command: "status" }> & { ref: string; agent: AgentKind; dir: string; line: string; tool?: string; actions: string[] };
 export type RhReply =
-  | { ok: true; text: string; undo?: BoardAct; slot?: string; panel?: { head: string[]; candidates: Candidate[] }; card?: InfoCard }
+  | { ok: true; text: string; undo?: BoardAct; slot?: string; panel?: { head: string[]; candidates: Candidate[] }; card?: InfoCard; flow?: Omit<FlowView, "log"> & Partial<Pick<FlowView, "log">> }
   | { ok: false; error: string; gone?: true };
 
 /** Handed off after the commit. A timer with at = null cancels it. */
@@ -119,6 +124,11 @@ export type Effect =
   // Append [bots.<name>] to the config file and take the bot in. Should the write fail, it answers
   // rh call id with why, and the rh_reply after it finds no one waiting.
   | { kind: "add_bot"; id: string; name: string; table: Record<string, string> }
+  // rh bot rm (architecture §14.8): disconnect the bot (its row id), taken out of the config already.
+  | { kind: "drop_bot"; bot: string }
+  // With no main chat in the config, make your private chat with the bot (its name) the main chat, in
+  // the file and as rhodium runs (architecture §8.5.1); one that can't be written is only logged.
+  | { kind: "main_chat"; bot: string; chat: string }
   // Fetch this bot's profile now (spec web-topology "头像"): your private chat with it has just appeared.
   | { kind: "avatars"; bot: string }
   | { kind: "timer"; timer: TimerKind; key: string; at: number | null }
@@ -359,7 +369,7 @@ export const BOARD = "board";
 const WEB = "web";
 /** The rh commands the board sends (spec web-write "写请求"): what its buttons do. Not a guard, as any
  *  program here can reach the rh socket: it keeps the board to what the page has. */
-const BOARD_RH = ["agent", "tui", "release", "stop", "archive", "unarchive", "rm", "rename", "set", "new", "ws", "import"];
+const BOARD_RH = ["agent", "tui", "release", "stop", "archive", "unarchive", "rm", "rename", "set", "new", "ws", "import", "bot", "pair"];
 
 /** A write from the board (spec web-write): yours, as at a terminal, by no chat; what it brings about is
  *  the board's, under the request's id. Done once: sent again, it says so. The answer goes back to the
@@ -384,7 +394,9 @@ function board(state: State, { id, act }: Extract<Input, { kind: "board" }>, ctx
     else {
       const [name, ...rest] = act.argv;
       // The emergency stop is not for a phone (product §7): rh stop <slot> only stops that slot.
-      if (!BOARD_RH.includes(name!) || (name === "stop" && (rest.length !== 1 || rest[0]!.startsWith("-")))) refuse(`看板不做 rh ${act.argv.join(" ")}。`);
+      // Of rh bot, only rh bot rm <name> (spec web-bots): a bot is made by its own flow.
+      const off = (name === "stop" && (rest.length !== 1 || rest[0]!.startsWith("-"))) || (name === "bot" && (rest.length !== 2 || rest[0] !== "rm"));
+      if (!BOARD_RH.includes(name!) || off) refuse(`看板不做 rh ${act.argv.join(" ")}。`);
       // A directory as you write it on a phone, under ~, which no shell expands here: a new workspace's,
       // or the one to look in for what to import.
       const argv = act.argv.map((a, i) => ((name === "ws" && i === 2) || (name === "import" && act.argv[i - 1] === "--dir") ? a.replace(/^~(?=\/|$)/, homedir()) : a));
@@ -416,7 +428,7 @@ function board(state: State, { id, act }: Extract<Input, { kind: "board" }>, ctx
 }
 
 /** The board's rh calls are yours, as at a terminal. */
-const AT_BOARD: RhCaller = { token: null, pid: null, tty: true, cwd: "/" };
+export const AT_BOARD: RhCaller = { token: null, pid: null, tty: true, cwd: "/" };
 
 /** What undoes the board's archive of s (spec web-write "归档和撤销"): s back, and each chat the archive
  *  took back to its bot's default pointed at s again, if it is still as the archive left it. */
@@ -691,7 +703,9 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   if ((bot.pairAdd || !ctx.config.bots[bot.name]?.owner) && bot.pairCode !== null && ctx.now < bot.pairUntil! && m.text.trim().toUpperCase() === bot.pairCode) {
     const now = bot.pairAdd ? [...paired(bot).filter((o) => o !== m.sender), m.sender] : [m.sender];
     d.writes.push({ op: "update", table: "bot", where: { id: bot.id }, patch: { owners: JSON.stringify(now), pairCode: null, pairUntil: null, pairAdd: null } });
-    d.events.push({ source: "im", type: "bot_paired", trace: id, data: { bot: bot.name } });
+    d.events.push({ source: "im", type: "bot_paired", trace: id, data: { bot: bot.name, id: bot.id } });
+    // The bot's first account of yours, with no main chat yet: your private chat with it is one (story 680).
+    if (!ctx.config.mainChat && m.chat === m.sender && !owners(bot, ctx.config).length) d.effects.push({ kind: "main_chat", bot: bot.name, chat: m.chat });
     if (m.chat === m.sender) d.effects.push({ kind: "avatars", bot: bot.id });
     reply(d, ctx, chat.id, id, `已配对，以后 Bot ${bot.name} ${bot.pairAdd ? "也" : "只"}认这个账号。`);
     return record(null, "配对");
@@ -3899,7 +3913,7 @@ function releaseHeld(state: State, ctx: Ctx, d: Decision, to: To, held: Outbound
 }
 
 // Names end up in commands typed on a phone: letters and digits of any script, plus _ . -
-const NAME = /^[\p{L}\p{N}][\p{L}\p{N}_.-]{0,63}$/u;
+export const NAME = /^[\p{L}\p{N}][\p{L}\p{N}_.-]{0,63}$/u;
 /** A bot's name is a bare TOML key, so rh bot writes [bots.<name>] as it is. */
 const BOT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -3971,7 +3985,8 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
 
   // Product §6.2. These guard against mistakes, not malice (architecture §11).
   if (who.kind !== "you") {
-    if (def.who === "you" || brake || replace) {
+    // rh bot rm alone is not yours only: an agent's asks you (architecture §14.8).
+    if (def.who === "you" || brake || replace || (def.name === "bot" && pos[0] !== "rm")) {
       const cmd = replace ? "不带参数的 rh pair" : `rh ${def.name}${brake ? " --all" : ""}`;
       refuse(`${cmd} 只有用户本人能用` + (who.kind === "slot" ? "，agent 调用一律拒绝。" : `。${UNKNOWN}`));
     }
@@ -4290,9 +4305,32 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       return `${who.kind === "you" && who.im ? "这个 Bot" : `Bot ${bot.name}`} 的默认槽位改成 ${slotView(state, s).ref}。单独选过槽位的窗口不受影响。`;
     }
 
-    // Product §5.11. rh asks twice: first with no credentials, so a wrong name or slot shows before
-    // you scan or paste anything; then with what the scan or paste gave, to write the bot in.
+    // Product §5.11. A bot-making flow (bot-flow.ts) asks twice: first with no credentials, so a wrong
+    // name or slot shows before you scan or paste anything; then with what the scan or paste gave, to
+    // write the bot in.
     case "bot": {
+      if (pos[0] === "rm") {
+        if (pos.length !== 2 || values.paste || values["api-root"] !== undefined) usage();
+        // The board may name it by its Rhodium id, as rh pair: its page may show a label.
+        const board = who.kind === "you" && who.board === true;
+        const found = state.bots.find((b) => b.name === pos[1] || (board && b.id === pos[1]));
+        const bot = (found && Object.hasOwn(ctx.config.bots, found.name) && found) || refuse(`没有 Bot ${pos[1]}。${Object.hasOwn(MADE, pos[1]!) ? "Bot 不能叫 rm：rh bot rm 是去掉 Bot 用的。" : ""}`);
+        const name = bot.name;
+        // You would have no chat left to drive Rhodium from (product §5.11).
+        if (ctx.config.mainChat?.bot === name) refuse(`Bot ${name} 是主 Bot，主窗口在它上面，不能去掉。要去掉它，先改配置文件里的 mainChat。`);
+        // Last of all, as it writes the file: a refusal after it would leave the bot out of the file alone.
+        // ponytail: the store's transaction may still fail after it, which never happens in practice.
+        try {
+          ctx.dropBot(name);
+        } catch (err) {
+          refuse(`没能从配置文件里删掉 Bot ${name}：${(err as Error).message}`);
+        }
+        // Its row stays, for its chats and messages; what a new bot of its name must not take over goes.
+        d.writes.push({ op: "update", table: "bot", where: { id: bot.id }, patch: { owners: null, pairCode: null, pairUntil: null, pairAdd: null, defaultTarget: null, menuHash: null, rowHash: null, connState: null } });
+        d.events.push({ source: "rh", type: "bot_removed", data: { bot: name } });
+        d.effects.push({ kind: "drop_bot", bot: bot.id });
+        return `已去掉 Bot ${name}：断开了连接，从配置文件里删掉了它。平台上的 Bot 本身还在，要删得到平台上删。`;
+      }
       if (pos.length < 2 || pos.length > 3) usage();
       const [name, platform, ref] = pos as [string, string, string?];
       if (!BOT_NAME.test(name)) refuse(`Bot 名字只能由英文字母、数字和 _ - 组成，不超过 64 个字符：${name}`);
@@ -4300,7 +4338,8 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       if (name === "web") refuse("Bot 不能叫 web：还在跑的 agent 可能照旧写 rh send web。");
       if (!Object.hasOwn(MADE, platform)) refuse(`平台只能是 ${series(Object.keys(MADE), "或")}：${platform}`);
       const how = MADE[platform as Made];
-      if (state.bots.some((b) => b.name === name) || Object.hasOwn(ctx.config.bots, name)) refuse(`已经有 Bot ${name}。`);
+      // Not the row of one rh bot rm took out, which a bot of its name takes over (architecture §14.8).
+      if (Object.hasOwn(ctx.config.bots, name)) refuse(`已经有 Bot ${name}。`);
       const apiRoot = values["api-root"];
       // The platforms that take it, by label: Telegram 和飞书.
       const only = (takes: (b: BotDef) => unknown) => amid(series((Object.keys(MADE) as Made[]).filter((p) => takes(MADE[p])).map((p) => PLATFORMS[p].label), "和")).trimEnd();
@@ -4330,7 +4369,15 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
 
     case "pair": {
       if (pos.length !== 1 || Number(!!add) + Number(rm !== undefined) + Number(!!list) > 1) usage();
-      const bot = state.bots.find((b) => b.name === pos[0]) ?? refuse(`没有 Bot ${pos[0]}。`);
+      // The board names a bot by its id, and an owner by its code, never the account (architecture §8.5.1,
+      // §11); it pairs only beside the owners, as the page has no use for a pairing in place of them.
+      const board = who.kind === "you" && who.board === true;
+      if (board && replace) refuse("看板只做 rh pair 的 --add、--list、--rm。");
+      // Not one rh bot rm took out: a bot of its name would take a code over with its row.
+      const bot =
+        state.bots.find((b) => (b.name === pos[0] || (board && b.id === pos[0])) && Object.hasOwn(ctx.config.bots, b.name)) ??
+        refuse(`没有 Bot ${pos[0]}。`);
+      const shown = (o: string) => (board ? ownerCode(o) : o);
       // The config's owners are its, whatever pairing does (product §5.11).
       const fixed = fixedOwners(ctx.config.bots[bot.name]);
       if (list) {
@@ -4341,12 +4388,14 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
           const s = chat && target(state, bot, chat, ctx);
           return s ? `：私聊交给 ${slotView(state, s).ref}` : "";
         };
-        return all.length ? [`Bot ${bot.name} 的主人：`, ...all.map((o) => `${o}${fixed.includes(o) ? "（配置）" : ""}${goes(o)}`)].join("\n") : `Bot ${bot.name} 还没配对。`;
+        return all.length ? [`Bot ${bot.name} 的主人：`, ...all.map((o) => `${shown(o)}${fixed.includes(o) ? "（配置）" : ""}${goes(o)}`)].join("\n") : `Bot ${bot.name} 还没配对。`;
       }
       if (rm !== undefined) {
-        if (fixed.includes(rm)) refuse(`${rm} 是 Bot ${bot.name} 配置里写的主人，以配置为准。要去掉，改配置文件里的 owner。`);
-        if (!paired(bot).includes(rm)) refuse(`${rm} 不是 Bot ${bot.name} 的主人。`);
-        d.writes.push({ op: "update", table: "bot", where: { id: bot.id }, patch: { owners: JSON.stringify(paired(bot).filter((o) => o !== rm)) } });
+        // What the board names stays as it named it in what rh says.
+        const account = board ? (owners(bot, ctx.config).find((o) => ownerCode(o) === rm) ?? rm) : rm;
+        if (fixed.includes(account)) refuse(`${rm} 是 Bot ${bot.name} 配置里写的主人，以配置为准。要去掉，改配置文件里的 owner。`);
+        if (!paired(bot).includes(account)) refuse(`${rm} 不是 Bot ${bot.name} 的主人。`);
+        d.writes.push({ op: "update", table: "bot", where: { id: bot.id }, patch: { owners: JSON.stringify(paired(bot).filter((o) => o !== account)) } });
         d.events.push({ source: "rh", type: "bot_owner_removed", data: { bot: bot.name } });
         // No account: agreed to an unknown caller's request, this goes to IM (docs/im-style.md §2.6).
         return `已去掉${amid(botName(ctx, bot))}的一个主人。`;
@@ -4356,7 +4405,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       const code = ctx.newPairCode();
       const until = ctx.now + ctx.config.durations.pairCode;
       d.writes.push({ op: "update", table: "bot", where: { id: bot.id }, patch: { pairCode: code, pairUntil: until, pairAdd: add ? 1 : null } });
-      d.events.push({ source: "rh", type: "pair_code", data: { bot: bot.name, until } }); // never the code itself
+      d.events.push({ source: "rh", type: "pair_code", data: { bot: bot.name, id: bot.id, until } }); // never the code itself
       // Not you at your terminal: the code goes to you in IM, never in rh's reply, which an agent led
       // astray might pass on (product §5.11). An unknown caller's, agreed, has no slot: the main chat.
       if (who.kind !== "you" || who.via !== undefined) {
@@ -4697,6 +4746,7 @@ function splitChat(ref: string): [string, string] | undefined {
  */
 function needsYou(state: State, ctx: Ctx, name: string, pos: string[], rm: string | undefined, caller: Slot): boolean {
   if (name === "pair") return rm !== undefined;
+  if (name === "bot") return true; // rh bot rm; the rest is yours alone
   const contact = contactChat(state, ctx, nothing(), caller);
   const on = (bot: Bot | undefined): bot is Bot => !!bot && contact?.bot === bot.id;
   if (name === "forget") {
@@ -4785,7 +4835,7 @@ function confirm(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decisio
   // Tried as yours first: a mistake is refused now, and a call that would change nothing asks no one.
   // What it would do is dropped, and it copies no file.
   const dry = nothing();
-  const out = rh(state, input, { kind: "you" }, { ...ctx, keepFile: (path) => ({ size: 0, path }), retarget: () => null }, dry);
+  const out = rh(state, input, { kind: "you" }, { ...ctx, keepFile: (path) => ({ size: 0, path }), retarget: () => null, dropBot: () => {} }, dry);
   if (typeof out === "string" && !dry.writes.length && !dry.effects.length) return out;
   const caller = who.kind === "slot" ? who.slot : undefined;
   const main = ctx.config.mainChat;

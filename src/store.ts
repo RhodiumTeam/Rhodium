@@ -145,6 +145,8 @@ export type Conversation = Row & {
   // itself. Rhodium begins a turn when it hands the agent your message, so a crash before this has
   // no turn to resume (product §4.5). Cleared when the turn ends.
   turnTaken: Flag | null;
+  // JSON of the context and the use of it Rhodium last heard, each with when (meter.ts, architecture §7.11).
+  meter: string | null;
 };
 
 export type Holder = Row & {
@@ -598,6 +600,10 @@ ALTER TABLE slot ADD COLUMN typeIn INTEGER;
   // A slot whose holder unit is held up over MemoryHigh (#692).
   `
 ALTER TABLE slot ADD COLUMN memBlocked TEXT;
+`,
+  // The context and use Rhodium last heard of a conversation (#750).
+  `
+ALTER TABLE conversation ADD COLUMN meter TEXT;
 `,
 ];
 

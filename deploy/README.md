@@ -150,6 +150,20 @@ systemctl --user restart <实例>
 5. 放好上文“日常”的 `rh` 包装。
 6. 建调度员：`mkdir ~/RhodiumWorkplace`，放进 `dispatcher/CLAUDE.md`；`rh ws dispatcher ~/RhodiumWorkplace`，`rh new dispatcher/main`。
 7. 发布看板：`tailscale serve --bg --https=<端口> http://127.0.0.1:<端口>`。只用带 `--https=<端口>` 的写法，不带的会占 443、覆盖已有条目。
+   - 还要经 Cloudflare Tunnel 加 Access 从外面开时，再加一个入口，让 `cloudflared` 只转到它（`[[board.extra]]`，见[规格·配置](../docs/spec/v1.md#配置)）：
+
+     ```toml
+     [board]
+     port = 7800
+     login = "you@example.com"
+
+     [[board.extra]]
+     port = 7802
+     auth = "none"
+     hosts = ["board.example.com"]
+     ```
+
+   - `cloudflared` 的 `service` 写 `http://127.0.0.1:7802`，不写 `httpHostHeader`。改完重启实例，跑 `rh doctor` 看两个入口都没报错。
 
 ## 卸载
 

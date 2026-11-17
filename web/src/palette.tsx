@@ -4,13 +4,13 @@
 import { Slider } from "@base-ui/react/slider";
 import { cn } from "cn";
 import { Bot, Box, Brain, ChartPie, Check, ChevronRight, FoldVertical, Gauge, History, Info, LoaderCircle, Search, Slash, Square, SquarePen, Workflow, type LucideIcon } from "lucide-react";
-import { Fragment, useEffect, useRef, useState, type CSSProperties } from "react";
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 import { AGENT_KINDS } from "../../src/agents";
 import type { AgentKind } from "../../src/contracts";
 import type { Candidate } from "../../src/panels";
 import type { RhReply } from "../../src/router";
 import { AgentLogo, agentName, ModelName, useEdges } from "./common";
-import { CardFrame } from "./card";
+import { CardFrame, PopFrame } from "./card";
 import { buttonVariants } from "./components/ui/button";
 import type { Command } from "./data";
 import { toast } from "./toast";
@@ -119,10 +119,10 @@ const Spinning = () => <LoaderCircle className="size-4 shrink-0 animate-spin" />
 const Now = () => <Check aria-label="现在" className="size-4 shrink-0 text-running" />;
 
 
-/** The agent sheet (story 303), /rh_agent's panel on the board: Claude and pi, the one now ticked. The
- *  other picked switches to it, a new conversation; while a turn runs it asks first: once the turn is
- *  over, or cutting it short. */
-export function AgentSheet({ open, close, agent, turn, send }: { open: boolean; close: () => void; agent: AgentKind; turn: boolean; send: Send }) {
+/** The agent sheet (story 303), /rh_agent's panel on the board, a popover by the agent's logo, anchor
+ *  (#761): the agents, the one now ticked. The other picked switches to it, a new conversation; while a
+ *  turn runs it asks first: once the turn is over, or cutting it short. */
+export function AgentSheet({ open, anchor, close, agent, turn, send }: { open: boolean; anchor: RefObject<HTMLElement | null>; close: () => void; agent: AgentKind; turn: boolean; send: Send }) {
   const [picked, setPicked] = useState<AgentKind | null>(null);
   const [pressed, setPressed] = useState<string | null>(null);
   if (!open && (picked || pressed)) (setPicked(null), setPressed(null));
@@ -134,9 +134,8 @@ export function AgentSheet({ open, close, agent, turn, send }: { open: boolean; 
     close();
     toast(r.text);
   };
-  if (!open) return null;
   return (
-    <CardFrame icon={Bot} title="Agent" close={close}>
+    <PopFrame open={open} anchor={anchor} label="换 agent" icon={Bot} title="Agent" close={close}>
       <div className="grid px-2 pb-2">
         {AGENT_KINDS.map((a) => (
           <button key={a} disabled={pressed !== null} onClick={() => (a === agent ? close() : turn ? setPicked(a) : void go(a, a))} className={cn(ROW, picked === a && "bg-accent")}>
@@ -156,9 +155,11 @@ export function AgentSheet({ open, close, agent, turn, send }: { open: boolean; 
           </button>
         </div>
       )}
-    </CardFrame>
+    </PopFrame>
   );
 }
+
+const NO_ULTRA = "这个模型用不了 ultracode";
 
 /** More models than this, IM's page of them, and the sheet has a search box (story 528). */
 const MANY = 8;
@@ -168,22 +169,22 @@ function resting(all: Candidate[]) {
   return new Set(all.length > MANY ? all.map((c) => c.group).filter((g) => g !== open) : []);
 }
 
-/** The model sheet (story 304): /model's and /effort's panels in one, the models on top and the
+/** The model sheet (story 304), a popover by the model button, anchor (story 655): /model's and /effort's panels in one, the models on top and the
  *  thinking levels of the one in use under them, as IM offers them, the one now ticked (story 299).
  *  A model picked is in use at once, the levels under it becoming its own, or, with none, the sheet
- *  closes. Each part a row of its own: under the levels' slider ultracode's switch, where the agent can
- *  take it, asked again for a model picked; flipped, the sheet stays open (#276). The levels and the
- *  switch are the card's foot, in sight however long the list (story 520). Over MANY models, a search
+ *  closes. At the right end of the levels' row, or of the one level's name, ultracode's key, where the
+ *  agent can take it, asked again for a model picked; flipped, the sheet stays open (#276, #761). The levels and the
+ *  key are the card's foot, in sight however long the list (story 520). Over MANY models, a search
  *  box on top finds them by name or group, the keyboard taken at once only with a mouse (story 528).
  *  Models of more than one group, pi's providers, under a header each that folds them (story 529). */
-export function ModelSheet({ open, close, send }: { open: boolean; close: () => void; send: Send }) {
+export function ModelSheet({ open, anchor, close, send }: { open: boolean; anchor: RefObject<HTMLElement | null>; close: () => void; send: Send }) {
   const [models, setModels] = useState<Candidate[] | null>(null);
   const [query, setQuery] = useState("");
   const [folded, setFolded] = useState<Set<string | undefined>>(new Set());
   const [levels, setLevels] = useState<Candidate[] | null>(null);
   const [pressed, setPressed] = useState<Candidate | null>(null);
-  // null: not known, or not to be had (pi, a model without it).
-  const [ultra, setUltra] = useState<boolean | null>(null);
+  // "no": a model without it (#761); null: not known, or not to be had (pi, Codex).
+  const [ultra, setUltra] = useState<boolean | "no" | null>(null);
   const [flipping, setFlipping] = useState(false);
   // Each opening's own: what comes for one before stays out of the next.
   const opening = useRef(0);
@@ -209,7 +210,7 @@ export function ModelSheet({ open, close, send }: { open: boolean; close: () => 
     return () => void opening.current++;
   }, [open]);
   const askUltra = (at: number) =>
-    void send("/ultracode").then((r) => opening.current === at && setUltra(r.ok && r.panel ? r.panel.candidates.some((c) => c.current && c.command === "/ultracode on") : null));
+    void send("/ultracode").then((r) => opening.current === at && setUltra(!r.ok ? null : r.panel ? r.panel.candidates.some((c) => c.current && c.command === "/ultracode on") : "no"));
   const flip = async () => {
     const at = opening.current;
     setFlipping(true);
@@ -235,7 +236,6 @@ export function ModelSheet({ open, close, send }: { open: boolean; close: () => 
     toast(r.text);
   };
   const busy = pressed !== null;
-  if (!open) return null;
   const q = query.trim().toLowerCase();
   const found = models?.filter((c) => !q || [c.label, c.group].some((s) => s?.toLowerCase().includes(q)));
   const groups = [...new Set(models?.map((c) => c.group))];
@@ -248,7 +248,10 @@ export function ModelSheet({ open, close, send }: { open: boolean; close: () => 
     </button>
   );
   return (
-    <CardFrame
+    <PopFrame
+      open={open}
+      anchor={anchor}
+      label="模型"
       icon={Box}
       title="模型"
       close={close}
@@ -274,23 +277,39 @@ export function ModelSheet({ open, close, send }: { open: boolean; close: () => 
         )
       }
       foot={
-        <>
-          {/* A model's own levels in place of the last one's, drawn anew (story 527). */}
-          {levels && levels.length > 1 && <Effort key={levels.map((c) => c.command).join("\n")} levels={levels} send={send} />}
-          {ultra !== null && (
-            <button role="switch" aria-checked={ultra} aria-label="ultracode" disabled={busy || flipping} onClick={() => void flip()} className={cn(ROW, "mb-2 w-full rounded-none border-t")}>
-              <Workflow aria-hidden className="size-4 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 flex-1 truncate">ultracode</span>
-              {flipping ? (
-                <Spinning />
-              ) : (
-                <span className={cn("flex h-6 w-10 shrink-0 items-center rounded-full p-0.5 transition-colors", ultra ? "justify-end bg-primary" : "bg-input dark:bg-input/80")}>
-                  <span className={cn("size-5 rounded-full shadow-sm", ultra ? "bg-background dark:bg-primary-foreground" : "bg-background dark:bg-foreground")} />
+        ((levels && levels.length > 1) || ultra !== null) && (
+          <div className={cn("flex items-center gap-3 border-t pl-4", ultra === null ? "pr-4" : "pr-1")}>
+            {/* A model's own levels in place of the last one's, drawn anew (story 527); one alone, its name. */}
+            {levels && levels.length > 1 ? (
+              <Effort key={levels.map((c) => c.command).join("\n")} levels={levels} send={send} />
+            ) : (
+              levels?.length === 1 && (
+                <>
+                  <Brain aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 truncate text-sm font-medium">{levels[0]!.label}</span>
+                </>
+              )
+            )}
+            {ultra !== null && (
+              // Off grey, on lit; for a model without it, grey still, saying why on hover and as tapped or held.
+              <button
+                role="switch"
+                aria-checked={ultra === true}
+                aria-label="ultracode"
+                aria-disabled={ultra === "no" || undefined}
+                title={ultra === "no" ? NO_ULTRA : "ultracode"}
+                disabled={busy || flipping}
+                onClick={() => (ultra === "no" ? toast(`${NO_ULTRA}。`, "info") : void flip())}
+                onContextMenu={(e) => ultra === "no" && (e.preventDefault(), toast(`${NO_ULTRA}。`, "info"))}
+                className="group/ultra ml-auto grid size-11 shrink-0 place-items-center"
+              >
+                <span className={cn("grid size-8 place-items-center rounded-full transition-colors", ultra === true ? "bg-primary text-primary-foreground" : "text-muted-foreground group-hover/ultra:bg-accent", ultra === "no" && "opacity-40 group-hover/ultra:bg-transparent")}>
+                  {flipping ? <Spinning /> : <Workflow aria-hidden className="size-4" />}
                 </span>
-              )}
-            </button>
-          )}
-        </>
+              </button>
+            )}
+          </div>
+        )
       }
     >
       <div role="group" aria-label="模型" className="grid px-2 pb-2">
@@ -318,7 +337,7 @@ export function ModelSheet({ open, close, send }: { open: boolean; close: () => 
           })
         )}
       </div>
-    </CardFrame>
+    </PopFrame>
   );
 }
 
@@ -364,8 +383,7 @@ function Effort({ levels, send }: { levels: Candidate[]; send: Send }) {
   // shows round it; Base UI keeps it inside the bar at either end, where its stops are too.
   const stop = (f: number) => `calc(0.875rem + (100% - 1.75rem) * ${f})`;
   return (
-    <div className="border-t px-4">
-      <Slider.Root aria-label="思考强度" value={Math.max(at, 0)} max={levels.length - 1} thumbAlignment="edge" onValueChange={(v) => setAt(v as number)} onValueCommitted={(v) => void commit(v as number)} style={heat} className="flex max-w-md items-center gap-3">
+    <Slider.Root aria-label="思考强度" value={Math.max(at, 0)} max={levels.length - 1} thumbAlignment="edge" onValueChange={(v) => setAt(v as number)} onValueCommitted={(v) => void commit(v as number)} style={heat} className="flex min-w-0 flex-1 items-center gap-3">
         <Brain aria-hidden className="size-4 shrink-0 text-muted-foreground" />
         <Slider.Control className="flex min-h-11 flex-1 touch-none items-center select-none">
           <Slider.Track className="relative h-7 w-full rounded-full bg-muted">
@@ -383,7 +401,6 @@ function Effort({ levels, send }: { levels: Candidate[]; send: Send }) {
           </Slider.Track>
         </Slider.Control>
         <span className="w-14 shrink-0 text-sm font-medium text-(--heat)">{label}</span>
-      </Slider.Root>
-    </div>
+    </Slider.Root>
   );
 }

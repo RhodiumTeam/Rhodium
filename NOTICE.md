@@ -14,7 +14,7 @@
 | `web/public/openai.svg` | OpenAI 的图形 | opencode 的 packages/ui | MIT |
 | `web/src/terminal-glyphs.woff2` | 终端里的几个符号 | Noto Sans Symbols 2 v2.008，裁剪过 | SIL OFL 1.1，全文见下文 |
 | `src/claude.ts` | 控制请求的处理 | Claude Agent SDK for Python | MIT，声明在文件开头 |
-| `src/bot.ts` 的 `scan()` | QQ 扫码建 Bot 的协议 | 腾讯的 qqbot-agent-sdk（tencent-connect） | MIT，声明在函数上方 |
+| `src/bot-flow.ts` 的 `scan()` | QQ 扫码建 Bot 的协议 | 腾讯的 qqbot-agent-sdk（tencent-connect） | MIT，声明在函数上方 |
 | `web/src/components/ui/` | 按钮、徽标、抽屉等组件 | shadcn/ui，用它的命令行生成 | MIT |
 | `web/src/index.css` 的 `live-shine` | 调用还在跑时扫过文字的光 | T3 Code 的 live-tool-shine | MIT |
 

@@ -5,10 +5,11 @@
 // whose chats land in it, its state, and the last thing said.
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "cn";
-import { ArrowUp, ChevronRight, Import, Pin, Quote, Search, SquarePen, type LucideIcon } from "lucide-react";
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent, type ReactNode, type RefObject, type TouchEvent } from "react";
+import { ArrowUp, ChevronRight, Import, Pin, Quote, Search, SquarePlus, SquareTerminal, type LucideIcon } from "lucide-react";
+import { createContext, lazy, Suspense, useContext, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent, type ReactNode, type RefObject, type TouchEvent } from "react";
 import { Link, useLocation } from "wouter";
-import { AgentLogo, ago, goHash, MAC } from "./common";
+import { AgentLogo, ago, goHash, MAC, openFrom } from "./common";
+import { buttonVariants } from "./components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./components/ui/collapsible";
 import { json, mayPrefetch, queryClient, settled, type BoardData, type Card, type TopologyData } from "./data";
 import { Face } from "./faces";
@@ -19,8 +20,9 @@ export type Kind = "needs" | "running" | "done" | "idle" | "archived";
 const KIND = { needsYou: "needs", running: "running", done: "done", idle: "idle" } as const;
 type Bot = BoardData["bots"][number];
 /** A slot as a row: its kind, its workspace, how deep under its parent, whether it goes by its full
- *  ref, as where no workspace's name is above it, and the Bots whose chats land in it. */
-export type Row = { c: Card; kind: Kind; ws: string; depth: number; full: boolean; bots: Bot[] };
+ *  ref, as where no workspace's name is above it, and the Bots whose chats land in it. lone: live, and
+ *  its workspace has no name over a card in the list (story 639), so its menu makes and imports there. */
+export type Row = { c: Card; kind: Kind; ws: string; depth: number; full: boolean; bots: Bot[]; lone?: boolean };
 
 /** When something was last said in the slot, or its turn ended; 0 for never. */
 const lastAt = (c: Card) => Math.max(c.last?.at ?? 0, c.turnEndedAt ?? 0);
@@ -82,7 +84,14 @@ function layout(data: BoardData) {
   const archived = data.workspaces
     .flatMap((w) => w.archived.map((c): Row => ({ c, kind: "archived", ws: w.name, depth: 0, full: true, bots: bots(c) })))
     .sort((a, b) => (b.c.archivedAt ?? 0) - (a.c.archivedAt ?? 0));
-  return { needs, pinned, cards, archived };
+  return alone({ needs, pinned, cards, archived });
+}
+
+/** l with each live row marked lone where its workspace has no name over one of l's cards (story 639). */
+function alone<L extends { needs: Row[]; pinned: Row[]; cards: { name?: string; rows: Row[] }[] }>(l: L): L {
+  const named = new Set(l.cards.map((x) => x.name));
+  const mark = (rows: Row[]) => rows.map((r) => ({ ...r, lone: !named.has(r.ws) }));
+  return { ...l, needs: mark(l.needs), pinned: mark(l.pinned), cards: l.cards.map((x) => ({ ...x, rows: mark(x.rows) })) };
 }
 
 /** The live slots top to bottom as the list has them, every workspace unfolded; and the archived. */
@@ -112,7 +121,7 @@ export function steady(was: BoardData | null, now: BoardData): ReturnType<typeof
   const all = new Map([...fresh.needs, ...fresh.pinned, ...fresh.cards.flatMap((x) => x.rows), ...fresh.archived].map((r) => [r.c.id, r]));
   // Where it was: how deep, and by which name.
   const keep = (rows: Row[]) => rows.flatMap((r) => (all.has(r.c.id) ? [{ ...all.get(r.c.id)!, depth: r.depth, full: r.full }] : []));
-  return { needs: keep(then.needs), pinned: keep(then.pinned), cards: then.cards.map((x) => ({ ...x, rows: keep(x.rows) })).filter((x) => x.rows.length), archived: keep(then.archived) };
+  return alone({ needs: keep(then.needs), pinned: keep(then.pinned), cards: then.cards.map((x) => ({ ...x, rows: keep(x.rows) })).filter((x) => x.rows.length), archived: keep(then.archived) });
 }
 
 // What the list under the mouse holds still, for Alt+↑↓ (story 442); none off a list, as beside the topology.
@@ -162,13 +171,36 @@ let archivedOpen = false;
 const Restore = lazy(() => import("./write").then((m) => ({ default: m.Restore })));
 const Toasts = lazy(() => import("./write").then((m) => ({ default: m.Toasts })));
 const RowMenu = lazy(() => import("./write").then((m) => ({ default: m.RowMenu })));
+// 新建槽位 and 导入 write, so they come only once opened.
+const Sheets = lazy(() => import("./create").then((m) => ({ default: m.Sheets })));
 
-/** A headless slot's row's menu (spec web-write "列表行的菜单"): a right click, or a finger held still
+/** 新建槽位 or 导入 opened in a list: which, from workspace ws, in it with no picker (inWs) or with the picker starting there. */
+type Making = { open: "new" | "import"; ws?: string; inWs?: boolean };
+
+/** Opens a list's 新建槽位 or 导入. The list owns the dialog, not the row or workspace opening it:
+ *  a reorder may unmount those, and the dialog with what was typed in it would go too. */
+const Make = createContext<(m: Making) => void>(() => {});
+
+/** The dialog a list opened (made), outside the rows it holds still: told the slot made (done). */
+function Makes({ made, close, done }: { made: Making | null; close: () => void; done: (slot: string) => void }) {
+  return (
+    made && (
+      <Suspense>
+        <Sheets {...made} close={close} done={done} />
+      </Suspense>
+    )
+  );
+}
+
+/** A slot's row's menu (spec web-write "列表行的菜单"): a right click, or a finger held still
  *  half a second, opens it where it was, its code coming then; Android's long press, a right click
- *  too, opens it once. One in the terminal has none. What the row takes, none for one in the terminal,
- *  and the menu, there once opened, its dialog outliving it. */
-function useRowMenu(c: Card) {
+ *  too, opens it once. One in the terminal has one too, once archived none (story 660). ws: the row's workspace where it is alone (story
+ *  639), whose 新建槽位 and 导入 the menu has too, opened by the list (Make). What the row takes, none
+ *  for one in the terminal archived; the menu, there once opened; and whether it is up, the row showing it as
+ *  picked till it closes (story 640). */
+function useRowMenu(c: Card, ws: string | undefined) {
   const [at, setAt] = useState<{ x: number; y: number } | null>();
+  const make = useContext(Make);
   // A finger down on the row, which may be held; shown: it opened the menu, which is still up.
   const press = useRef<{ x: number; y: number; timer?: ReturnType<typeof setTimeout>; shown?: boolean } | null>(null);
   const show = (x: number, y: number) => {
@@ -184,7 +216,7 @@ function useRowMenu(c: Card) {
     addEventListener("contextmenu", no);
     return () => removeEventListener("contextmenu", no);
   }, []);
-  const hold = c.mode !== "headless" ? undefined : {
+  const hold = c.mode !== "headless" && c.archivedAt !== null ? undefined : {
     onContextMenu: (e: MouseEvent) => (e.preventDefault(), press.current?.shown || show(e.clientX, e.clientY)),
     // In capture, beside toward's own.
     onPointerDownCapture: (e: PointerEvent) => {
@@ -204,9 +236,10 @@ function useRowMenu(c: Card) {
     hold,
     at !== undefined && (
       <Suspense>
-        <RowMenu c={c} at={at} close={() => ((press.current = null), setAt(null))} />
+        <RowMenu c={c} at={at} close={() => ((press.current = null), setAt(null))} make={ws ? (open) => make({ open, ws, inWs: true }) : undefined} />
       </Suspense>
     ),
+    !!at,
   ] as const;
 }
 
@@ -220,6 +253,7 @@ export function BoardPage() {
 /** The board. It measures its own width: a slot is a line where there is room, two beside a chat. */
 export function BoardView({ data }: { data: BoardData }) {
   const [was, hover] = useHeld(data);
+  const [made, setMade] = useState<Making | null>(null);
   const { needs, pinned, cards, archived } = steady(was, data);
   const [arcOpen, setArcOpen] = useState(archivedOpen);
   // What a button did shows at the bottom, as a chat gone back from had it; beside a chat, in the chat.
@@ -230,37 +264,62 @@ export function BoardView({ data }: { data: BoardData }) {
   // last lines stay in one column (story 438).
   const most = Math.max(0, ...[...needs, ...pinned, ...cards.flatMap((x) => x.rows), ...archived].map((r) => r.bots.length));
   return (
-    <div className="@container" style={{ "--bw": `${facesRoom(Math.min(3, most), most, 24)}px` } as CSSProperties} {...hover}>
-      {needs.length > 0 && <Rows rows={needs} className="mt-5 border-needs/35 shadow-needs/10 @min-[40rem]:mt-6" />}
-      {pinned.length > 0 && (
-        <div className="mt-5 @min-[40rem]:mt-6.5">
-          <Pinned className="ml-4 pb-[7px]" />
-          <Rows rows={pinned} />
-        </div>
-      )}
-      {cards.map((x) => (x.name ? <Workspace key={x.name} name={x.name} rows={x.rows} /> : <Rows key={x.rows[0]!.c.id} rows={x.rows} className="mt-5 @min-[40rem]:mt-6.5" />))}
-      {!needs.length && !pinned.length && !cards.length && <p className="my-10 text-center text-muted-foreground">没有在用的槽位。</p>}
-      {archived.length > 0 && (
-        <Collapsible className="mt-7" open={arcOpen} onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}>
-          {/* Its focus ring round its arrow and words, as far from them left as right, as the workspace name's; the arrow where it was. */}
-          <CollapsibleTrigger className="group ml-1.5 flex items-center gap-1 rounded-md px-1.5 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
-            <ChevronRight className="size-4 transition-transform group-data-panel-open:rotate-90" />
-            已归档 {archived.length}
-          </CollapsibleTrigger>
-          <CollapsibleContent className="mt-1.5">
-            <Rows rows={archived} />
-          </CollapsibleContent>
-          {!arcOpen && <Rows rows={peek(archived, at)} className="mt-1.5" />}
-        </Collapsible>
-      )}
-      {up && !beside && (
-        <Suspense>
-          <div className="fixed inset-x-0 bottom-[env(safe-area-inset-bottom)] z-[60]">
-            <Toasts />
+    <Make.Provider value={setMade}>
+      <div className="@container" style={{ "--bw": `${facesRoom(Math.min(3, most), most, 24)}px` } as CSSProperties} {...hover}>
+        {needs.length > 0 && <Rows rows={needs} className="mt-5 border-needs/35 shadow-needs/10 @min-[40rem]:mt-6" />}
+        {pinned.length > 0 && (
+          <div className="mt-5 @min-[40rem]:mt-6.5">
+            <Pinned className="ml-4 pb-[7px]" />
+            <Rows rows={pinned} />
           </div>
-        </Suspense>
-      )}
-    </div>
+        )}
+        {cards.map((x) => (x.name ? <Workspace key={x.name} name={x.name} rows={x.rows} /> : <Rows key={x.rows[0]!.c.id} rows={x.rows} className="mt-5 @min-[40rem]:mt-6.5" />))}
+        {!needs.length && !pinned.length && !cards.length && (
+          // In the middle of what is left under the bar, archived ones under it.
+          <div className={cn("grid justify-items-center gap-4 px-4 text-center", archived.length ? "my-10" : "min-h-[calc(100dvh-10rem)] content-center")}>
+            <p className="text-muted-foreground">
+              暂无槽位
+              <br />
+              新建或导入已有的会话以开始使用 Rhodium
+            </p>
+            <div className="flex gap-2">
+              {(
+                [
+                  ["new", SquarePlus, "新建"],
+                  ["import", Import, "导入"],
+                ] as const
+              ).map(([open, Icon, label]) => (
+                <button key={open} type="button" onClick={() => setMade({ open })} className={buttonVariants({ variant: "outline", size: "lg" })}>
+                  <Icon />
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {archived.length > 0 && (
+          <Collapsible className="mt-7" open={arcOpen} onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}>
+            {/* Its focus ring round its arrow and words, as far from them left as right, as the workspace name's; the arrow where it was. */}
+            <CollapsibleTrigger className="group ml-1.5 flex items-center gap-1 rounded-md px-1.5 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
+              <ChevronRight className="size-4 transition-transform group-data-panel-open:rotate-90" />
+              已归档 {archived.length}
+            </CollapsibleTrigger>
+            <CollapsibleContent className="mt-1.5">
+              <Rows rows={archived} />
+            </CollapsibleContent>
+            {!arcOpen && <Rows rows={peek(archived, at)} className="mt-1.5" />}
+          </Collapsible>
+        )}
+        {up && !beside && (
+          <Suspense>
+            <div className="fixed inset-x-0 bottom-[env(safe-area-inset-bottom)] z-[75]">
+              <Toasts />
+            </div>
+          </Suspense>
+        )}
+      </div>
+      <Makes made={made} close={() => setMade(null)} done={(id) => openFrom(id, at)} />
+    </Make.Provider>
   );
 }
 
@@ -287,17 +346,39 @@ function Workspace({ name, rows }: { name: string; rows: Row[] }) {
   const [at] = useLocation();
   return (
     <Collapsible className="mt-5 @min-[40rem]:mt-6.5" open={open} onOpenChange={(o) => (setOpen(o), fold(name, !o))}>
-      {/* Its focus ring round its name and arrow, as far from them above as below, clear of the card; the name where it was. */}
-      <CollapsibleTrigger className="group -mt-1 mb-[3px] ml-2.5 flex items-center gap-1 rounded-md px-1.5 py-1 text-[13px] font-semibold tracking-[0.01em] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
-        {name}
-        {!open && <Count rows={rows} className="font-normal" />}
-        <ChevronRight className="size-3.5 opacity-60 transition-transform group-data-panel-open:rotate-90" />
-      </CollapsibleTrigger>
+      <div className="group/ws -mt-1 mb-[3px] flex items-center">
+        {/* Its focus ring round its name and arrow, as far from them above as below, clear of the card; the name where it was. */}
+        {/* A long name truncated: its keys stay on the line. */}
+        <CollapsibleTrigger className="group ml-2.5 flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-[13px] font-semibold tracking-[0.01em] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
+          <span className="truncate">{name}</span>
+          {!open && <Count rows={rows} className="font-normal" />}
+          <ChevronRight className="size-3.5 shrink-0 opacity-60 transition-transform group-data-panel-open:rotate-90" />
+        </CollapsibleTrigger>
+        <WsKeys ws={name} className="-my-2 mr-1.5 ml-auto" />
+      </div>
       <CollapsibleContent>
         <Rows rows={rows} />
       </CollapsibleContent>
       {!open && <Rows rows={peek(rows, at)} />}
     </Collapsible>
+  );
+}
+
+/** A workspace's 新建槽位 and 导入 at the end of its name's line (story 634): with a mouse, only while
+ *  it is on the line or a key's focus on them; always on a touch screen. They fold nothing. ws: the
+ *  workspace, which they say to a screen reader. */
+function WsKeys({ ws, className }: { ws: string; className?: string }) {
+  const make = useContext(Make);
+  const key = (open: "new" | "import", label: string, Icon: LucideIcon) => (
+    <button aria-label={`${ws} ${label}`} title={label} onClick={() => make({ open, ws, inWs: true })} className="hover-round grid size-9 shrink-0 place-items-center text-muted-foreground hover:text-foreground">
+      <Icon className="size-4" />
+    </button>
+  );
+  return (
+    <span className={cn("flex max-w-0 shrink-0 overflow-hidden group-hover/ws:max-w-none focus-within:max-w-none pointer-coarse:max-w-none", className)}>
+      {key("new", "新建槽位", SquarePlus)}
+      {key("import", "导入", Import)}
+    </span>
   );
 }
 
@@ -515,10 +596,14 @@ function useInSight(link: RefObject<HTMLAnchorElement | null>, id: string, open:
   return (e: MouseEvent) => open || e.metaKey || e.ctrlKey || e.shiftKey || (clicked = id);
 }
 
-/** One running but not in a turn, as waiting for quota, or that could not switch back, or in the
- *  terminal, its agent at rest there or a dialog open there, or one held up over its memory limit (#692):
- *  it says why in place of the last thing said. */
-const whyNot = (c: Card, kind: Kind) => (kind === "running" && c.state !== "运行中") || c.state === "没能切回无头" || c.state.startsWith("TUI 模式") || c.state === "被弹框挡住" || c.state === "内存阻塞";
+/** In the terminal, its agent there with no dialog open: it says the last thing said after a terminal
+ *  icon (story 659). */
+const inTui = (c: Card) => c.state.startsWith("TUI 模式");
+
+/** One running but not in a turn, as waiting for quota, or on its way to the terminal, or that could
+ *  not switch back, or a dialog open in the terminal, or one held up over its memory limit (#692): it
+ *  says why in place of the last thing said. */
+const whyNot = (c: Card, kind: Kind) => (kind === "running" && c.state !== "运行中" && !inTui(c)) || c.state === "没能切回无头" || c.state === "被弹框挡住" || c.state === "内存阻塞";
 
 /** A slot's state in a word: 需要你 or 崩溃, 运行中, or how long ago its turn ended, it was archived, or
  *  it was last active. */
@@ -536,11 +621,19 @@ function Unread({ id }: { id: string }) {
 }
 
 /** What a slot's second line says: why it is not in a turn, or the last thing said, yours after 你：,
- *  a quote sign before what was said under a quote (#607). */
+ *  a quote sign before what was said under a quote (#607); in the terminal, a terminal icon first, alone
+ *  with nothing said (story 659). */
 const Last = ({ c, why }: { c: Card; why: boolean }) =>
-  why
-    ? c.state
-    : c.last && (
+  why ? (
+    c.state
+  ) : (
+    <>
+      {inTui(c) && (
+        <span role="img" aria-label="在终端里" className="mr-1">
+          <SquareTerminal className="inline size-[1em] align-[-0.125em]" />
+        </span>
+      )}
+      {c.last && (
         <>
           {yours(c.last) && <b className="font-medium text-foreground/75">你：</b>}
           {c.last.quoted && (
@@ -550,7 +643,9 @@ const Last = ({ c, why }: { c: Card; why: boolean }) =>
           )}
           {c.last.text}
         </>
-      );
+      )}
+    </>
+  );
 
 let resting: ReturnType<typeof setTimeout> | undefined;
 let slotCode: typeof import("./slot") | undefined;
@@ -571,20 +666,21 @@ const toward = (id: string) => {
 /** A slot's row, which opens it. Two lines: the logo beside its name and state, the last thing said
  *  under them; where there is room, one. A child is indented under its parent. Beside its chat, it is in
  *  sight as the slot changes but by a click on it. */
-function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
+function SlotRow({ r: { c, kind, ws, depth, full, bots, lone } }: { r: Row }) {
   const why = whyNot(c, kind);
   // A line under its name (#587): with none, the name is level with the logo's middle.
-  const two = why || !!c.last;
+  const two = why || !!c.last || inTui(c);
   const state = kind === "done" && c.turnEndedAt ? `${word(c, kind)}结束` : word(c, kind);
   const kid = depth > 0;
   const quiet = kind === "idle" ? "opacity-70" : kind === "archived" ? "opacity-60" : "";
   const href = `/slot/${encodeURIComponent(c.id)}`;
   // Its chat open beside the list, on a wide screen.
-  const open = useLocation()[0] === href;
+  const [at] = useLocation();
+  const open = at === href;
   const archived = kind === "archived";
   const link = useFlash(c.id);
   const onClick = useInSight(link, c.id, open);
-  const [hold, menu] = useRowMenu(c);
+  const [hold, menu, picked] = useRowMenu(c, lone ? ws : undefined);
   return (
     <div
       style={{ "--d": Math.min(depth, 2) } as CSSProperties}
@@ -617,6 +713,8 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
           "scroll-mb-[calc(1.5rem+env(safe-area-inset-bottom))]",
           "bg-(--row)",
           !open && "hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--card))] active:[--row:var(--accent)]",
+          // Its menu up, pointed at as it was (story 640).
+          !open && picked && "[--row:color-mix(in_oklab,var(--foreground)_4%,var(--card))]",
           // Inside the row; the card's first and last rows round as its corners inside its border, which clip the rest.
           "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring group-first/row:rounded-t-[17px] group-last/row:rounded-b-[17px]",
           "@min-[40rem]:grid-cols-[var(--av)_calc(250px-var(--d)*42px-var(--av)+var(--bw))_minmax(0,1fr)_auto] @min-[40rem]:gap-x-3.5",
@@ -646,7 +744,7 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
                 kid && "size-2.5 border-2 @min-[40rem]:size-[9px]",
               )}
             >
-              {kind === "running" && !why && <span className="absolute inset-0 rounded-full bg-(--c) opacity-55 motion-safe:animate-ripple" />}
+              {kind === "running" && !why && !inTui(c) && <span className="absolute inset-0 rounded-full bg-(--c) opacity-55 motion-safe:animate-ripple" />}
             </span>
           )}
         </span>
@@ -686,8 +784,6 @@ function SlotRow({ r: { c, kind, ws, depth, full, bots } }: { r: Row }) {
 
 // ---- maximize mode's sidebar (spec web-maximize) ----
 
-// Its 新建槽位 and 导入 write, so they come only once opened.
-const SideSheets = lazy(() => import("./create").then((m) => ({ default: m.SideSheets })));
 
 /** Opens the jump box, as ⌘K does: the jump box listens for it. */
 export const openJump = () => dispatchEvent(new Event("rh-jump"));
@@ -734,7 +830,7 @@ const onBlank = (e: MouseEvent<HTMLElement>) => {
  *  the list scrolls or one is pressed. Scrolled into a workspace, its tab sticks under them. */
 export function SideList({ from, wide }: { from: "list" | "topology"; wide?: boolean }) {
   const { data } = useQuery({ queryKey: ["board"], queryFn: () => json<BoardData>("api/board") });
-  const [sheet, setSheet] = useState<"new" | "import" | null>(null);
+  const [made, setMade] = useState<Making | null>(null);
   const [arcOpen, setArcOpen] = useState(archivedOpen);
   const [shut, setShut] = useState(false);
   const [peeking, setPeeking] = useState(false);
@@ -781,126 +877,124 @@ export function SideList({ from, wide }: { from: "list" | "topology"; wide?: boo
   return (
     // The buttons stay in the list's scroller, so the wheel, a finger and the keys on them scroll it. Their
     // line runs on behind it, under its bar, across the sidebar to the chat's top bar's (#645).
-    <div className="relative isolate h-full">
-      <div style={head.style} className={cn("pointer-events-none absolute inset-x-0 top-0 -z-10", head.line)} />
-      {/* --head: how far down the buttons reach now, under which a tab sticks and the bar starts. The
-          scroll padding keeps a row scrolled or paged to clear of them and a stuck tab (a row's scroll
-          margin takes the tab back off where there is none). Its bar shows only under the pointer or the
-          focus (index.css). */}
-      <div
-        ref={scroller}
-        data-wide={wide || undefined}
-        data-shut={shut || undefined}
-        data-quiet-scroll=""
-        onScroll={(e) => {
-          const top = e.currentTarget.scrollTop;
-          setShut((was) => shrunk(was, top));
-          clearTimeout(peekAt.current);
-          setPeeking(false);
-        }}
-        onKeyDown={(e) => {
-          const t = e.target as HTMLElement;
-          const down = ({ PageDown: true, PageUp: false, " ": !e.shiftKey } as Record<string, boolean>)[e.key];
-          // Space on a button presses it, in a row's name box types it. A key in a sheet, out of the list in the page, is not the list's.
-          if (down === undefined || e.altKey || e.ctrlKey || e.metaKey || !e.currentTarget.contains(t) || (e.key === " " && t.closest("button, input"))) return;
-          if (turnPage(e.currentTarget, down)) e.preventDefault();
-        }}
-        style={{ "--head": `${shut ? HEAD.shut : HEAD.open}px` } as CSSProperties}
-        className="group/side h-full scroll-pt-[calc(var(--head)+2rem)] overflow-y-auto [&::-webkit-scrollbar-track]:mt-(--head)"
-      >
-        <nav aria-label="槽位">
-          <div className="sticky top-0 z-10 h-0">
-            {/* Shrinking, all moves once the names are gone (Tab's fade). */}
-            <div
-              onPointerMove={(e) => {
-                if (e.pointerType !== "mouse") return;
-                clearTimeout(peekAt.current);
-                if (shut && !peeking && onBlank(e)) peekAt.current = setTimeout(() => setPeeking(true), 300);
-              }}
-              onPointerLeave={(e) => {
-                if (e.pointerType !== "mouse") return;
-                clearTimeout(peekAt.current);
-                if (peeking) peekAt.current = setTimeout(() => setPeeking(false), 1000);
-              }}
-              onClick={(e) => {
-                const blank = onBlank(e);
-                if (!blank || (e.nativeEvent as globalThis.PointerEvent).pointerType !== "mouse") setPeeking((p) => blank && shut && !p);
-              }}
-              style={head.style}
-              className={cn("relative bg-sidebar", head.line)}
-            >
-              {/* Grown for a while, each as wide as what it says: the blank tapped stays blank, to tap again. */}
-              <Tab i={0} shut={icons} fit={peeking} icon={SquarePen} onClick={() => setSheet("new")}>
-                新建槽位
-              </Tab>
-              <Tab i={1} shut={icons} fit={peeking} icon={Search} onClick={openJump} hint={MAC ? "⌘K" : "Ctrl+K"}>
-                跳转
-              </Tab>
-              <Tab i={2} shut={icons} fit={peeking} icon={Import} onClick={() => setSheet("import")}>
-                导入
-              </Tab>
-              {above && (
-                <button
-                  // It goes as they come in sight: the focus, with them.
-                  onClick={() => (scroller.current?.scrollTo({ top: 0, behavior: "smooth" }), needsRef.current?.querySelector("a")?.focus({ preventScroll: true }))}
-                  className="absolute top-[15px] right-2 flex items-center gap-1 rounded-full bg-[color-mix(in_oklab,var(--needs)_15%,var(--sidebar))] py-1 pr-2.5 pl-2 text-[13px] font-semibold text-needs ring-1 ring-needs/30 transition-colors hover:bg-[color-mix(in_oklab,var(--needs)_25%,var(--sidebar))] focus-visible:outline-2 focus-visible:outline-ring"
+    <Make.Provider value={setMade}>
+      <div className="relative isolate h-full">
+        <div style={head.style} className={cn("pointer-events-none absolute inset-x-0 top-0 -z-10", head.line)} />
+        {/* --head: how far down the buttons reach now, under which a tab sticks and the bar starts. The
+            scroll padding keeps a row scrolled or paged to clear of them and a stuck tab (a row's scroll
+            margin takes the tab back off where there is none). Its bar shows only under the pointer or the
+            focus (index.css). */}
+        <div
+          ref={scroller}
+          data-wide={wide || undefined}
+          data-shut={shut || undefined}
+          data-quiet-scroll=""
+          onScroll={(e) => {
+            const top = e.currentTarget.scrollTop;
+            setShut((was) => shrunk(was, top));
+            clearTimeout(peekAt.current);
+            setPeeking(false);
+          }}
+          onKeyDown={(e) => {
+            const t = e.target as HTMLElement;
+            const down = ({ PageDown: true, PageUp: false, " ": !e.shiftKey } as Record<string, boolean>)[e.key];
+            // Space on a button presses it, in a row's name box types it. A key in a sheet, out of the list in the page, is not the list's.
+            if (down === undefined || e.altKey || e.ctrlKey || e.metaKey || !e.currentTarget.contains(t) || (e.key === " " && t.closest("button, input"))) return;
+            if (turnPage(e.currentTarget, down)) e.preventDefault();
+          }}
+          style={{ "--head": `${shut ? HEAD.shut : HEAD.open}px` } as CSSProperties}
+          className="group/side h-full scroll-pt-[calc(var(--head)+2rem)] overflow-y-auto [&::-webkit-scrollbar-track]:mt-(--head)"
+        >
+          <nav aria-label="槽位">
+            <div className="sticky top-0 z-10 h-0">
+              {/* Shrinking, all moves once the names are gone (Tab's fade). */}
+              <div
+                onPointerMove={(e) => {
+                  if (e.pointerType !== "mouse") return;
+                  clearTimeout(peekAt.current);
+                  if (shut && !peeking && onBlank(e)) peekAt.current = setTimeout(() => setPeeking(true), 300);
+                }}
+                onPointerLeave={(e) => {
+                  if (e.pointerType !== "mouse") return;
+                  clearTimeout(peekAt.current);
+                  if (peeking) peekAt.current = setTimeout(() => setPeeking(false), 1000);
+                }}
+                onClick={(e) => {
+                  const blank = onBlank(e);
+                  if (!blank || (e.nativeEvent as globalThis.PointerEvent).pointerType !== "mouse") setPeeking((p) => blank && shut && !p);
+                }}
+                style={head.style}
+                className={cn("relative bg-sidebar", head.line)}
+              >
+                {/* Grown for a while, each as wide as what it says: the blank tapped stays blank, to tap again. */}
+                <Tab i={0} shut={icons} fit={peeking} icon={SquarePlus} onClick={() => setMade({ open: "new", ws })}>
+                  新建槽位
+                </Tab>
+                <Tab i={1} shut={icons} fit={peeking} icon={Search} onClick={openJump} hint={MAC ? "⌘K" : "Ctrl+K"}>
+                  跳转
+                </Tab>
+                <Tab i={2} shut={icons} fit={peeking} icon={Import} onClick={() => setMade({ open: "import", ws })}>
+                  导入
+                </Tab>
+                {above && (
+                  <button
+                    // It goes as they come in sight: the focus, with them.
+                    onClick={() => (scroller.current?.scrollTo({ top: 0, behavior: "smooth" }), needsRef.current?.querySelector("a")?.focus({ preventScroll: true }))}
+                    className="absolute top-[15px] right-2 flex items-center gap-1 rounded-full bg-[color-mix(in_oklab,var(--needs)_15%,var(--sidebar))] py-1 pr-2.5 pl-2 text-[13px] font-semibold text-needs ring-1 ring-needs/30 transition-colors hover:bg-[color-mix(in_oklab,var(--needs)_25%,var(--sidebar))] focus-visible:outline-2 focus-visible:outline-ring"
+                  >
+                    <ArrowUp className="size-3.5" />
+                    需要你
+                  </button>
+                )}
+              </div>
+            </div>
+            <div ref={list} style={{ paddingTop: HEAD.open }} className="px-2 pb-6" {...hover}>
+              {needs.length > 0 && (
+                <div ref={needsRef} className="mt-1 grid gap-px">
+                  {rowsOf(needs)}
+                </div>
+              )}
+              {pinned.length > 0 && (
+                <div className="mt-2 grid gap-px">
+                  <Pinned className="h-8 px-2" />
+                  {rowsOf(pinned)}
+                </div>
+              )}
+              {/* 置顶 ends with a line, as the buttons on top do: the next block may have no name over it. */}
+              {pinned.length > 0 && (cards.length > 0 || archived.length > 0) && <hr className="-mx-2 mt-2 border-border/70" />}
+              {cards.map((x) =>
+                x.name ? (
+                  <SideWorkspace key={x.name} name={x.name} rows={x.rows} row={(r) => <SideRow key={r.c.id} r={r} from={from} under />} />
+                ) : (
+                  <div key={x.rows[0]!.c.id} className="mt-2 grid gap-px">
+                    {rowsOf(x.rows)}
+                  </div>
+                ),
+              )}
+              {!needs.length && !pinned.length && !cards.length && <p className="my-6 px-2 text-sm text-muted-foreground">没有在用的槽位。</p>}
+              {archived.length > 0 && (
+                <SideFold
+                  className="mt-3"
+                  open={arcOpen}
+                  onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}
+                  tab={
+                    <>
+                      已归档
+                      <span className="ml-auto tabular-nums">{archived.length}</span>
+                    </>
+                  }
+                  peek={rowsOf(peek(archived, at))}
                 >
-                  <ArrowUp className="size-3.5" />
-                  需要你
-                </button>
+                  {rowsOf(archived)}
+                </SideFold>
               )}
             </div>
-          </div>
-          <div ref={list} style={{ paddingTop: HEAD.open }} className="px-2 pb-6" {...hover}>
-            {needs.length > 0 && (
-              <div ref={needsRef} className="mt-1 grid gap-px">
-                {rowsOf(needs)}
-              </div>
-            )}
-            {pinned.length > 0 && (
-              <div className="mt-2 grid gap-px">
-                <Pinned className="h-8 px-2" />
-                {rowsOf(pinned)}
-              </div>
-            )}
-            {/* 置顶 ends with a line, as the buttons on top do: the next block may have no name over it. */}
-            {pinned.length > 0 && (cards.length > 0 || archived.length > 0) && <hr className="-mx-2 mt-2 border-border/70" />}
-            {cards.map((x) =>
-              x.name ? (
-                <SideWorkspace key={x.name} name={x.name} rows={x.rows} row={(r) => <SideRow key={r.c.id} r={r} from={from} under />} />
-              ) : (
-                <div key={x.rows[0]!.c.id} className="mt-2 grid gap-px">
-                  {rowsOf(x.rows)}
-                </div>
-              ),
-            )}
-            {!needs.length && !pinned.length && !cards.length && <p className="my-6 px-2 text-sm text-muted-foreground">没有在用的槽位。</p>}
-            {archived.length > 0 && (
-              <SideFold
-                className="mt-3"
-                open={arcOpen}
-                onOpenChange={(open) => ((archivedOpen = open), setArcOpen(open))}
-                tab={
-                  <>
-                    已归档
-                    <span className="ml-auto tabular-nums">{archived.length}</span>
-                  </>
-                }
-                peek={rowsOf(peek(archived, at))}
-              >
-                {rowsOf(archived)}
-              </SideFold>
-            )}
-          </div>
-          <div ref={end} />
-        </nav>
-        {sheet && (
-          <Suspense>
-            <SideSheets open={sheet} close={() => setSheet(null)} ws={ws} done={(id) => goHash(maxHash(id, from))} />
-          </Suspense>
-        )}
+            <div ref={end} />
+          </nav>
+          <Makes made={made} close={() => setMade(null)} done={(id) => goHash(maxHash(id, from))} />
+        </div>
       </div>
-    </div>
+    </Make.Provider>
   );
 }
 
@@ -951,7 +1045,7 @@ function Tab({ i, shut, fit, icon: Icon, hint, onClick, children }: { i: number;
  *  pushes it off. Folded or unfolded, the tab stays where it is on screen: folded where it sticks, the
  *  next fold comes right under it. Not a CollapsibleContent, which goes a frame late, after the tab is
  *  put back. --tab: the tab's height, which a row scrolled to keeps clear of. */
-function SideFold({ open, onOpenChange, tab, peek, className, children }: { open: boolean; onOpenChange: (open: boolean) => void; tab: ReactNode; peek: ReactNode; className?: string; children: ReactNode }) {
+function SideFold({ open, onOpenChange, tab, keys, peek, className, children }: { open: boolean; onOpenChange: (open: boolean) => void; tab: ReactNode; keys?: ReactNode; peek: ReactNode; className?: string; children: ReactNode }) {
   const ref = useRef<HTMLButtonElement>(null);
   const was = useRef<number | null>(null);
   useLayoutEffect(() => {
@@ -964,11 +1058,12 @@ function SideFold({ open, onOpenChange, tab, peek, className, children }: { open
   return (
     <Collapsible className={cn("[--tab:2rem]", className)} open={open} onOpenChange={(o) => ((was.current = ref.current!.getBoundingClientRect().top), onOpenChange(o))}>
       {/* The sidebar's ground: no row shows through as it passes under. */}
-      <div className="sticky top-(--head) z-[5] bg-sidebar transition-[top] duration-200 ease-out group-data-shut/side:delay-75 motion-reduce:transition-none">
-        <CollapsibleTrigger ref={ref} className="group flex h-8 w-full items-center gap-1.5 rounded-lg px-2 text-[13px] text-muted-foreground hover:bg-foreground/[0.05]">
+      <div className="group/ws sticky top-(--head) z-[5] flex items-center bg-sidebar transition-[top] duration-200 ease-out group-data-shut/side:delay-75 motion-reduce:transition-none">
+        <CollapsibleTrigger ref={ref} className="group flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg px-2 text-[13px] text-muted-foreground hover:bg-foreground/[0.05]">
           <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-panel-open:rotate-90" />
           {tab}
         </CollapsibleTrigger>
+        {keys}
       </div>
       {open ? <div className="grid gap-px">{children}</div> : peek}
     </Collapsible>
@@ -976,7 +1071,8 @@ function SideFold({ open, onOpenChange, tab, peek, className, children }: { open
 }
 
 /** A workspace as the sidebar's tab: its name, which folds it, folded on this device as on the board;
- *  folded, how many slots it has, and the open one's row. row: a row as the sidebar draws it. */
+ *  folded, how many slots it has, and the open one's row; its 新建槽位 and 导入 at its end (story 634).
+ *  row: a row as the sidebar draws it. */
 function SideWorkspace({ name, rows, row }: { name: string; rows: Row[]; row: (r: Row) => ReactNode }) {
   const [open, setOpen] = useState(() => !folded(name));
   const [at] = useLocation();
@@ -985,6 +1081,7 @@ function SideWorkspace({ name, rows, row }: { name: string; rows: Row[]; row: (r
       className="mt-2"
       open={open}
       onOpenChange={(o) => (setOpen(o), fold(name, !o))}
+      keys={<WsKeys ws={name} className="[&>button]:size-8" />}
       tab={
         <>
           <span className="truncate font-semibold">{name}</span>
@@ -1002,17 +1099,17 @@ function SideWorkspace({ name, rows, row }: { name: string; rows: Row[]; row: (r
  *  (none once archived: faded and in order, they need no time); the last thing said under them. under:
  *  under a workspace's tab, a little in; a child 16px further in under its parent. The open one has a
  *  ground of its own, and is in sight as the sidebar comes or the slot changes but by a click on it. */
-function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Row; from: "list" | "topology"; under?: boolean }) {
+function SideRow({ r: { c, kind, ws, depth, full, bots, lone }, from, under }: { r: Row; from: "list" | "topology"; under?: boolean }) {
   const why = whyNot(c, kind);
   // A line under its name (#587): with none, the name is level with the logo's middle.
-  const two = why || !!c.last;
+  const two = why || !!c.last || inTui(c);
   const kid = depth > 0;
   const quiet = kind === "idle" ? "opacity-70" : kind === "archived" ? "opacity-60" : "";
   const open = openSlot(useLocation()[0]) === c.id;
   const archived = kind === "archived";
   const link = useFlash(c.id);
   const onClick = useInSight(link, c.id, open);
-  const [hold, menu] = useRowMenu(c);
+  const [hold, menu, picked] = useRowMenu(c, lone ? ws : undefined);
   return (
     // Its ground, which the Bots' marks ring themselves in, and a rename box covers it with, rounded as it is,
     // within its padding (#647).
@@ -1031,6 +1128,7 @@ function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Ro
           "grid scroll-mt-[calc(var(--tab,0px)-2rem)] scroll-mb-2 grid-cols-[var(--av)_minmax(0,1fr)_auto] items-center gap-x-2.5 rounded-lg py-1.5 pr-(--pr) pl-(--pl) [--av:28px] [--c:var(--muted-foreground)]",
           "bg-(--row)",
           !open && "hover:[--row:color-mix(in_oklab,var(--foreground)_4%,var(--sidebar))]",
+          !open && picked && "[--row:color-mix(in_oklab,var(--foreground)_4%,var(--sidebar))]",
           "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
           // Wide, the phone's two lines, the logo a size up.
           "group-data-wide/side:gap-x-3 group-data-wide/side:gap-y-0.5 group-data-wide/side:py-2.5 group-data-wide/side:[--av:40px]",
@@ -1044,7 +1142,7 @@ function SideRow({ r: { c, kind, ws, depth, full, bots }, from, under }: { r: Ro
           {c.agent ? <AgentLogo agent={c.agent} className="size-[58%]" /> : <span aria-hidden>{c.name[0]?.toUpperCase()}</span>}
           {kind !== "idle" && !archived && (
             <span className={cn("absolute -right-[3px] -bottom-[3px] size-2.5 rounded-full border-2 border-(--row) bg-(--c) group-data-wide/side:size-3", kid && "size-2 group-data-wide/side:size-2.5")}>
-              {kind === "running" && !why && <span className="absolute inset-0 rounded-full bg-(--c) opacity-55 motion-safe:animate-ripple" />}
+              {kind === "running" && !why && !inTui(c) && <span className="absolute inset-0 rounded-full bg-(--c) opacity-55 motion-safe:animate-ripple" />}
             </span>
           )}
         </span>

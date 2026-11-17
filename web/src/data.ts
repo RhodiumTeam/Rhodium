@@ -1,7 +1,7 @@
 // How the page gets its data from rhodium's board (src/board.ts, which has what each path answers)
 // and keeps it live.
 import { QueryClient } from "@tanstack/react-query";
-import type { Block, MessagesData, SlotEvent } from "../../src/board";
+import type { Block, MessagesData, SlotData, SlotEvent } from "../../src/board";
 import { fromBoard } from "../../src/contracts";
 
 export type { Block, BoardData, Card, Command, Episode, MessagesData, RhodiumData, SlotData, SlotEvent, TopologyData } from "../../src/board";
@@ -160,6 +160,16 @@ export function follow(changed: () => void, live: (on: boolean) => void, slot?: 
       builds.forEach((f) => f(entry));
       stream = id ?? "";
       front();
+    });
+    // A meter recorded (architecture §7.11): the open slot's page, its agent's, reads /api/slot again.
+    events.addEventListener("meter", (e) => {
+      const { agent } = JSON.parse((e as MessageEvent<string>).data) as { agent: string };
+      if (slot) void queryClient.invalidateQueries({ queryKey: ["slot", slot], predicate: (q) => (q.state.data as SlotData | undefined)?.agent === agent });
+    });
+    // A bot-making flow changed (architecture §8.5.1): the wizard showing it reads it again.
+    events.addEventListener("bot_flow", (e) => {
+      const { id } = JSON.parse((e as MessageEvent<string>).data) as { id: string };
+      void queryClient.invalidateQueries({ queryKey: ["bot-flow", id] });
     });
     // Not in the event table: told to the chat alone, and the rest of the page stays.
     for (const what of ["grew", "delta", "said", "exit", "pictures"]) {

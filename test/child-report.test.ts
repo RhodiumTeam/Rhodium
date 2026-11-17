@@ -27,6 +27,7 @@ const ctx: Ctx = {
   front: () => false,
   herdr: () => true,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
 };
 

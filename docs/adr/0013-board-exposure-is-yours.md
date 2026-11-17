@@ -54,4 +54,4 @@ Tailscale 模式也有一条：端口前不能再接把主机名改成本机地�
 - 页面为反代的登录过期做两件事：装到手机桌面时的清单文件带上 cookie 去取；请求说明自己是页面发的，收到 401 就整页刷新，转去反代的登录。
 - 网页终端空闲时，看板定时 ping 页面，免得反代断掉空闲的连接。
 - 配置写错只关看板，不挡 Rhodium 启动。IM 和 `rh` 照常。
-- 看板还是只听一个端口、只用一种认法。同时开两种（例如 tailnet 和 Cloudflare 一起）不做：Cloudflare 不删请求里自带的 `Tailscale-User-Login`，公网上谁都能冒充你。
+- 看板还是只听一个端口、只用一种认法。同时开两种（例如 tailnet 和 Cloudflare 一起）不做：Cloudflare 不删请求里自带的 `Tailscale-User-Login`，公网上谁都能冒充你。2026-11-17 改：可以同时开几个入口，每个入口一个端口、一种认法，见 [ADR-0014](0014-board-several-entries.md)。

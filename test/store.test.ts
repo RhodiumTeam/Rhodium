@@ -88,8 +88,9 @@ test("#276: a slot on the old ultracode level reopens on xhigh with ultracode on
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 16}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 17}`);
   db.close();
 
   const again = openStore(path);
@@ -109,8 +110,9 @@ test("#300: a bot from the release before keeps the hash of its / menu and has n
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 15}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 16}`);
   db.close();
 
   const again = openStore(path);
@@ -146,8 +148,9 @@ test("#506: a slot from the release before was last active as its turn began, ru
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 11}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 12}`);
   db.close();
 
   const again = openStore(path);
@@ -166,8 +169,9 @@ test("#668: a slot from the release before has no time of your last writing to i
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 7}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 8}`);
   db.close();
 
   const again = openStore(path);
@@ -190,8 +194,9 @@ test("#449: a bot's one owner from the release before is its one paired owner; T
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 13}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 14}`);
   db.close();
 
   const again = openStore(path);
@@ -215,8 +220,9 @@ test("#664: a slot in the terminal from the release before has no word of its ag
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 8}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 9}`);
   db.close();
 
   const again = openStore(path);
@@ -237,8 +243,9 @@ test("#669: a database that ran #664's and #668's steps already gets the reply p
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 6}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 7}`);
   db.close();
 
   const again = openStore(path);
@@ -256,8 +263,9 @@ test("#710: a slot in the terminal from the release before has no word yet of wh
   db.run("ALTER TABLE slot DROP COLUMN tuiHeldNotice"); // #709's, after all
   dropTyped(db); // #712's, after that
   db.run("ALTER TABLE slot DROP COLUMN typeIn"); // #722's
-  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's, last
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 5}`);
+  db.run("ALTER TABLE slot DROP COLUMN memBlocked"); // #692's
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, last
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 6}`);
   db.close();
 
   const again = openStore(path);
@@ -274,11 +282,27 @@ test("#692: a slot from the release before is not held up over its memory limit"
   first.close();
   const db = new Database(path);
   db.run("ALTER TABLE slot DROP COLUMN memBlocked");
-  db.run(`PRAGMA user_version = ${schemaOf(path) - 1}`);
+  db.run("ALTER TABLE conversation DROP COLUMN meter"); // #750's, after it
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 2}`);
   db.close();
 
   const again = openStore(path);
   expect(again.tx((tx) => tx.get("slot", "M")!.memBlocked)).toBeNull();
+  again.close();
+});
+
+test("#750: a conversation from the release before has heard nothing of its context yet", () => {
+  const path = freshPath();
+  const first = openStore(path);
+  first.tx((tx) => void tx.insert("conversation", { ...samples.conversation, id: "C" }));
+  first.close();
+  const db = new Database(path);
+  db.run("ALTER TABLE conversation DROP COLUMN meter");
+  db.run(`PRAGMA user_version = ${schemaOf(path) - 1}`);
+  db.close();
+
+  const again = openStore(path);
+  expect(again.tx((tx) => tx.get("conversation", "C")!.meter)).toBeNull();
   again.close();
 });
 

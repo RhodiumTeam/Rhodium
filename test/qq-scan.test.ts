@@ -1,16 +1,15 @@
-// rh bot qq's scan against the stand-in for QQ's QR service (test/fake-qq-connect.ts), in process:
+// QQ's scan in rhodium's bot-making flow, against the stand-in for QQ's QR service (test/fake-qq-connect.ts), in process:
 // a call with no answer is asked again, and only five in a row give up, in Chinese (#535).
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { ONBOARD } from "../src/bot";
+import { ONBOARD } from "../src/bot-flow";
 import { outage, QR } from "./fake-qq-connect";
 
 const CREATE = "/lite/create_bind_task";
 const POLL = "/lite/poll_bind_result";
-const scan = () => ONBOARD.qq.credentials(undefined, false);
+const scan = () => ONBOARD.qq.scan!(undefined, { say: () => {}, qr: () => {}, signal: new AbortController().signal });
 
 beforeEach(() => {
   spyOn(Bun, "sleep").mockResolvedValue(undefined); // its 2 s waits
-  spyOn(process.stdout, "write").mockReturnValue(true); // its QR codes
 });
 afterEach(() => {
   mock.restore();

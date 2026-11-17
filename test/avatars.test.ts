@@ -133,7 +133,7 @@ test("stories 234, 235, 238, 239: kept avatars and your Telegram name come to th
   writeFileSync(join(tmp, "config.toml"), `stateDir = "${dir}"\n[board]\nport = 0\nlogin = "${BOARD_LOGIN}"\n[bots.t]\nplatform = "fake"\nlike = "telegram"\nsocket = "/nowhere"\n`, { mode: 0o600 });
   const cfg = loadConfig(join(tmp, "config.toml"));
   const store = openStore(join(tmp, "rh.db"));
-  const server = serveBoard(store, cfg);
+  const server = serveBoard(store, cfg).servers[0]!;
   try {
     const { bot, chat } = store.tx((tx) => {
       const bot = tx.insert("bot", { platform: "fake", name: "t", isMain: 0, owners: JSON.stringify([String(TG_ME)]) }).id;

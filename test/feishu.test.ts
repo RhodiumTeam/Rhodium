@@ -1085,7 +1085,7 @@ test("story 319: the board shows a Feishu chat writing tool lines in full by def
         tx.insert("chat", { bot, platformChatId: ME });
       }
     });
-    const server = serveBoard(store, loadConfig(join(dir, "config.toml")));
+    const server = serveBoard(store, loadConfig(join(dir, "config.toml"))).servers[0]!;
     try {
       const res = await fetch(`http://127.0.0.1:${server.port}/api/topology`, { headers: { "Tailscale-User-Login": BOARD_LOGIN } });
       const g = (await res.json()) as { bots: { id: string; name: string; platform: string }[]; chats: { bot: string; verbose: boolean }[] };

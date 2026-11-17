@@ -4,8 +4,9 @@
 // buttons, the rows' menus and the board's toasts, loaded once they show: the board's first screen stays light.
 import { AlertDialog } from "@base-ui/react/alert-dialog";
 import { Menu } from "@base-ui/react/menu";
+import { Tooltip } from "@base-ui/react/tooltip";
 import { cn } from "cn";
-import { Archive, ArchiveRestore, ArrowUp, Check, ChevronDown, CircleAlert, CornerUpRight, FileText, List, ListPlus, LoaderCircle, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, Quote, RotateCw, Square, SquarePen, SquareTerminal, Terminal, Trash2, Workflow, X, Zap, type LucideIcon } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowUp, Check, ChevronDown, CircleAlert, Copy, CornerUpRight, FileText, Info, Import, List, ListPlus, LoaderCircle, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, Quote, RotateCw, Square, SquarePen, SquarePlus, SquareTerminal, Terminal, Trash2, Workflow, X, Zap, type LucideIcon } from "lucide-react";
 import { lazy, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject, type UIEvent } from "react";
 import { useLocation } from "wouter";
 import { AGENTS, TYPING } from "../../src/agents";
@@ -17,6 +18,7 @@ import { AgentLogo, breakLong, chatAt, edges, FileRow, goHash, MAC, Max, ModelNa
 import { buttonVariants } from "./components/ui/button";
 import { json, posting, request, type Card, type Command, type Messages, type Sent, type SlotData } from "./data";
 import { InfoCard } from "./card";
+import { MeterPop, Ring, Strips, useGrey } from "./meter";
 import { AgentSheet, Answer, matching, ModelSheet, Palette } from "./palette";
 import { dismiss, toast, useToasts, type Toast } from "./toast";
 import { useTerminalEntry } from "./settings";
@@ -29,7 +31,7 @@ const TRIES = 3;
 /** POSTs init's body to path, and resolves to rhodium's answer; it never rejects, so a button is never
  *  left busy. One whose answer the network lost, even mid-body, or that met a 502 while rhodium
  *  restarts, goes again as it was, with the same id, which rhodium does once (story 257). */
-async function post(path: string, init: RequestInit): Promise<RhReply> {
+export async function post(path: string, init: RequestInit): Promise<RhReply> {
   const read = async (r: Response): Promise<RhReply | null> =>
     r.ok ? ((await r.json()) as RhReply) : r.status < 500 ? { ok: false, error: (await r.text()).trim() || `出错了（${r.status}）` } : null;
   // Out, the page does not load itself again for a new build (web/src/main.tsx).
@@ -70,6 +72,16 @@ export function forAgent(text: string, files: number): string | null {
   const words = bang ? text.slice(bang[0].length) : text;
   if (bang && !words.trim() && !files) return null;
   return words.trimStart().startsWith("/") ? null : words;
+}
+
+/** Whether the terminal's agent runs text as a command it types bare (TYPING's runs, #737). */
+const runsIn = (agent: AgentKind | null, terminal: boolean, text: string) => terminal && agent !== null && !!TYPING[agent]?.runs?.test(text.trim());
+
+/** What of text sent goes into the message box's ↑ history (story 650): what the transcript shows as
+ *  yours, as forAgent has it. Not a ! the terminal's agent runs in its shell: its transcript keeps it as
+ *  no message of yours, and brought back without the ! it would go as words for the agent. */
+export function recalled(text: string, files: number, agent: AgentKind | null, terminal: boolean): string | undefined {
+  return runsIn(agent, terminal, text) ? undefined : forAgent(text.trim(), files)?.trim() || undefined;
 }
 
 /** What you typed, with files attached, under the reply you quote (story 573), as a quote from IM
@@ -134,14 +146,36 @@ export function keepDraft(slot: string, text: string): void {
   } catch {}
 }
 
+/** Where ↑ or ↓ leaves you in what you said in the slot (story 650), newest first: at, an index in
+ *  said, -1 for your draft. ↑ stops at the oldest; ↓, past the newest, is back at the draft. */
+export const walk = (said: string[], at: number, key: "up" | "down") => (key === "up" ? Math.min(at + 1, said.length - 1) : Math.max(at - 1, -1));
+
+/** What you said with words just sent first, the same as the newest once, the newest 100 kept (story 650). */
+export const withSent = (said: string[], words: string) => (said[0] === words ? said : [words, ...said].slice(0, 100));
+
+/** Whether the caret in box is on its first line as it shows (up), or its last, wrapped lines too
+ *  (spec web-import-composer "输入历史"): the text up to it, to the end of its word as a word wraps
+ *  whole (not CJK, which breaks between any two characters), is one line high, or as high as all of it, in a hidden copy of the box. */
+function onEdge(box: HTMLTextAreaElement, up: boolean): boolean {
+  const { value, selectionStart: pos } = box;
+  const to = value.slice(0, pos + /^[\p{sc=Latin}\p{sc=Greek}\p{sc=Cyrillic}\p{N}_]*/u.exec(value.slice(pos))![0].length);
+  const copy = box.cloneNode() as HTMLTextAreaElement;
+  copy.style.cssText = `position:absolute;visibility:hidden;width:${box.clientWidth}px;height:0;min-height:0;max-height:none;overflow:hidden;field-sizing:fixed`;
+  box.after(copy);
+  const tall = (t: string) => ((copy.value = t), copy.scrollHeight);
+  const edge = tall(to) === tall(up ? "" : value);
+  copy.remove();
+  return edge;
+}
+
 /** Says how the act went in a toast, with 撤销 when it can be undone. */
 export const told = (r: RhReply) => (r.ok ? toast(r.text, false, r.undo) : toast(r.error, true));
-
-/** The toasts, newest at the bottom, over what is at the bottom of the screen. Each goes when tapped. */
+/** The toasts, newest at the bottom, over what is at the bottom of the screen and over any popover open there (#761). Each goes when tapped;
+ *  data-pop keeps that tap from also closing the popover. */
 export function Toasts() {
   const list = useToasts();
   return (
-    <div role="status" className="pointer-events-none absolute inset-x-0 bottom-full z-[60] mb-2 grid justify-items-center gap-2 px-4">
+    <div data-pop role="status" className="pointer-events-none absolute inset-x-0 bottom-full z-[75] mb-2 grid justify-items-center gap-2 px-4">
       {list.map((t) => (
         <ToastView key={t.id} t={t} />
       ))}
@@ -156,7 +190,7 @@ function ToastView({ t }: { t: Toast }) {
   return (
     <div className={cn("pointer-events-auto relative flex max-w-full items-center overflow-hidden rounded-lg border bg-popover text-sm text-popover-foreground shadow-md", t.error && "border-destructive/50 text-destructive")}>
       <button onClick={() => dismiss(t.id)} className="flex min-w-0 items-start gap-2 px-3 py-2 text-left transition-colors hover:bg-foreground/5">
-        {t.error ? <CircleAlert className="mt-0.5 size-4 shrink-0" /> : <Check className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
+        {t.error ? <CircleAlert className="mt-0.5 size-4 shrink-0" /> : t.info ? <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" /> : <Check className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
         <span className="min-w-0 whitespace-pre-wrap wrap-anywhere">{t.text}</span>
       </button>
       {t.undo && (
@@ -207,8 +241,26 @@ export function keep(storage: () => Storage, key: string, value: string | null) 
   } catch {}
 }
 
+/** 复制: copies text as written, a check for 2 s once it did; one it could not says so (story 572). */
+export function CopyKey({ text, className, icon, disabled }: { text: string; className: string; icon: string; disabled?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () =>
+    navigator.clipboard.writeText(text).then(
+      () => (setCopied(true), setTimeout(() => setCopied(false), 2000)),
+      () => toast("没能复制。", true),
+    );
+  return (
+    <button type="button" aria-label="复制" disabled={disabled} onClick={copy} className={className}>
+      {copied ? <Check className={icon} /> : <Copy className={icon} />}
+    </button>
+  );
+}
+
 /** A choice in a menu: its icon and what it says; on: the one now, ticked. */
-export type Choice = { icon?: LucideIcon; label: string; on?: boolean; run: () => void };
+/** A menu's choice: its icon, what it says, whether it is what is on now, and what it does. apart: a line
+ *  above it, setting it and those after it apart from those before. off: greyed, and why, shown under
+ *  a mouse; danger: red, as what cannot be undone. */
+export type Choice = { icon?: LucideIcon; label: string; on?: boolean; apart?: boolean; off?: string; danger?: boolean; run: () => void };
 
 /** The menu's choices, each a 44px row, under head. */
 function Choices({ choices, head, back }: { choices: Choice[]; head?: ReactNode; back?: RefObject<HTMLElement | null> }) {
@@ -216,13 +268,31 @@ function Choices({ choices, head, back }: { choices: Choice[]; head?: ReactNode;
     // Not back on what opened it once closed: 改名 puts the focus in the title. back: where it goes instead.
     <Menu.Popup finalFocus={back ?? false} className="min-w-44 rounded-xl border bg-popover p-1 text-sm text-popover-foreground shadow-lg outline-none transition-opacity data-ending-style:opacity-0 data-starting-style:opacity-0">
       {head}
-      {choices.map((c) => (
-        <Menu.Item key={c.label} onClick={c.run} className="flex h-11 cursor-default items-center gap-2.5 rounded-lg px-3 outline-none select-none data-highlighted:bg-muted">
-          {c.icon && <c.icon className="size-4 shrink-0 text-muted-foreground" />}
-          {c.label}
-          {c.on && <Check aria-label="现在" className="ml-auto size-4 shrink-0 text-running" />}
-        </Menu.Item>
-      ))}
+      {choices.map((c) => {
+        const item = (
+          // A tooltip comes under a mouse alone: a finger on a greyed one is told why in a toast (story 671).
+          <Menu.Item key={c.label} disabled={!!c.off} onClick={c.run} onPointerUp={(e) => void (c.off && e.pointerType !== "mouse" && toast(c.off, "info"))} className={cn("flex h-11 cursor-default items-center gap-2.5 rounded-lg px-3 outline-none select-none data-disabled:opacity-50 data-highlighted:bg-muted", c.danger && "text-destructive")}>
+            {c.icon && <c.icon className={cn("size-4 shrink-0", c.danger ? "text-destructive" : "text-muted-foreground")} />}
+            {c.label}
+            {c.on && <Check aria-label="现在" className="ml-auto size-4 shrink-0 text-running" />}
+          </Menu.Item>
+        );
+        return [
+          c.apart && <Menu.Separator key={`${c.label}-apart`} className="mx-2 my-1 h-px bg-border" />,
+          c.off ? (
+            <Tooltip.Root key={c.label}>
+              <Tooltip.Trigger render={item} />
+              <Tooltip.Portal>
+                <Tooltip.Positioner side="right" sideOffset={6} collisionPadding={8} className="z-[80]">
+                  <Tooltip.Popup className="rounded-md bg-foreground px-2 py-1 text-xs text-background shadow transition-opacity data-ending-style:opacity-0 data-starting-style:opacity-0">{c.off}</Tooltip.Popup>
+                </Tooltip.Positioner>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+          ) : (
+            item
+          ),
+        ];
+      })}
     </Menu.Popup>
   );
 }
@@ -244,13 +314,13 @@ export function Pick({ label, choices, head, side = "bottom", disabled, classNam
 }
 
 /** The same menu where the pointer is, as a right click opens one; null: closed. back: where the focus goes once closed. */
-export function MenuAt({ at, close, choices, back }: { at: { x: number; y: number } | null; close: () => void; choices: Choice[]; back?: RefObject<HTMLElement | null> }) {
+export function MenuAt({ at, close, choices, head, back }: { at: { x: number; y: number } | null; close: () => void; choices: Choice[]; head?: ReactNode; back?: RefObject<HTMLElement | null> }) {
   const anchor = at && { getBoundingClientRect: () => DOMRect.fromRect({ x: at.x, y: at.y, width: 0, height: 0 }) };
   return (
     <Menu.Root open={at !== null} onOpenChange={(open) => !open && close()}>
       <Menu.Portal>
         <Menu.Positioner anchor={anchor} side="bottom" align="start" collisionPadding={8} className="z-[70]">
-          <Choices choices={choices} back={back} />
+          <Choices choices={choices} head={head} back={back} />
         </Menu.Positioner>
       </Menu.Portal>
     </Menu.Root>
@@ -339,28 +409,40 @@ export function Remove({ slot, name, open, onOpenChange }: { slot: string; name:
   );
 }
 
-/** A headless slot's row's menu on the list and the sidebar (spec web-write "列表行的菜单", stories 535,
- *  550), at where the right click was; null: closed. A live one's are what its chat's 更多 and the bar
+/** A slot's row's menu on the list and the sidebar (spec web-write "列表行的菜单", stories 535,
+ *  550), at where the right click was; null: closed. One in the terminal, never archived here, has 置顶
+ *  or 取消置顶, 改名 and 收回终端, asking first (story 660). A live one's are what its chat's 更多 and the bar
  *  under where you type do: 停止 while its turn runs, 开新对话, 改名, the name in its row turning into a
  *  box, 切到终端, asking first, unless 终端入口 is off or there is no Herdr, and 归档, its toast with 撤销; and, after 停止, 置顶 or 取消置顶 (#506). An
  *  archived one has 恢复 and 删除. */
-export function RowMenu({ c, at, close }: { c: Card; at: { x: number; y: number } | null; close: () => void }) {
+export function RowMenu({ c, at, close, make }: { c: Card; at: { x: number; y: number } | null; close: () => void; make?: (sheet: "new" | "import") => void }) {
   const [, run] = useAct();
   const [removing, setRemoving] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [switching, setSwitching] = useState(false);
+  const [taking, setTaking] = useState(false);
   const entry = useTerminalEntry();
   // In a turn, as inTurn has it, by the state the board names.
   const turn = ["启动中", "运行中", "需要你"].includes(c.state);
+  const pin: Choice = c.pinnedAt === null ? { icon: Pin, label: "置顶", run: () => void run({ kind: "pin", slot: c.id, on: true }) } : { icon: PinOff, label: "取消置顶", run: () => void run({ kind: "pin", slot: c.id, on: false }) };
+  const makes: Choice[] = make
+    ? [
+        { icon: SquarePlus, label: "新建槽位", apart: true, run: () => make("new") },
+        { icon: Import, label: "导入", run: () => make("import") },
+      ]
+    : [];
   const choices: Choice[] =
-    c.archivedAt === null
+    c.mode === "tui"
+      ? [pin, { icon: Pencil, label: "改名", run: () => setRenaming(true) }, { icon: SquareTerminal, label: "收回终端", run: () => setTaking(true) }, ...makes]
+      : c.archivedAt === null
       ? [
           ...(turn ? [{ icon: Square, label: "停止", run: () => void run({ kind: "common", slot: c.id, name: "stop" }) }] : []),
-          c.pinnedAt === null ? { icon: Pin, label: "置顶", run: () => void run({ kind: "pin", slot: c.id, on: true }) } : { icon: PinOff, label: "取消置顶", run: () => void run({ kind: "pin", slot: c.id, on: false }) },
+          pin,
           { icon: SquarePen, label: "开新对话", run: () => void act({ kind: "common", slot: c.id, name: "new" }).then(told) },
           { icon: Pencil, label: "改名", run: () => setRenaming(true) },
           ...(entry ? [{ icon: SquareTerminal, label: "切到终端", run: () => setSwitching(true) }] : []),
           { icon: Archive, label: "归档", run: () => void run({ kind: "rh", argv: ["archive", c.id] }) },
+          ...makes,
         ]
       : [
           { icon: ArchiveRestore, label: "恢复", run: () => void run({ kind: "rh", argv: ["unarchive", c.id] }) },
@@ -378,6 +460,7 @@ export function RowMenu({ c, at, close }: { c: Card; at: { x: number; y: number 
         </div>
       )}
       <ToTerminal slot={c.id} turn={turn} open={switching} onOpenChange={setSwitching} />
+      <TakeBack slot={c.id} open={taking} onOpenChange={setTaking} />
       <Remove slot={c.id} name={c.ref} open={removing} onOpenChange={setRemoving} />
     </>
   );
@@ -447,14 +530,15 @@ export function Rename({ d, done }: { d: { id: string; ref: string }; done: () =
   );
 }
 
-/** A dialog asking title, its buttons two a row under it. Placed by its top, a two-button one in the
- *  middle: a row it grows as a turn starts goes under the rest, which stay put (story 476). */
-function Asks({ title, children }: { title: string; children: ReactNode }) {
+/** A dialog asking title, sub under it, its buttons two a row under them. Placed by its top, a two-button
+ *  one in the middle: a row it grows as a turn starts goes under the rest, which stay put (story 476). */
+export function Asks({ title, sub, children }: { title: string; sub?: string; children: ReactNode }) {
   return (
     <AlertDialog.Portal>
       <AlertDialog.Backdrop className="fixed inset-0 z-50 bg-black/30 transition-opacity data-ending-style:opacity-0 data-starting-style:opacity-0" />
       <AlertDialog.Popup className="fixed top-[calc(50%-3.5rem)] left-1/2 z-50 w-[min(20rem,calc(100vw-2rem))] -translate-x-1/2 rounded-xl border bg-popover p-4 text-popover-foreground shadow-lg transition data-ending-style:scale-95 data-ending-style:opacity-0 data-starting-style:scale-95 data-starting-style:opacity-0">
         <AlertDialog.Title className="font-semibold">{title}</AlertDialog.Title>
+        {sub && <AlertDialog.Description className="mt-1 text-sm text-muted-foreground">{sub}</AlertDialog.Description>}
         <div className="mt-4 grid grid-cols-2 gap-2">{children}</div>
       </AlertDialog.Popup>
     </AlertDialog.Portal>
@@ -509,13 +593,15 @@ async function command(slot: string, words: string): Promise<RhReply> {
 export const frame = (r: RhReply): "card" | "toast" => (r.ok && (r.card || r.panel) ? "card" : "toast");
 
 /** What the page does itself for a command typed or picked: /rh_agent alone opens the bar's agent
- *  sheet, /model, /effort or /ultracode alone its model sheet, as their buttons do (story 297), but
+ *  sheet, /model, /effort or /ultracode alone its model popover, as their buttons do (story 297), but
  *  /ultracode on an agent without it, as pi, goes as typed (story 413); /rh_ls takes you to the list, /rh_help
- *  brings up the commands (story 412). null: it goes as typed. */
-export function byPage(words: string, agent: AgentKind | null): "agent" | "model" | "ls" | "help" | null {
+ *  brings up the commands (story 412); /usage and /context alone open the ring's popover, which starts
+ *  no agent (story 655). null: it goes as typed. */
+export function byPage(words: string, agent: AgentKind | null): "agent" | "model" | "meter" | "ls" | "help" | null {
   const w = words.trim();
   if (/^\/rh_ls(\s|$)/.test(w)) return "ls";
   if (/^\/rh_help(\s|$)/.test(w)) return "help";
+  if (/^\/(usage|context)$/.test(w)) return "meter";
   const name = /^\/(rh_agent|model|effort|ultracode)$/.exec(w)?.[1];
   return !name || (name === "ultracode" && agent !== null && !AGENTS[agent].ultracode) ? null : name === "rh_agent" ? "agent" : "model";
 }
@@ -581,7 +667,7 @@ const MAX_FILES = 20 << 20;
 /** Where you type to the slot (spec web-write "页面"). terminal: under the chat of a slot in the terminal,
  *  whose words Rhodium types in there (#737): words, files and a quote only, no palette, no bar, no stop;
  *  a / or ! command its agent runs goes as typed, a ! told it runs in the shell. */
-export function Composer({ slot, turn, archived, switchable, log, changed, commands, agent, model, effort, ultracode, terminal = false }: { slot: string; turn: boolean; archived: boolean; switchable: boolean; log: Messages; changed: () => void; commands: Command[]; agent: AgentKind | null; model: string | null; effort: string | null; ultracode: boolean; terminal?: boolean }) {
+export function Composer({ slot, turn, archived, switchable, log, changed, commands, agent, model, effort, ultracode, meter, live, terminal = false }: { slot: string; turn: boolean; archived: boolean; switchable: boolean; log: Messages; changed: () => void; commands: Command[]; agent: AgentKind | null; model: string | null; effort: string | null; ultracode: boolean; meter: SlotData["meter"]; live: boolean; terminal?: boolean }) {
   const [text, setText] = useState(() => draft(slot));
   const [files, setFiles] = useState<File[]>(() => unsentFiles.get(slot) ?? []);
   useEffect(() => void (files.length ? unsentFiles.set(slot, files) : unsentFiles.delete(slot)), [slot, files]);
@@ -592,8 +678,9 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
   // The palette: the command ↑↓ are on, and what was typed when Esc closed it, till you type on.
   const [at, setAt] = useState(0);
   const [shut, setShut] = useState<string | null>(null);
-  // The info card open: a command's answer, with the command said, or one of the bar's sheets.
-  const [shown, setShown] = useState<Shown | "agent" | "model" | null>(null);
+  // The info card open: a command's answer, with the command said, or one of the bar's sheets; or a
+  // popover, the model's or the ring's.
+  const [shown, setShown] = useState<Shown | "agent" | "model" | "meter" | null>(null);
   // Whether Enter sends, as picked on this device from the send key's menu (story 511), and where that menu is open.
   const [enterSends, setEnterSends] = useState(() => kept(() => localStorage, "send-key") === "enter");
   const [keysAt, setKeysAt] = useState<{ x: number; y: number } | null>(null);
@@ -604,18 +691,64 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
   const send = (text: string) => act({ kind: "say", slot, text });
   const picker = useRef<HTMLInputElement>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+  const ring = useRef<HTMLButtonElement>(null);
+  const modelKey = useRef<HTMLButtonElement>(null);
+  const agentKey = useRef<HTMLButtonElement>(null);
+  const grey = useGrey(live, meter.quota?.at ?? null);
   const edged = useEdges(box);
-  const type = (t: string) => (setText(t), keepDraft(slot, t), setAt(0), setShut(null));
+  const bar = useRef<HTMLDivElement>(null);
+  const named = useRef<HTMLSpanElement>(null);
+  // On a narrow phone the ring's figure, then the effort, then the ultracode sign give way, one at a time,
+  // while the model's name is cut (#752). Measured: the words in them vary in width.
+  useLayoutEffect(() => {
+    const el = bar.current!;
+    const fit = () => {
+      const drop = ["figure", "effort", "ultracode"].map((d) => el.querySelector(`[data-drop=${d}]`));
+      for (const d of drop) d?.removeAttribute("hidden");
+      const n = named.current;
+      for (const d of drop) if (n && n.scrollWidth > n.clientWidth) d?.setAttribute("hidden", "");
+    };
+    fit();
+    const sized = new ResizeObserver(fit);
+    sized.observe(el);
+    return () => sized.disconnect();
+  }, [agent, model, effort, ultracode, meter.context, switchable, terminal, archived]);
+  // What you said in the slot, fetched at the first ↑ (story 650), and where ↑↓ are in it, -1 your draft;
+  // where the caret goes once one is brought back.
+  const said = useRef<Promise<string[] | null> | null>(null);
+  const back = useRef(-1);
+  const caret = useRef<"start" | "end" | null>(null);
+  const type = (t: string) => ((back.current = -1), setText(t), keepDraft(slot, t), setAt(0), setShut(null));
+  /** ↑ or ↓ through what you said: the draft kept stays yours, so a reload mid-way has it back. */
+  const recall = async (key: "up" | "down") => {
+    said.current ??= json<{ said: string[] }>(`api/history?slot=${encodeURIComponent(slot)}`).then(
+      (r) => r.said,
+      () => (said.current = null),
+    );
+    const list = await said.current;
+    const to = list && walk(list, back.current, key);
+    if (list === null || to === back.current) return;
+    back.current = to!;
+    caret.current = key === "up" ? "start" : "end";
+    setText(to! < 0 ? draft(slot) : list[to!]!);
+    setAt(0);
+    setShut(null);
+  };
   const list = !terminal && /^\/\S*$/.test(text) && text !== shut ? matching(commands, text.slice(1)) : [];
   // A command its terminal's agent runs (TYPING's runs): a ! one goes to its shell.
-  const runs = terminal && agent !== null && !!TYPING[agent]?.runs?.test(text.trim());
+  const runs = runsIn(agent, terminal, text);
   const shell = runs && text.trim().startsWith("!");
   const empty = !text.trim() && !files.length;
   const mode = keyMode(turn, text, files.length);
   const stop = turn && empty;
   // At its full height, text written in grows it no more and, away from the caret, scrolls it not:
   // its fade is read again as the text changes (#579).
-  useLayoutEffect(() => edges(box.current!), [text]);
+  useLayoutEffect(() => {
+    const b = box.current!;
+    if (caret.current) b.selectionStart = b.selectionEnd = caret.current === "start" ? 0 : b.value.length;
+    caret.current = null;
+    edges(b);
+  }, [text]);
   // Words given back or taken from the queue to edit go after what is here.
   const current = useRef(text);
   current.current = text;
@@ -639,14 +772,14 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
   };
   /** Opens the bar's sheet p, or, tapped on its button again, closes it (story 519). On a touch screen
    *  the keyboard goes first, which would push the sheet's top off the screen (story 522). */
-  const sheet = (p: "agent" | "model", again = false) => {
+  const sheet = (p: "agent" | "model" | "meter", again = false) => {
     if (matchMedia("(pointer: coarse)").matches) box.current?.blur();
     setShown((s) => (again && s === p ? null : p));
   };
   /** Does what the page does itself for words (byPage), and says whether there was any. */
   const own = (words: string) => {
     const p = byPage(words, agent);
-    if (p === "agent" || p === "model") sheet(p);
+    if (p === "agent" || p === "model" || p === "meter") sheet(p);
     else if (p === "help") (type("/"), box.current?.focus());
     // On a wide screen the list goes beside the chat; on a phone, in its place; in maximize mode the
     // sidebar is there already, expanded first if collapsed.
@@ -681,6 +814,8 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
     const words = quoted === null || (terminal && /^[!/]/.test(typed.trim())) ? typed.trim() : withQuote(quoted, typed.trim(), files.length);
     if (words !== typed.trim()) setQuoted(null);
     const shown = queued ? null : forAgent(words, files.length);
+    const yours = recalled(typed, files.length, agent, terminal);
+    if (yours && said.current) said.current = said.current.then((l) => l && withSent(l, yours));
     const s: Sent = { id: crypto.randomUUID(), text: shown ?? "", words, files, from: log.end };
     if (shown !== null) log.sent.push(s);
     type("");
@@ -712,12 +847,23 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
   };
   return (
     <div className="px-3 pt-1 pb-[calc(0.5rem+env(safe-area-inset-bottom))]">
-      {reply?.card && <InfoCard card={reply.card} close={() => setShown(null)} run={(c) => run(c, reply)} />}
+      {reply?.card && <InfoCard card={reply.card} anchor={box} close={() => setShown(null)} run={(c) => run(c, reply)} />}
       {reply?.panel && <Answer r={reply} name={/^\/(\S+)/.exec(reply.said)?.[1] ?? ""} close={() => setShown(null)} pick={(c) => choose(c, reply)} />}
-      {agent && <AgentSheet open={shown === "agent"} close={() => setShown((s) => (s === "agent" ? null : s))} agent={agent} turn={turn} send={send} />}
+      {agent && <AgentSheet open={shown === "agent"} anchor={agentKey} close={() => setShown((s) => (s === "agent" ? null : s))} agent={agent} turn={turn} send={send} />}
       {/* With a mouse its search box took the keyboard: closed, the caret is back where you type. */}
-      <ModelSheet open={shown === "model"} close={() => (setShown((s) => (s === "model" ? null : s)), matchMedia("(pointer: fine)").matches && box.current?.focus())} send={send} />
-      <div className="relative mx-auto max-w-3xl rounded-3xl border bg-card shadow-xs">
+      <ModelSheet open={shown === "model"} anchor={modelKey} close={() => (setShown((s) => (s === "model" ? null : s)), matchMedia("(pointer: fine)").matches && box.current?.focus())} send={send} />
+      <MeterPop
+        slot={slot}
+        open={shown === "meter"}
+        anchor={ring}
+        close={() => setShown((s) => (s === "meter" ? null : s))}
+        meter={meter}
+        live={live}
+        agent={agent}
+        // A slot in the terminal has no 压缩 here (spec web-import-composer "上下文和额度").
+        compact={terminal ? undefined : async () => (setShown(null), show(await send("/compact"), "/compact"))}
+      />
+      <div data-box className="relative mx-auto max-w-3xl rounded-3xl border bg-card shadow-xs">
         {list.length > 0 && <Palette list={list} at={Math.min(at, list.length - 1)} pick={pick} point={setAt} />}
         {quoted !== null && (
           <div className="flex items-center gap-1.5 pt-1.5 pl-4 text-sm text-muted-foreground">
@@ -755,7 +901,11 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
             // method still composes what you type: its Enter takes the word, its Esc ends the composing.
             if (e.nativeEvent.isComposing || e.keyCode === 229) return;
             const move = list.length && { ArrowDown: 1, ArrowUp: -1 }[e.key];
+            const arrow = { ArrowUp: "up", ArrowDown: "down" }[e.key] as "up" | "down" | undefined;
+            const b = e.currentTarget;
             if (move) setAt((Math.min(at, list.length - 1) + move + list.length) % list.length);
+            // Through what you said (story 650), on a computer: from the first line up, the last down, nothing selected.
+            else if (arrow && (arrow === "up" || back.current >= 0) && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && b.selectionStart === b.selectionEnd && matchMedia("(pointer: fine)").matches && onEdge(b, arrow === "up")) void recall(arrow);
             else if (list.length && !e.ctrlKey && !e.metaKey && (e.key === "Enter" || e.key === "Tab")) pick(list[Math.min(at, list.length - 1)]!);
             else if (list.length && e.key === "Escape") setShut(text);
             else if (e.key === "Escape" && shown) setShown(null);
@@ -773,18 +923,22 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
           // has them, with nothing over it (#646).
           className={cn("card-scroll edge-fade-y block max-h-[40dvh] scroll-py-8 min-h-11 w-full resize-none [clip-path:border-box] bg-transparent px-4 pt-3 pb-1 text-base outline-none [field-sizing:content] placeholder:text-muted-foreground", quoted === null && !files.length && !shell && "rounded-t-[inherit]")}
         />
-        <div className="flex min-w-0 items-center px-1 pb-1">
+        <div ref={bar} className="flex min-w-0 items-center px-1 pb-1">
           {agent && !archived && !terminal && (
             <>
-              <button aria-label="换 agent" aria-expanded={shown === "agent"} onClick={() => sheet("agent", true)} className="hover-round grid size-11 shrink-0 place-items-center">
+              <button ref={agentKey} data-pop aria-label="换 agent" aria-expanded={shown === "agent"} onClick={() => sheet("agent", true)} className="hover-round grid size-11 shrink-0 place-items-center">
                 <AgentLogo agent={agent} className="size-5" />
               </button>
-              <button aria-label="模型和思考强度" aria-expanded={shown === "model"} onClick={() => sheet("model", true)} className="flex h-11 min-w-0 items-center gap-1 rounded-full pr-2 pl-3 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-6 focus-visible:outline-ring">
-                <span className="truncate">
+              <button ref={modelKey} data-pop aria-label="模型和思考强度" aria-expanded={shown === "model"} onClick={() => sheet("model", true)} className="flex h-11 min-w-0 items-center gap-1 rounded-full pr-2 pl-3 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-6 focus-visible:outline-ring">
+                <span ref={named} className="truncate">
                   <ModelName name={model ?? "默认"} />
                 </span>
-                {effort && <span className="shrink-0">{effort}</span>}
-                {ultracode && <Workflow aria-label="ultracode" className="size-3.5 shrink-0" />}
+                {effort && (
+                  <span data-drop="effort" className="shrink-0">
+                    {effort}
+                  </span>
+                )}
+                {ultracode && <Workflow data-drop="ultracode" aria-label="ultracode" className="size-3.5 shrink-0" />}
                 <ChevronDown className="size-3.5 shrink-0" />
               </button>
             </>
@@ -804,7 +958,12 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
               e.target.value = "";
             }}
           />
-          <button aria-label="添加图片或文件" onClick={() => picker.current?.click()} className="hover-round ml-auto grid size-11 shrink-0 place-items-center text-muted-foreground hover:text-foreground">
+          {/* The strips (a wide screen's only), the ring, + and the key (stories 652, 653, 668). */}
+          <div className="ml-auto flex shrink-0 items-center">
+            <Strips limits={meter.quota?.limits ?? []} grey={grey.quota} open={shown === "meter"} toggle={() => sheet("meter", true)} className="hidden room:flex" />
+            <Ring ref={ring} context={meter.context} grey={grey.numbers} open={shown === "meter"} toggle={() => sheet("meter", true)} />
+          </div>
+          <button aria-label="添加图片或文件" onClick={() => picker.current?.click()} className="hover-round grid size-11 shrink-0 place-items-center text-muted-foreground hover:text-foreground">
             <Plus className="size-5" />
           </button>
           <Key mode={mode} busy={busy} idle={empty && !stop} onClick={() => void go()} onContextMenu={(e) => (e.preventDefault(), setKeysAt({ x: e.clientX, y: e.clientY }))} />

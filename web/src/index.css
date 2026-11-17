@@ -143,6 +143,14 @@
 /* A screen 480px high or more: an info card's title and foot stay in place as the rest scrolls (story 520). */
 @custom-variant tall (@media (min-height: 30rem));
 
+/* A wide or medium screen, as ROOM (web/src/common.tsx) has it: the message box's bar has the quota strips (story 652). */
+@custom-variant room {
+  /* The block form: in the short one Tailwind splits the query's top-level comma as between selectors. */
+  @media (min-width: 64rem), (min-width: 37.5rem) and (min-height: 30rem) {
+    @slot;
+  }
+}
+
 /* A pointer that can hover, as a mouse: a message's keys show only then, small, in the gap under it (story 571). */
 @custom-variant mouse (@media (hover: hover));
 

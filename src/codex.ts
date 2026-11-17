@@ -32,6 +32,14 @@ const policy = (approval: boolean) => (approval ? "untrusted" : "never");
 const SHELLS = new Set(["zsh", "bash", "sh"]);
 // A quota window by its length in minutes (architecture §6.4).
 const WINDOW: Record<number, QuotaWindow["window"]> = { 300: "5h", 10080: "7d" };
+/** A quota bucket's windows, its fields as account/rateLimits/read names them (architecture §6.4), each
+ *  with the bucket's limitId; model: the one model it is for. */
+export const windowsOf = (b: Json, model?: string): QuotaWindow[] =>
+  [b.primary, b.secondary].flatMap((w: Json | null): QuotaWindow[] => {
+    const window = w && WINDOW[w.windowDurationMins];
+    if (!window) return [];
+    return [{ window, ...(model && { model }), usedPercent: w.usedPercent, resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null, limitId: String(b.limitId ?? "codex") }];
+  });
 // How long Rhodium waits for what it asks Codex besides, for /status or a turn out of quota: it goes on
 // without what is slow.
 const EXTRA_WAIT = 2_000;
@@ -547,14 +555,7 @@ export class CodexDriver implements AgentDriver {
     const buckets: Json[] = [main, ...Object.values((r.rateLimitsByLimitId ?? {}) as Record<string, Json>).filter((b) => b.limitId !== main.limitId)];
     // A model's bucket by the model's name.
     const names = new Map(buckets.some((b) => b.normalModelSlug) ? (await this.models().catch(() => [])).map((m) => [m.id, m.displayName]) : []);
-    const limits = buckets.flatMap((b) =>
-      [b.primary, b.secondary].flatMap((w: Json | null): QuotaWindow[] => {
-        const window = w && WINDOW[w.windowDurationMins];
-        if (!window) return [];
-        const model = b.normalModelSlug && String(names.get(b.normalModelSlug) ?? b.normalModelSlug);
-        return [{ window, ...(model && { model }), usedPercent: w.usedPercent, resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null }];
-      }),
-    );
+    const limits = buckets.flatMap((b) => windowsOf(b, b.normalModelSlug && String(names.get(b.normalModelSlug) ?? b.normalModelSlug)));
     const c = main.credits;
     return { limits, ...(c?.hasCredits && c.balance != null && { credits: Number(c.balance) }) };
   }

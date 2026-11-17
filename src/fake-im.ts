@@ -385,7 +385,8 @@ export class FakeBot implements ImAdapter {
   /** Call once. A message is acked when the next one is asked for, so one rhodium took but never
    *  finished with comes again after a restart, as with Telegram's offset. The first poll, and the
    *  first after a refused one, is answered at once, so connected hears right away. */
-  async *messages(connected?: Connected): AsyncGenerator<InboundMessage> {
+  async *messages(connected?: Connected, stop?: AbortSignal): AsyncGenerator<InboundMessage> {
+    stop?.addEventListener("abort", () => this.close());
     let after = 0;
     let wait = false;
     while (!this.stop.signal.aborted) {

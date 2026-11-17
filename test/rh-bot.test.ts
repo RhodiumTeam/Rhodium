@@ -1,6 +1,7 @@
 // rh bot (seam one): you make a bot at your terminal; rhodium writes it into its config file bound
 // to a slot, takes it in while it runs on and gives the pairing code (product §5.11, architecture
-// §8.5). Telegram's Bot API is a local stand-in, and so is QQ's QR service, preloaded into rh, and
+// §8.5). Behind it, rh bot shows a flow rhodium runs (architecture §8.5.1), as the board does.
+// Telegram's Bot API is a local stand-in, and so is QQ's QR service, preloaded into rhodium, and
 // Feishu (test/feishu-api.ts), its scan included.
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -11,9 +12,12 @@ import { APP, BOT, feishuApi, ME, SECRET } from "./feishu-api";
 import type { Script } from "./fake-agent/fake-agent";
 import { endTurn, on, startTurn } from "./fake-agent/scripts";
 import { QR } from "./fake-qq-connect";
-import { newInstance, until, type Instance } from "./instance";
+import { newInstance, terminal, until, type Instance } from "./instance";
 
 const TOKEN = "123456:pasted-token-never-shown";
+const MAIN = join(import.meta.dir, "../src/main.ts");
+/** rhodium with QQ's QR service swapped for its stand-in. */
+const WITH_FAKE_QQ = [process.execPath, "--preload", join(import.meta.dir, "fake-qq-connect.ts"), MAIN];
 const ME_Q = "me-under-q";
 
 let rhodium: Instance;
@@ -142,10 +146,10 @@ test("story 28: rh bot scans a QR code for a QQ bot, as qq-cli does, a new one w
   // The new bot's made-up AppID never reaches QQ: its requests go to a proxy that is not there.
   const env = { HTTPS_PROXY: "http://127.0.0.1:9", https_proxy: "http://127.0.0.1:9" };
   rhodium = newInstance({ bots: { q: { like: "qq", owner: ME_Q, target: "w/a" } }, toml: `mainChat = "q/${ME_Q}"`, env });
-  await rhodium.start();
+  await rhodium.start(WITH_FAKE_QQ);
   await rhodium.slots("a");
 
-  const r = await rhodium.rh(["bot", "q2", "qq"], { preload: join(import.meta.dir, "fake-qq-connect.ts") });
+  const r = await rhodium.rh(["bot", "q2", "qq"]);
   expect({ code: r.code, err: r.err }).toEqual({ code: 0, err: "" });
   expect(r.out).toStartWith("建 QQ Bot q2，建完绑定到 w/a。\n");
   expect(r.out).toMatch(/[▀▄█]/); // the QR code
@@ -163,15 +167,42 @@ test("story 28: rh bot scans a QR code for a QQ bot, as qq-cli does, a new one w
 test("rh bot turns down a bot the config has already, by its AppID or token: two connections to one bot push each other off", async () => {
   api = botApi({ token: TOKEN });
   rhodium = newInstance({ bots: { q: { like: "qq", owner: "me-under-q", target: "w/a", appId: QR.appId }, t: { like: "telegram", target: "w/a", token: TOKEN } } });
-  await rhodium.start();
+  await rhodium.start(WITH_FAKE_QQ);
   await rhodium.slots("a");
   const before = readFileSync(rhodium.config, "utf8");
-  const qq = await rhodium.rh(["bot", "q2", "qq", "w/a"], { preload: join(import.meta.dir, "fake-qq-connect.ts") });
+  const qq = await rhodium.rh(["bot", "q2", "qq", "w/a"]);
   expect({ code: qq.code, err: qq.err }).toEqual({ code: 1, err: "rh: 配置里已经有这个 Bot 了，叫 q。要再建一个，扫码后点“创建新机器人”。\n" });
   const tg = await rhodium.rh(["bot", "t2", "telegram", "w/a", "--api-root", api.url], { type: `${TOKEN}\n` });
   expect(tg.code).toBe(1);
   expect(tg.err).toEndWith("\nrh: 配置里已经有这个 Bot 了，叫 t。要再建一个，向 @BotFather 发 /newbot。\n"); // after the paste prompt
   expect(readFileSync(rhodium.config, "utf8")).toBe(before);
+}, 30_000);
+
+// SIGHUP: the terminal went away (ssh dropped, window closed); SIGTERM: killed.
+test.each([
+  ["SIGINT", 130],
+  ["SIGHUP", 129],
+  ["SIGTERM", 143],
+] as const)("story 686: Ctrl-C at rh bot, or its terminal gone (%s), cancels its flow in rhodium: nothing is written, and the name is free again", async (signal, code) => {
+  api = botApi({ token: TOKEN });
+  rhodium = newInstance();
+  await rhodium.start();
+  await rhodium.slots("a");
+  const before = readFileSync(rhodium.config, "utf8");
+  const args = ["bot", "t", "telegram", "w/a", "--api-root", api.url];
+  const proc = Bun.spawn([process.execPath, MAIN, "rh", ...args], { env: rhodium.env, cwd: rhodium.dir, stdin: terminal(), stdout: "pipe", stderr: "pipe" });
+  let err = "";
+  for await (const chunk of proc.stderr.pipeThrough(new TextDecoderStream())) {
+    err += chunk;
+    if (err.includes("粘贴 @BotFather 给的 token")) break;
+  }
+  proc.kill(signal);
+  expect(await proc.exited).toBe(code);
+  expect(readFileSync(rhodium.config, "utf8")).toBe(before);
+  // Its flow is gone: another for the same name goes through.
+  const r = await rhodium.rh(args, { type: `${TOKEN}\n` });
+  expect({ code: r.code, err: r.err }).toMatchObject({ code: 0 });
+  expect(loadConfig(rhodium.config).bots.t).toMatchObject({ token: TOKEN });
 }, 30_000);
 
 // ---- Feishu: the scan, or the App ID and secret pasted (docs/spec/feishu.md "rh bot"). ----

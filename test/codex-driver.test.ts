@@ -521,7 +521,7 @@ describe("Codex's common commands", () => {
     r.feed(resumedUsage());
     expect(await r.driver.command("usage", "")).toEqual({
       command: "usage",
-      limits: [{ window: "7d", usedPercent: 35, resetsAt: handshakeReset() * 1000 }],
+      limits: [{ window: "7d", usedPercent: 35, resetsAt: handshakeReset() * 1000, limitId: "codex" }],
       credits: 1000,
       session: { tokens: { input: 19618, output: 108, cacheRead: 44544, cacheWrite: 0, total: 64270 } },
     });
@@ -534,9 +534,10 @@ describe("Codex's common commands", () => {
     expect(await more.driver.command("usage", "")).toEqual({
       command: "usage",
       limits: [
-        { window: "5h", usedPercent: 28, resetsAt: handshakeReset() * 1000 },
-        { window: "7d", usedPercent: 91, resetsAt: handshakeReset() * 1000 },
-        { window: "7d", model: "GPT-6-Astra", usedPercent: 12, resetsAt: handshakeReset() * 1000 },
+        // Each with its bucket, which a transcript's quota replaces its own windows of (architecture §7.11).
+        { window: "5h", usedPercent: 28, resetsAt: handshakeReset() * 1000, limitId: "codex" },
+        { window: "7d", usedPercent: 91, resetsAt: handshakeReset() * 1000, limitId: "codex" },
+        { window: "7d", model: "GPT-6-Astra", usedPercent: 12, resetsAt: handshakeReset() * 1000, limitId: "gpt-6-astra" },
       ],
     });
     // An API key login has no quota (architecture §6.4).
@@ -559,7 +560,7 @@ describe("Codex's common commands", () => {
       model: "GPT-6-Luna",
       effort: "high",
       context: { usedTokens: 19328, maxTokens: 258400 },
-      limits: [{ window: "7d", usedPercent: 35, resetsAt: handshakeReset() * 1000 }],
+      limits: [{ window: "7d", usedPercent: 35, resetsAt: handshakeReset() * 1000, limitId: "codex" }],
     });
   });
 

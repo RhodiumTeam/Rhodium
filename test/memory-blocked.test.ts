@@ -34,6 +34,7 @@ const ctx: Ctx = {
   front: () => false,
   herdr: () => true,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
 };
 const G = 2 ** 30;
@@ -115,7 +116,7 @@ test("#692: rh ls and /rh_ls say 内存阻塞 in a blocked slot's state; rh ls <
 
 test("#692: on the board a blocked slot's card says 内存阻塞 and stays in its group; its 详情 has what its unit uses and its limit", async () => {
   const store = openStore(join(dir, "rh.db"));
-  const server = serveBoard(store, config);
+  const server = serveBoard(store, config).servers[0]!;
   try {
     const ids = store.tx((tx) => {
       const ws = tx.insert("workspace", { name: "w", dir: "/w" }).id;
@@ -182,6 +183,7 @@ test("#692: the daemon looks at its holder units every durations.memoryLook: a s
     await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
     const db = new Database(join(rhodium.dir, "state/rh.db"));
     try {
+      db.run("PRAGMA busy_timeout = 5000"); // the daemon may be writing, as what the turn's end asked comes back
       db.run(`UPDATE slot SET memBlocked = '{"current":1,"high":2}'`);
       await until(() => (db.query("SELECT memBlocked FROM slot").get() as { memBlocked: string | null }).memBlocked === null, 5_000);
       expect(db.query("SELECT data FROM event WHERE type = 'memory_blocked'").all()).toEqual([{ data: expect.stringContaining('"current":null') }]);

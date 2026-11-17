@@ -238,10 +238,11 @@ export class QQAdapter implements ImAdapter {
 
   /** Holds the gateway connection while iterated; stopping the iteration disconnects. One reader at a
    *  time: the SDK allows one start() per bot. Sending needs no connection. */
-  messages(connected: Connected = () => {}): AsyncIterable<InboundMessage> {
+  messages(connected: Connected = () => {}, ended?: AbortSignal): AsyncIterable<InboundMessage> {
     const stop = new AbortController();
     return new ReadableStream<InboundMessage>({
       start: (out) => {
+        ended?.addEventListener("abort", () => (stop.abort(), out.close()));
         this.client.on("message", (_ctx, msg) => {
           // v1 does private chats only (architecture §8).
           if (msg.kind !== "c2c" || stop.signal.aborted) return;

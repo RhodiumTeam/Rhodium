@@ -24,6 +24,7 @@ const at = (now: number): Ctx => ({
   front: () => false,
   herdr: () => true,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
 });
 const now = Date.parse("2026-10-30T12:00:00Z");

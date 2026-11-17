@@ -2,7 +2,7 @@
 // HTTP, with and without your Tailscale login in the header tailscale serve adds.
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -209,7 +209,7 @@ async function withWeb(fn: (at: string, web: string, store: Store, dir: string) 
   writeFileSync(herdr, `#!/bin/sh\necho "$@" >> ${dir}/ran\ncase "$*" in *w1:gone*) echo '{"type":"terminal.closed","reason":"terminal session control failed: terminal target w1:gone not found"}'; exit 0;; *w1:long*) echo "${long}" >&2; exit 1;; *w1:flood*) f=$(head -c 49152 /dev/zero | base64 -w0); for i in $(seq 1000); do echo "{\\"type\\":\\"terminal.frame\\",\\"bytes\\":\\"$f\\"}"; done; exec sleep 30;; esac\necho "herdr: failed to connect to server: No such file or directory (os error 2)" >&2\necho "Is herdr server running? Start it with \\\`herdr server\\\`." >&2\nexit 1\n`, { mode: 0o755 });
   writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}/state"\n[programs]\nherdr = "${herdr}"\n[herdr]\nsession = "rhodium-test-none"\n[board]\nport = 0\nlogin = "${BOARD_LOGIN}"\n`, { mode: 0o600 });
   const store = openStore(join(dir, "rh.db"));
-  const server = serveBoard(store, loadConfig(join(dir, "config.toml")), new Set(), web);
+  const server = serveBoard(store, loadConfig(join(dir, "config.toml")), new Set(), web).servers[0]!;
   try {
     await fn(`http://127.0.0.1:${server.port}`, web, store, dir);
   } finally {
@@ -515,19 +515,21 @@ test("story 203: what a headless agent writes comes as it writes, piece by piece
     const mine = await stream(undefined, a, at);
     const other = await stream(undefined, b, at);
 
+    // What it writes, not that its transcript grew, nor the meter every stream hears of (architecture §7.11).
+    const writes = (s: typeof mine) => s.told.filter(([name]) => name !== "grew" && name !== "meter");
     await writer.im.inject("q", { chat: ME, sender: ME, text: "go" });
     await until(() => mine.told.some(([name]) => name === "said"), 15_000);
-    const written = mine.told.filter(([name]) => name !== "grew");
+    const written = writes(mine);
     expect(written).toEqual([...PROGRESS_PIECES.map((text): [string, unknown] => ["delta", { text }]), ["said", {}]]);
     // The turn's end is in the event table, but not what was written.
     await until(() => all.seen.some((e) => e.type === "final_reply"), 5_000);
-    expect([all.told, other.told]).toEqual([[], []]);
+    expect([writes(all), writes(other)]).toEqual([[], []]);
     expect(JSON.stringify(all.seen)).not.toContain(PROGRESS_PIECES[1]!);
     // And that its process ended, as one stopped mid-message never says its message is whole.
     expect((await writer.rh(["stop", "w/a"])).code).toBe(0);
     await until(() => mine.told.some(([name]) => name === "exit"), 5_000);
-    expect(mine.told.filter(([name]) => name !== "grew").slice(-2)).toEqual([["said", {}], ["exit", {}]]);
-    expect([all.told, other.told]).toEqual([[], []]);
+    expect(writes(mine).slice(-2)).toEqual([["said", {}], ["exit", {}]]);
+    expect([writes(all), writes(other)]).toEqual([[], []]);
     await Promise.all([all.close(), mine.close(), other.close()]);
   } finally {
     await writer.cleanup();
@@ -583,6 +585,34 @@ test("story 258: a write comes only from the board's own page: same-origin as th
   const release = (sure?: true) => JSON.stringify({ id: crypto.randomUUID(), act: { kind: "rh", argv: ["release", "w/idle"], ...(sure && { sure }) } });
   expect((await post(same, release())).status).toBe(400);
   expect(await (await post(same, release(true))).json()).toEqual({ ok: true, text: "w/idle 不在 TUI 里。" });
+});
+
+test("story 638: /api/folder, to the board's own page alone, gives a folder's branch, how many files are not committed, untracked too, and how far ahead of its upstream; behind and ahead none with no upstream, the branch none when detached; outside a repository none of them", async () => {
+  const repo = join(rhodium.home, "folder-repo");
+  mkdirSync(repo, { recursive: true });
+  const git = (...args: string[]) => {
+    const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env: { ...process.env, HOME: rhodium.home } });
+    if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+  };
+  git("init", "-q", "-b", "feat");
+  writeFileSync(join(repo, "a.txt"), "a\n");
+  writeFileSync(join(repo, "b.txt"), "b\n");
+  git("add", ".");
+  git("commit", "-qm", "one");
+  const folder = async (path: string, headers: Record<string, string> = { "sec-fetch-site": "same-origin" }) => get(`/api/folder?path=${encodeURIComponent(path)}`, BOARD_LOGIN, headers);
+  // No upstream yet.
+  expect(await (await folder("~/folder-repo")).json()).toEqual({ branch: "feat", changed: 0 });
+  git("branch", "base");
+  git("branch", "--set-upstream-to=base");
+  git("commit", "-q", "--allow-empty", "-m", "two");
+  writeFileSync(join(repo, "a.txt"), "changed\n");
+  writeFileSync(join(repo, "new.txt"), "");
+  expect((await folder("~/folder-repo", {})).status).toBe(403);
+  expect(await (await folder("~/folder-repo")).json()).toEqual({ branch: "feat", ahead: 1, behind: 0, changed: 2 });
+  git("checkout", "-q", "--detach");
+  expect(await (await folder(repo)).json()).toEqual({ changed: 2 });
+  expect(await (await folder("~")).json()).toEqual({});
+  expect(await (await folder("~/nowhere")).json()).toEqual({});
 });
 
 test("story 258: every path, reading too, answers only to a Host of the tailnet or this machine: a page elsewhere whose name points here gets nothing", async () => {
@@ -1127,7 +1157,7 @@ test("#380: the page's terminal does not wait for Herdr's look for new clients, 
   writeFileSync(join(dir, "herdr-here"), `#!/bin/sh\nHOME=${dir} exec ${bin} "$@"\n`, { mode: 0o755 });
   writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}/state"\n[programs]\nherdr = "${dir}/herdr-here"\n[herdr]\nsession = "${session}"\n[board]\nport = 0\nlogin = "${BOARD_LOGIN}"\n`, { mode: 0o600 });
   const store = openStore(join(dir, "rh.db"));
-  const server = serveBoard(store, loadConfig(join(dir, "config.toml")));
+  const server = serveBoard(store, loadConfig(join(dir, "config.toml"))).servers[0]!;
   try {
     const pane = (await call(fake.socket, "workspace.create", { cwd: dir, label: "w", focus: false })).result.root_pane.pane_id;
     const ws = store.tx((tx) => tx.insert("workspace", { name: "w", dir }).id);
@@ -1232,5 +1262,189 @@ test("stories 340, 352, 356: a slot not in the terminal, still switching to it, 
 
     writeFileSync(join(web, "index.html"), "<!doctype html><title>Rhodium</title>");
     expect((await get("/", BOARD_LOGIN, {}, undefined, at)).headers.get("content-security-policy")).toBe("frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval'");
+  });
+});
+
+test("story 651: /api/history, to the board's own page alone, has what you said in the slot, newest first, from its current conversation back: from IM and the board, words only, no source line, quote or files, the same twice in a row once; not what another slot sent or Rhodium's reports; at most the newest 100", async () => {
+  await withWeb(async (at, _web, store, dir) => {
+    const home = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const sessions = join(dir, ".pi/agent/sessions/--w--");
+      mkdirSync(sessions, { recursive: true });
+      const t = Date.now() - 100_000;
+      const line = (i: number, role: string, text: string) => JSON.stringify({ type: "message", timestamp: new Date(t + i).toISOString(), message: { role, content: [{ type: "text", text }] } }) + "\n";
+      const file = (session: string, said: [string, string][]) => writeFileSync(join(sessions, `2026-11-16_${session}.jsonl`), said.map(([role, text], i) => line(i, role, text)).join(""));
+      const { slot, many } = store.tx((tx) => {
+        const ws = tx.insert("workspace", { name: "w", dir: "/w" }).id;
+        const add = (name: string, sessions: string[]) => {
+          const id = tx.insert("slot", { workspace: ws, name, dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
+          const convs = sessions.map((s, i) => tx.insert("conversation", { slot: id, agent: "pi", sessionId: s, startedAt: t + i }).id);
+          tx.update("slot", { id }, { conversation: convs.at(-1)! });
+          return id;
+        };
+        return { slot: add("a", ["old", "now"]), many: add("b", ["lots"]) };
+      });
+      file("old", [
+        ["user", "[来自 QQ 私聊]\n最早的"],
+        ["user", "[来自 槽位 w/b，经 rh send]\n别的槽位的"],
+        ["user", "[来自 Rhodium：子槽位汇报]\n汇报"],
+        ["assistant", "收到"],
+      ]);
+      file("now", [
+        ["user", "[来自 网页]\n> 引用的回复\n\n改一下"],
+        ["user", `[来自 网页]\n看这个\n[图片] ${dir}/state/media/${"a".repeat(64)}`],
+        ["user", "[来自 QQ 私聊]\n同一句"],
+        ["user", "[来自 网页]\n同一句"],
+        ["assistant", "好"],
+        ["user", "[来自 网页]\n最新的\n第二行"],
+      ]);
+      file("lots", Array.from({ length: 120 }, (_, i): [string, string] => ["user", `m${i}`]));
+      const history = (id: string, headers: Record<string, string> = { "sec-fetch-site": "same-origin" }) => fetch(`${at}/api/history?slot=${id}`, { headers: { "Tailscale-User-Login": BOARD_LOGIN, ...headers } });
+      expect((await history(slot, { "sec-fetch-site": "cross-site" })).status).toBe(403);
+      expect((await history(slot, {})).status).toBe(403);
+      expect(await (await history(slot)).json()).toEqual({ said: ["最新的\n第二行", "同一句", "看这个", "改一下", "最早的"] });
+      const lots = ((await (await history(many)).json()) as { said: string[] }).said;
+      expect([lots.length, lots[0], lots.at(-1)]).toEqual([100, "m119", "m20"]);
+      expect((await history("no-such-slot")).status).toBe(404);
+    } finally {
+      process.env.HOME = home;
+    }
+  });
+});
+
+describe("the import list (architecture §7.10)", () => {
+  const inst = newInstance({ herdr: true });
+  let at = "";
+  let d: Daemon;
+  beforeAll(async () => {
+    d = await inst.start();
+    at = `http://${d.logs.find((l) => l.msg === "ready")!.board}`;
+  });
+  afterAll(() => inst.cleanup());
+  const own = { "sec-fetch-site": "same-origin" };
+  const ask = async (query: string, headers: Record<string, string> = own) => get(`/api/importable?${query}`, BOARD_LOGIN, headers, undefined, at);
+  const page = async (query: string) => (await (await ask(query)).json()) as { list: { session: string; pane?: string; dir: string; title: string; count: number; hit?: unknown }[]; cursor?: string; partial?: true };
+
+  let n = 0;
+  const id = () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`;
+  /** A Claude conversation started in dir under HOME, saying what, last changed minute m of a day: its id. */
+  function claude(dir: string, what: string[], m: number, sub = ""): string {
+    const session = id();
+    const folder = join(inst.home, ".claude/projects", join(inst.home, dir).replace(/[^a-zA-Z0-9]/g, "-"), sub);
+    mkdirSync(folder, { recursive: true });
+    const file = join(folder, sub ? "agent-x.jsonl" : `${session}.jsonl`);
+    writeFileSync(file, what.map((t) => JSON.stringify({ parentUuid: null, type: t.startsWith("<") ? "system" : "user", message: { role: "user", content: t }, cwd: join(inst.home, dir) }) + "\n").join(""));
+    utimesSync(file, new Date(), new Date(Date.UTC(2026, 0, 1, 0, m)));
+    return session;
+  }
+  /** A Codex thread started in dir, a subagent's if sub, saying hi: its id. */
+  function codex(dir: string, sub: boolean): string {
+    const thread = `00000000-0000-7000-8000-${String(++n).padStart(12, "0")}`;
+    const day = join(inst.home, ".codex/sessions/2026/01/01");
+    mkdirSync(day, { recursive: true });
+    const lines = [
+      { timestamp: "2026-01-01T00:00:00Z", type: "session_meta", payload: { id: thread, cwd: join(inst.home, dir), ...(sub && { source: { subagent: "review" } }), git: { branch: "main" } } },
+      { timestamp: "2026-01-01T00:00:01Z", type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "codex hi" }] } } },
+    ];
+    writeFileSync(join(day, `rollout-2026-01-01T00-00-00-${thread}.jsonl`), lines.map((l) => JSON.stringify(l) + "\n").join(""));
+    return thread;
+  }
+
+  test("stories 641, 645, 649: /api/importable, to the board's own page alone, lists the agent's conversations started in the folder itself, newest first, 10 a page, the next going on with none twice; not another agent's, a subfolder's, a subagent's, one a slot used, nor one with nothing said; with q and no dir, every folder's it finds, each with its folder", async () => {
+    mkdirSync(join(inst.home, "proj/sub"), { recursive: true });
+    mkdirSync(join(inst.home, "other"), { recursive: true });
+    const ids = Array.from({ length: 12 }, (_, i) => claude("proj", [`said ${i}`], i));
+    claude("proj", ["<command-name>/clear</command-name>"], 30); // nothing said
+    claude("proj/sub", ["in a subfolder"], 31);
+    claude("proj", ["a subagent's"], 32, `${ids[0]}/subagents`);
+    const elsewhere = claude("other", ["the quokka elsewhere"], 33);
+    // One a slot took over: not listed again.
+    await inst.ok("import", ids[11]!);
+    const pi = join(inst.home, `.pi/agent/sessions/--${join(inst.home, "proj").slice(1).replace(/\//g, "-")}--`);
+    mkdirSync(pi, { recursive: true });
+    writeFileSync(join(pi, "2026-01-01T00-00-00-000Z_0199f000-0000-7000-8000-000000000001.jsonl"), JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "pi hi" }] } }) + "\n");
+    const thread = codex("proj", false);
+    codex("proj", true);
+
+    expect((await ask("agent=claude&dir=~/proj", {})).status).toBe(403);
+    expect((await ask("agent=claude")).status).toBe(400);
+    expect((await ask("agent=nope&dir=~/proj")).status).toBe(400);
+    const one = await page("agent=claude&dir=~/proj");
+    expect(one.list.map((c) => c.session)).toEqual(ids.slice(1, 11).toReversed());
+    expect(one.list[0]).toMatchObject({ dir: "~/proj", title: "said 10", count: 1 });
+    expect(one.partial).toBeUndefined();
+    const two = await page(`agent=claude&dir=~/proj&cursor=${encodeURIComponent(one.cursor!)}`);
+    expect(two).toEqual({ list: [expect.objectContaining({ session: ids[0] })] });
+    expect((await page("agent=pi&dir=~/proj")).list.map((c) => c.title)).toEqual(["pi hi"]);
+    expect((await page("agent=codex&dir=~/proj")).list.map((c) => c.session)).toEqual([thread]);
+    // Every folder's: the subfolder's and the other's too, but no subagent's.
+    expect((await page("agent=claude&q=QUOKKA")).list).toEqual([expect.objectContaining({ session: elsewhere, dir: "~/other" })]);
+    expect((await page("agent=claude&q=subagent")).list).toEqual([]);
+    expect((await page("agent=claude&q=subfolder")).list).toEqual([expect.objectContaining({ dir: "~/proj/sub" })]);
+    expect((await page("agent=codex&q=hi")).list.map((c) => c.session)).toEqual([thread]);
+  });
+
+  test("story 638: /api/folder counts each agent's conversations there as the import list does, with when the newest changed; none for an agent with none", async () => {
+    const r = await get(`/api/folder?path=${encodeURIComponent("~/proj")}`, BOARD_LOGIN, own, undefined, at);
+    const { sessions } = (await r.json()) as { sessions: Record<string, { count: number; at: number }> };
+    expect(sessions).toEqual({ claude: { count: 11, at: Date.UTC(2026, 0, 1, 0, 10) }, pi: { count: 1, at: expect.any(Number) }, codex: { count: 1, at: expect.any(Number) } });
+    expect(((await (await get(`/api/folder?path=${encodeURIComponent("~/proj/sub/none")}`, BOARD_LOGIN, own, undefined, at)).json()) as object)).toEqual({});
+  });
+
+  test("story 641: the agent's panes in Herdr that report a conversation in the folder come first on the first page, once; another folder's are not listed", async () => {
+    const herdr = async (method: string, params: object = {}) => (await call(inst.herdr.socket, method, params)).result;
+    const ids = (await page("agent=claude&dir=~/proj")).list.map((c) => c.session);
+    const mine = await herdr("workspace.create", { cwd: join(inst.home, "proj"), label: "mine" });
+    await herdr("pane.report_agent_session", { pane_id: mine.root_pane.pane_id, source: "herdr:claude", agent: "claude", agent_session_id: ids[3] });
+    const far = await herdr("workspace.create", { cwd: join(inst.home, "other"), label: "far" });
+    await herdr("pane.report_agent_session", { pane_id: far.root_pane.pane_id, source: "herdr:claude", agent: "claude", agent_session_id: id() });
+    const one = await page("agent=claude&dir=~/proj");
+    expect(one.list[0]).toMatchObject({ session: ids[3], pane: mine.root_pane.pane_id, title: "said 7" });
+    const all = [...one.list, ...(await page(`agent=claude&dir=~/proj&cursor=${encodeURIComponent(one.cursor!)}`)).list].map((c) => c.session);
+    expect(all.filter((s) => s === ids[3])).toHaveLength(1);
+    expect(all).toHaveLength(11);
+    // A search lists the pane only if it finds it.
+    expect((await page("agent=claude&dir=~/proj&q=said 7")).list).toEqual([expect.objectContaining({ pane: mine.root_pane.pane_id })]);
+    expect((await page("agent=claude&dir=~/proj&q=said 8")).list.map((c) => c.pane)).toEqual([undefined]);
+  });
+
+  test("story 648: a search whose page goes away midway stops scanning", async () => {
+    const big = JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "lorem ipsum ".repeat(80) }, cwd: join(inst.home, "big") }) + "\n";
+    const block = big.repeat(4096);
+    for (let i = 0; i < 40; i++) claude("big", [], 100 + i), appendFileSync(join(inst.home, ".claude/projects", join(inst.home, "big").replace(/[^a-zA-Z0-9]/g, "-"), `${`00000000-0000-4000-8000-${String(n).padStart(12, "0")}`}.jsonl`), block);
+    const stop = new AbortController();
+    const asked = get("/api/importable?agent=claude&dir=~/big&full=1&q=absent", BOARD_LOGIN, own, stop.signal, at).catch(() => null);
+    await Bun.sleep(100);
+    stop.abort();
+    await asked;
+    await until(async () => d.logs.some((l) => l.msg === "import search stopped: the page went"), 5_000);
+  });
+
+  test("story 666: /api/importable/messages, to the board's own page alone, gives the last page of a conversation by its whole id, Claude's, pi's or Codex's, with what you and the agent said alone; before goes back a page; a start of an id, a path or an unknown id is not found", async () => {
+    const fixtures = join(import.meta.dir, "fixtures/transcripts");
+    const put = (from: string, to: string) => (mkdirSync(join(inst.home, to, ".."), { recursive: true }), copyFileSync(join(fixtures, from), join(inst.home, to)));
+    put("claude/00000000-0000-4000-8000-645e563d4553.jsonl", ".claude/projects/-srv-fixture/00000000-0000-4000-8000-645e563d4553.jsonl");
+    put("pi/2026-01-01T00-00-00-386Z_00000000-0000-4000-8000-4c4a2a950dc8.jsonl", ".pi/agent/sessions/--srv-fixture--/2026-01-01T00-00-00-386Z_00000000-0000-4000-8000-4c4a2a950dc8.jsonl");
+    put("codex/thread.jsonl", ".codex/sessions/2026/10/27/rollout-2026-10-27T16-30-54-00000000-0000-7000-8000-8d5c554c3185.jsonl");
+    const preview = (query: string, headers: Record<string, string> = own) => get(`/api/importable/messages?${query}`, BOARD_LOGIN, headers, undefined, at);
+    type Page = { blocks: { kind: string; text: string }[]; before?: number };
+    const said = async (query: string) => (await (await preview(query)).json()) as Page;
+    // Tool calls and results, thoughts and system lines left out.
+    expect((await said("agent=claude&session=00000000-0000-4000-8000-645e563d4553")).blocks.map((b) => b.kind)).toEqual(["user", "assistant"]);
+    expect(await said("agent=pi&session=00000000-0000-4000-8000-4c4a2a950dc8")).toEqual({ blocks: [expect.objectContaining({ kind: "user" }), expect.objectContaining({ kind: "assistant", text: "done" })] });
+    const codex = await said("agent=codex&session=00000000-0000-7000-8000-8d5c554c3185");
+    expect(codex.blocks.map((b) => [b.kind, b.kind === "assistant" ? b.text : ""])).toEqual([["user", ""], ["assistant", "ok"], ["user", ""], ["assistant", "hello.txt"], ["user", ""], ["assistant", "pong"]]);
+    expect(codex.before).toBeUndefined();
+    // 25 things said: the last 20, then the 5 before.
+    const long = claude("proj", Array.from({ length: 25 }, (_, i) => `line ${i}`), 200);
+    const last = await said(`agent=claude&session=${long}`);
+    expect(last.blocks.map((b) => b.text)).toEqual(Array.from({ length: 20 }, (_, i) => `line ${i + 5}`));
+    expect((await said(`agent=claude&session=${long}&before=${last.before}`)).blocks.map((b) => b.text)).toEqual(Array.from({ length: 5 }, (_, i) => `line ${i}`));
+    // Its whole id, of that agent, alone.
+    expect((await preview(`agent=claude&session=${long}`, {})).status).toBe(403);
+    for (const q of [`agent=claude&session=${long.slice(0, 8)}`, `agent=pi&session=${long}`, "agent=claude&session=00000000-0000-4000-8000-ffffffffffff", `agent=claude&session=${encodeURIComponent(join(inst.home, ".claude/projects"))}`, "agent=claude&session=*", "agent=claude"])
+      expect([q, (await preview(q)).status]).toEqual([q, 404]);
+    expect((await preview(`agent=nope&session=${long}`)).status).toBe(400);
   });
 });

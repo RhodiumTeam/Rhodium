@@ -127,7 +127,8 @@ export type TokenUsage = { inputTokens?: number; outputTokens?: number; contextT
 
 /** How full the context is: the tokens in use out of the model's window, null where unknown. */
 export type ContextUse = { usedTokens: number; maxTokens: number | null };
-export type QuotaWindow = { window: "5h" | "7d"; model?: string; usedPercent: number; resetsAt: number | null };
+// limitId: the Codex bucket it is of, which a transcript's quota replaces only its own windows of (architecture §7.11).
+export type QuotaWindow = { window: "5h" | "7d"; model?: string; usedPercent: number; resetsAt: number | null; limitId?: string };
 export type ExtraUsage = { usedPercent: number; used: number; limit: number | null; currency: string };
 export type Tokens = { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 // cost: none where the agent gives none (Codex).
@@ -360,8 +361,9 @@ export type Connected = (up: boolean, error?: string) => void;
 
 export interface ImAdapter {
   readonly capabilities: Capabilities;
-  /** Holds the connection to the platform while iterated, telling connected how it goes. */
-  messages(connected?: Connected): AsyncIterable<InboundMessage>;
+  /** Holds the connection to the platform while iterated, telling connected how it goes. stop ends
+   *  it and lets the connection go, as for a bot taken out (rh bot rm), even with nothing coming in. */
+  messages(connected?: Connected, stop?: AbortSignal): AsyncIterable<InboundMessage>;
   send(chat: string, message: OutboundMessage): Promise<SendResult>;
   edit(chat: string, messageId: string, message: OutboundMessage): Promise<SendResult>;
   /** Takes the buttons off a sent message. */

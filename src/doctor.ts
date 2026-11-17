@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { headlessEnv } from "./agents";
 import { ClaudeDriver, refuseBare } from "./claude";
 import { CodexDriver, codexModelNames } from "./codex";
-import { formatGB, formatMB, hasHerdr, locate, type Config } from "./config";
+import { entryName, formatGB, formatMB, hasHerdr, locate, type BoardEntry, type Config } from "./config";
 import { log } from "./daemon";
 import { request, sessionSocket } from "./herdr";
 import { daily, freeDisk } from "./ops";
@@ -351,30 +351,39 @@ type Finding = { level: "错误" | "告警"; text: string };
 /** GETs url as a stranger on the internet would: no login, no following a redirect, 5 s at most. */
 const asStranger = (url: string) => fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5_000) });
 
-/** What rh doctor finds of the board's exposure (ADR-0013): [board] written wrong; listening beyond
- *  this machine; with auth none, any of hosts that opens the board with no login, the proxy in front
- *  letting a stranger through, as probe asks it. One probe cannot reach is a warning: not checked,
- *  maybe only from here, and no reason to wake you daily. Each error begins 看板: upgrade.sh goes
- *  back on none of them, as going back fixes none. */
-export async function boardFindings(b: Config["board"], probe = asStranger): Promise<Finding[]> {
+/** What rh doctor finds of the board's exposure (ADR-0013, ADR-0014), for each entry: [board] written
+ *  wrong; listening beyond this machine; not listening, as deaf says by entry name; with auth none, any
+ *  of hosts that opens the board with no login, the proxy in front letting a stranger through, as probe
+ *  asks it. One probe cannot reach is a warning: not checked, maybe only from here, and no reason to
+ *  wake you daily. Each error begins 看板, with the entry's name when there are several: upgrade.sh
+ *  goes back on none of them, as going back fixes none. */
+export async function boardFindings(b: Config["board"], probe = asStranger, deaf: ReadonlyMap<string, string> = new Map()): Promise<Finding[]> {
   if (b.closed) return [{ level: "错误", text: `看板关着：配置文件 [board] 写错了，${b.closed}` }];
+  const entries = [b, ...b.extra];
+  const found = await Promise.all(entries.map((e, i) => entryFindings(e, entries.length > 1 ? `看板（${entryName(i)}）` : "看板", deaf.get(entryName(i)), probe)));
+  return found.flat();
+}
+
+/** What rh doctor finds of one entry, each error beginning board. */
+async function entryFindings(e: BoardEntry, board: string, deaf: string | undefined, probe: typeof asStranger): Promise<Finding[]> {
   const found: Finding[] = [];
-  if (!/^127\./.test(b.bind) && b.bind !== "::1")
+  if (!/^127\./.test(e.bind) && e.bind !== "::1")
     found.push({
       level: "错误",
       text:
-        b.auth === "none"
-          ? `看板不认身份（auth = "none"），却听着 ${b.bind}：连得到这个地址的人都能完全控制看板，包括终端。只听本机，由反代转发`
-          : `看板听着 ${b.bind}：连得到这个地址的人能自己带上 Tailscale-User-Login，冒充你。只听本机，由 tailscale serve 转发`,
+        e.auth === "none"
+          ? `${board}不认身份（auth = "none"），却听着 ${e.bind}：连得到这个地址的人都能完全控制看板，包括终端。只听本机，由反代转发`
+          : `${board}听着 ${e.bind}：连得到这个地址的人能自己带上 Tailscale-User-Login，冒充你。只听本机，由 tailscale serve 转发`,
     });
-  if (b.auth !== "none") return found;
+  if (deaf !== undefined) found.push({ level: "错误", text: `${board}听不到 ${e.bind}:${e.port}：${deaf}` });
+  if (e.auth !== "none") return found;
   const hosts = await Promise.all(
-    b.hosts.map(async (host): Promise<Finding | null> => {
+    e.hosts.map(async (host): Promise<Finding | null> => {
       const url = `https://${host}/`;
       try {
         // The board answers its ping with 204; a proxy wanting a login, with a redirect to it, 401 or 403.
         if ((await probe(`${url}api/ping`)).status !== 204) return null;
-        return { level: "错误", text: `看板在 ${url} 上不登录就能打开：它前面的反代没要登录，例如 Access 漏配了。谁都能完全控制看板，包括终端` };
+        return { level: "错误", text: `${board}在 ${url} 上不登录就能打开：它前面的反代没要登录，例如 Access 漏配了。谁都能完全控制看板，包括终端` };
       } catch (err) {
         return { level: "告警", text: `连不上 ${url}，没核对它要不要登录：${(err as Error).message}` };
       }
@@ -387,7 +396,7 @@ export async function boardFindings(b: Config["board"], probe = asStranger): Pro
 const BIG_OUT_LOG = 512 * 2 ** 20;
 
 /** Runs every check. notify: something you should hear about even without asking. */
-async function check(cfg: Config, store: Store): Promise<{ text: string; notify: boolean }> {
+async function check(cfg: Config, store: Store, deaf: ReadonlyMap<string, string>): Promise<{ text: string; notify: boolean }> {
   const info: string[] = [];
   const found: Finding[] = [];
   const error = (text: string) => found.push({ level: "错误", text });
@@ -536,7 +545,7 @@ async function check(cfg: Config, store: Store): Promise<{ text: string; notify:
       );
   }
 
-  found.push(...(await boardFindings(cfg.board)));
+  found.push(...(await boardFindings(cfg.board, undefined, deaf)));
 
   notify ||= found.some((f) => f.level === "错误");
   const lines = [...info, ...found.map((f) => `${f.level}：${f.text}`)];
@@ -548,9 +557,10 @@ async function check(cfg: Config, store: Store): Promise<{ text: string; notify:
  * rh doctor as rhodium runs it: when you ask (rh doctor), once a day, and when a Claude process
  * reports a version the last check did not see. A run nobody asked for tells you through notify
  * what needs you. Creating it arms the daily run. No check runs before `ready`: till the restart's
- * takeover is done, the holder rows say what the last rhodium left (architecture §5).
+ * takeover is done, the holder rows say what the last rhodium left (architecture §5). deaf: the
+ * board's entries that could not listen, by name, with why, as the daemon fills it.
  */
-export function createDoctor(o: { cfg: Config; store: Store; notify: (text: string) => void; ready: Promise<unknown> }) {
+export function createDoctor(o: { cfg: Config; store: Store; notify: (text: string) => void; ready: Promise<unknown>; deaf?: ReadonlyMap<string, string> }) {
   let running: Promise<string> | null = null;
   const failed = (err: unknown) => log("rh doctor failed", { error: String(err) });
   /** Runs the checks, or joins the run under way, and resolves with the report. */
@@ -558,7 +568,7 @@ export function createDoctor(o: { cfg: Config; store: Store; notify: (text: stri
     if (running) return running;
     setMeta(o.store, LAST_RUN, String(Date.now()));
     return (running = o.ready
-      .then(() => check(o.cfg, o.store))
+      .then(() => check(o.cfg, o.store, o.deaf ?? new Map()))
       .then((r) => {
         if (!asked && r.notify) o.notify(r.text);
         return r.text;

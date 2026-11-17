@@ -2,19 +2,24 @@
 // and in the chat's column alone, the transcript under it as it is. Only the chat's code has this.
 import { cn } from "cn";
 import { Box, ChartPie, ChevronDown, ChevronRight, Copy, FoldVertical, Gauge, Info, LoaderCircle, MessageSquare, RotateCcw, Square, SquarePen, X, type LucideIcon } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Popover } from "@base-ui/react/popover";
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { AGENTS } from "../../src/agents";
-import type { QuotaWindow, Tokens } from "../../src/contracts";
+import type { AgentKind, ContextUse, ExtraUsage, QuotaWindow, SessionUse, Tokens } from "../../src/contracts";
 import { moment, money, percent, span, tokens } from "../../src/panels";
 import type { InfoCard as Card, StatusCard } from "../../src/router";
-import { AgentLogo, ModelName } from "./common";
+import { AgentLogo, ModelName, ROOM } from "./common";
 import { toast } from "./toast";
 import { buttonVariants } from "./components/ui/button";
 
 /** A bar's colour by how full it is (story 394): amber from 80%, red from 95%. */
 export const tone = (p: number): "" | "warn" | "bad" => (p >= 95 ? "bad" : p >= 80 ? "warn" : "");
-const TONE = { "": "bg-foreground", warn: "bg-needs", bad: "bg-destructive" };
-const TONE_TEXT = { "": "", warn: "text-needs", bad: "text-destructive" };
+const TONE = { "": "bg-foreground", warn: "bg-needs", bad: "bg-destructive", grey: "bg-muted-foreground/45" };
+const TONE_TEXT = { "": "", warn: "text-needs", bad: "text-destructive", grey: "text-muted-foreground" };
+/** Whether the numbers drawn under it are as last heard, the agent not running, or the quota old (story 657): grey. */
+export const Grey = createContext(false);
+/** A bar's or number's tone, grey where Grey says so. */
+const useTone = (p: number) => (useContext(Grey) ? "grey" : tone(p));
 
 /** The card, by the bottom of the chat's column: a handle, its icon and title with ✕, then what is in it
  *  (stories 387-389, 391). Up to 70% of the screen high, never over the chat's top bar; the handle, the title and top stay on top and
@@ -95,7 +100,8 @@ export function CardFrame({ icon: Icon, logo, title, sub, close, top, foot, chil
             </div>
             {top}
           </div>
-          <div className="card-scroll tall:min-h-0 tall:flex-1 tall:overflow-y-auto">{children}</div>
+          {/* Its bar kept off the card's round corners: on a phone it lies over what scrolls, where the track's margins do nothing. */}
+            <div className={cn("card-scroll tall:min-h-0 tall:flex-1 tall:overflow-y-auto", !(title || top) && "tall:mt-2", !foot && "tall:mb-2")}>{children}</div>
           {foot && <div className="shrink-0">{foot}</div>}
         </div>
       </div>
@@ -103,13 +109,102 @@ export function CardFrame({ icon: Icon, logo, title, sub, close, top, foot, chil
   );
 }
 
-/** A query's answer, drawn from its data. run: says a command as typed, its answer shown as any is. */
-export function InfoCard({ card, close, run }: { card: Card; close: () => void; run: (command: string) => Promise<void> }) {
+/** How far in from its message box's edge on side align el is: 0 with no box. */
+function edge(el: HTMLElement | null, align: "start" | "end") {
+  const [a, box] = [el?.getBoundingClientRect(), el?.closest("[data-box]")?.getBoundingClientRect()];
+  return a && box ? (align === "start" ? a.left - box.left : box.right - a.right) : 0;
+}
+
+/** A popover (story 655), by the button anchor that opened it, over it: on a phone 20rem wide at most,
+ *  at the message box's edge on side align, half the screen high at most; on a wide screen lined up
+ *  with the anchor, 24rem high at most (story 667). Tapping outside, Esc or a press on what opens it (marked data-pop, which
+ *  toggles it itself) closes it; no handle. Never over the chat's top bar, its title and top and foot
+ *  staying as what is between scrolls (story 520); with a top, as a search box, it grows but never
+ *  shrinks while open, so the top stays put as what is under it filters. title: with ✕ beside it, after
+ *  logo or icon, sub after it in grey. */
+export function PopFrame({ open, anchor, close, label, title, icon: Icon, logo, sub, align = "start", top, foot, className, children }: { open: boolean; anchor: RefObject<HTMLElement | null>; close: () => void; label: string; title?: string; icon?: LucideIcon; logo?: ReactNode; sub?: string; align?: "start" | "end"; top?: ReactNode; foot?: ReactNode; className?: string; children: ReactNode }) {
+  // Clear of the chat's top bar: the bottom of the header of the nearest column that has one.
+  const [bar, setBar] = useState(8);
+  useLayoutEffect(() => {
+    if (!open) return;
+    let el = anchor.current?.parentElement;
+    while (el && !el.querySelector("header")) el = el.parentElement;
+    setBar((el?.querySelector("header")?.getBoundingClientRect().bottom ?? 0) + 8);
+  }, [open]);
+  const card = useRef<HTMLDivElement>(null);
+  const topped = open && !!top;
+  useLayoutEffect(() => {
+    if (!topped) return;
+    const el = card.current;
+    if (!el) return;
+    let most = 0;
+    const grown = new ResizeObserver(() => ((most = Math.max(most, el.offsetHeight)), (el.style.minHeight = `min(var(--available-height), ${most}px)`)));
+    grown.observe(el);
+    return () => grown.disconnect();
+  }, [topped]);
+  return (
+    <Popover.Root
+      open={open}
+      onOpenChange={(o, d) => {
+        // A press on a [data-pop] element (its own key, a toast over it) leaves it open. composedPath is
+        // fixed at dispatch, so a toast React removed before the click still counts; focus moving to one
+        // first arrives as focus-out, told by where the focus goes.
+        const pop = (n: unknown) => n instanceof Element && n.closest("[data-pop]") !== null;
+        if (
+          o ||
+          (d.reason === "outside-press" && d.event?.composedPath().some(pop)) ||
+          (d.reason === "focus-out" && pop((d.event as FocusEvent | undefined)?.relatedTarget)) ||
+          (d.reason === "escape-key" && d.event?.defaultPrevented)
+        )
+          return;
+        close();
+      }}
+    >
+      <Popover.Portal>
+        {/* Over the message box the anchor is in, not over what you type in it, growing as it does, and
+            lined up with the anchor's edge (#760) on a wide screen, with the box's on a phone (story 667). Never flipped below or beside it when taller than the
+            room there: capped to that room, it scrolls. */}
+        <Popover.Positioner anchor={() => anchor.current?.closest("[data-box]") ?? anchor.current} side="top" align={align} sideOffset={4} collisionAvoidance={{ side: "none", fallbackAxisSide: "none" }} alignOffset={() => (matchMedia(ROOM).matches ? edge(anchor.current, align) : 0)} collisionPadding={{ top: bar, right: 8, bottom: 8, left: 8 }} className="z-[70]">
+          <Popover.Popup
+            ref={card}
+            initialFocus={false}
+            finalFocus={false}
+            aria-label={label}
+            className={cn("card-scroll flex max-h-[min(var(--available-height),50dvh)] w-[min(20rem,calc(100vw-3rem))] flex-col overflow-y-auto rounded-2xl border bg-popover text-popover-foreground shadow-lg outline-none room:max-h-[min(var(--available-height),24rem)] room:w-88 tall:overflow-hidden not-tall:[clip-path:border-box]", className)}
+          >
+            {(title || top) && (
+              <div className="shrink-0">
+                {title && (
+                  <div className="flex min-h-11 items-center gap-2 pl-4 font-medium">
+                    {logo ?? (Icon && <Icon className="size-4 shrink-0 text-muted-foreground" />)}
+                    <span className="min-w-0 py-2.5 wrap-anywhere">{title}</span>
+                    {sub && <span className="shrink-0 text-sm font-normal text-muted-foreground">{sub}</span>}
+                    <button aria-label="关闭" onClick={close} className="hover-round relative ml-auto grid size-11 shrink-0 place-items-center text-muted-foreground hover:text-foreground">
+                      <X className="size-4" />
+                    </button>
+                  </div>
+                )}
+                {top}
+              </div>
+            )}
+            {/* Its bar kept off the card's round corners: on a phone it lies over what scrolls, where the track's margins do nothing. */}
+            <div className={cn("card-scroll tall:min-h-0 tall:flex-1 tall:overflow-y-auto", !(title || top) && "tall:mt-2", !foot && "tall:mb-2")}>{children}</div>
+            {foot && <div className="shrink-0">{foot}</div>}
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+/** A query's answer, drawn from its data. run: says a command as typed, its answer shown as any is.
+ *  /status's is a popover over the message box, anchor in it (#761). */
+export function InfoCard({ card, anchor, close, run }: { card: Card; anchor: RefObject<HTMLElement | null>; close: () => void; run: (command: string) => Promise<void> }) {
   if (card.command === "status")
     return (
-      <CardFrame icon={Info} logo={<AgentLogo agent={card.agent} />} title={card.ref} sub={card.line.split("，")[0]} close={close}>
+      <PopFrame open anchor={anchor} label={card.ref} logo={<AgentLogo agent={card.agent} />} title={card.ref} sub={card.line.split("，")[0]} close={close}>
         <Status s={card} run={run} />
-      </CardFrame>
+      </PopFrame>
     );
   if (card.command === "usage")
     return (
@@ -128,18 +223,21 @@ export function InfoCard({ card, close, run }: { card: Card; close: () => void; 
 }
 
 /** A bar of how full p, 0-100, is, in its tone. */
-const Bar = ({ p }: { p: number }) => (
-  <span className="mt-1.5 block h-2 overflow-hidden rounded-full bg-muted">
-    <span className={cn("block h-full rounded-full", TONE[tone(p)])} style={{ width: `${Math.min(p, 100)}%` }} />
-  </span>
-);
+function Bar({ p, className = "mt-1.5" }: { p: number; className?: string }) {
+  const t = useTone(p);
+  return (
+    <span className={cn("block h-2 overflow-hidden rounded-full bg-muted", className)}>
+      <span className={cn("block h-full rounded-full", TONE[t])} style={{ width: `${Math.min(p, 100)}%` }} />
+    </span>
+  );
+}
 
 /** A row of a block that does something as you press it: its ground under the mouse reaches a little
  *  past its words, which stay where the other rows' are. */
 const PRESS = "-mx-2 w-[calc(100%+1rem)] rounded-md px-2 transition-colors hover:bg-foreground/5";
 
 /** A block of the card under its small heading. */
-const Section = ({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) => (
+export const Section = ({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) => (
   <section className="px-4 pb-3">
     <h3 className="flex h-8 items-center gap-1.5 text-sm text-muted-foreground">
       {icon}
@@ -157,12 +255,13 @@ export const resetsIn = (at: number, now: number) => (at <= now ? "已重置" : 
 
 /** A quota line: its name, then on the right what to add and how full, a bar under it. */
 function Quota({ name, side, p }: { name: string; side: ReactNode; p: number }) {
+  const t = useTone(p);
   return (
     <div className="py-1.5">
       <div className="flex items-center gap-2 tabular-nums">
         <span className="min-w-0 truncate">{name}</span>
         <span className="ml-auto flex items-center gap-1 text-sm text-muted-foreground">{side}</span>
-        <span className={cn("w-12 text-right font-semibold", TONE_TEXT[tone(p)])}>{Math.round(p)}%</span>
+        <span className={cn("w-12 text-right font-semibold", TONE_TEXT[t])}>{Math.round(p)}%</span>
       </div>
       <Bar p={p} />
     </div>
@@ -181,71 +280,86 @@ const Window = ({ l, now }: { l: QuotaWindow; now: number }) => (
 
 const KINDS: [keyof Tokens, string][] = [["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读"], ["cacheWrite", "缓存写"]];
 
-/** /usage (stories 393-397, 500): each quota window a bar, Codex's credits left, then this conversation's
- *  cost, where the agent gives one, and tokens; the tokens tapped, their four kinds and, Claude's, the cost by model. */
+/** /usage (stories 393-397, 500): its quota, then this conversation's use. */
 function Usage({ u }: { u: Extract<Card, { command: "usage" }> }) {
-  const [open, setOpen] = useState(false);
-  const now = Date.now();
-  const s = u.session;
-  const row = "flex h-9 items-center gap-2 tabular-nums";
   return (
     <div className="pb-1">
-      {(u.limits.length > 0 || u.extra || u.credits !== undefined) && (
-        <Section icon={<AgentLogo agent={u.agent} />} title={`${AGENTS[u.agent].name} 额度`}>
-          {u.limits.map((l, i) => (
-            <Window key={i} l={l} now={now} />
-          ))}
-          {u.extra && <Quota name="额外用量" p={u.extra.usedPercent} side={`${money(u.extra.used, u.extra.currency)}${u.extra.limit === null ? "" : ` / ${money(u.extra.limit, u.extra.currency)}`}`} />}
-          {u.credits !== undefined && (
-            <div className={row}>
-              credits 余额
-              <span className="ml-auto font-semibold">{u.credits.toFixed(2)}</span>
-            </div>
-          )}
-        </Section>
-      )}
-      {s && (
-        <Section icon={<MessageSquare className="size-3.5" />} title="当前对话">
-          {s.cost !== undefined && (
-            <div className={row}>
-              费用
-              <span className="ml-auto font-semibold">{money(s.cost)}</span>
-              {AGENTS[u.agent].apiPrice && <span className="text-sm text-muted-foreground">等效 API 价格</span>}
-            </div>
-          )}
-          <button aria-expanded={open} onClick={() => setOpen(!open)} className={cn(row, PRESS, "text-left")}>
-            Tokens
-            <span className="ml-auto font-semibold">{tokens(s.tokens.total)}</span>
-            <ChevronDown className={cn("size-4 text-muted-foreground transition-transform", open && "rotate-180")} />
-          </button>
-          {open && (
-            <ul className="text-sm">
-              {KINDS.map(([k, name]) => (
-                <li key={k} className="flex h-8 items-center tabular-nums">
-                  <span className="text-muted-foreground">{name}</span>
-                  <span className="ml-auto">{tokens(s.tokens[k])}</span>
-                </li>
-              ))}
-              {s.models?.map((m, i) => (
-                <li key={m.name} className={cn("flex h-8 items-center gap-3 tabular-nums", i === 0 && "border-t")}>
-                  <span className="min-w-0 truncate">{m.name}</span>
-                  <span className="ml-auto text-muted-foreground">{tokens(m.tokens.total)}</span>
-                  <span className="w-16 text-right">{money(m.cost)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Section>
-      )}
+      <QuotaPart agent={u.agent} q={u} />
+      {u.session && <SessionPart agent={u.agent} s={u.session} />}
     </div>
   );
 }
 
+/** An agent's quota (stories 393-395, 500): each window a bar, the extra use, Codex's credits left; none
+ *  with none of them. */
+export function QuotaPart({ agent, q }: { agent: AgentKind; q: { limits: QuotaWindow[]; extra?: ExtraUsage; credits?: number } }) {
+  const now = Date.now();
+  if (!q.limits.length && !q.extra && q.credits === undefined) return null;
+  return (
+    <Section icon={<AgentLogo agent={agent} />} title={`${AGENTS[agent].name} 额度`}>
+      {q.limits.map((l, i) => (
+        <Window key={i} l={l} now={now} />
+      ))}
+      {q.extra && <Quota name="额外用量" p={q.extra.usedPercent} side={`${money(q.extra.used, q.extra.currency)}${q.extra.limit === null ? "" : ` / ${money(q.extra.limit, q.extra.currency)}`}`} />}
+      {q.credits !== undefined && (
+        <div className={ROW}>
+          credits 余额
+          <span className="ml-auto font-semibold">{q.credits.toFixed(2)}</span>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+const ROW = "flex h-9 items-center gap-2 tabular-nums";
+
+/** This conversation's cost, where the agent gives one, and tokens (stories 396, 397); the tokens
+ *  tapped, their four kinds and, Claude's, the cost by model. */
+export function SessionPart({ agent, s }: { agent: AgentKind; s: SessionUse }) {
+  const [open, setOpen] = useState(false);
+  const list = useRef<HTMLUListElement>(null);
+  // Last in a popover capped in height: opened, scrolled into sight (#766).
+  useEffect(() => void (open && list.current?.scrollIntoView({ block: "nearest" })), [open]);
+  return (
+    <Section icon={<MessageSquare className="size-3.5" />} title="当前对话">
+      {s.cost !== undefined && (
+        <div className={ROW}>
+          费用
+          <span className="ml-auto font-semibold">{money(s.cost)}</span>
+          {AGENTS[agent].apiPrice && <span className="text-sm text-muted-foreground">等效 API 价格</span>}
+        </div>
+      )}
+      <button aria-expanded={open} onClick={() => setOpen(!open)} className={cn(ROW, PRESS, "text-left")}>
+        Tokens
+        <span className="ml-auto font-semibold">{tokens(s.tokens.total)}</span>
+        <ChevronDown className={cn("size-4 text-muted-foreground transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <ul ref={list} className="text-sm">
+          {KINDS.map(([k, name]) => (
+            <li key={k} className="flex h-8 items-center tabular-nums">
+              <span className="text-muted-foreground">{name}</span>
+              <span className="ml-auto">{tokens(s.tokens[k])}</span>
+            </li>
+          ))}
+          {s.models?.map((m, i) => (
+            <li key={m.name} className={cn("flex h-8 items-center gap-3 tabular-nums", i === 0 && "border-t")}>
+              <span className="min-w-0 truncate">{m.name}</span>
+              <span className="ml-auto text-muted-foreground">{tokens(m.tokens.total)}</span>
+              <span className="w-16 text-right">{money(m.cost)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Section>
+  );
+}
+
 /** /context (story 400): a bar, the tokens out of the window and the percentage; tapped, what holds them. */
-function Context({ c }: { c: Extract<Card, { command: "context" }> }) {
+export function Context({ c }: { c: ContextUse & { categories?: { name: string; tokens: number }[] } }) {
   const [open, setOpen] = useState(false);
   const p = c.maxTokens ? (c.usedTokens * 100) / c.maxTokens : null;
-  const t = tone(p ?? 0);
+  const t = useTone(p ?? 0);
   return (
     <>
       <button aria-expanded={open} aria-label="分项" disabled={!c.categories} onClick={() => setOpen(!open)} className="block w-full px-4 py-1 text-left transition-colors enabled:hover:bg-foreground/5">
@@ -280,12 +394,13 @@ const ACTIONS: Record<string, [LucideIcon, string]> = { "/stop": [Square, "停�
 /** /status (stories 401-406): the tool running, if any; 模型设置 and 状态 as IM has them, the quota
  *  windows at 80% or more under them; the directory tapped is copied, the context tapped opens
  *  /context's card; then what can be done now. */
-function Status({ s, run }: { s: StatusCard; run: (command: string) => Promise<void> }) {
+export function Status({ s, run }: { s: StatusCard; run: (command: string) => Promise<void> }) {
   const full = (s.limits ?? []).filter((l) => l.usedPercent >= 80);
   const now = Date.now();
   const c = s.context;
   const p = c?.maxTokens ? (c.usedTokens * 100) / c.maxTokens : null;
-  const row = "flex min-h-9 w-full items-center gap-2 text-left tabular-nums";
+  // Its label never wraps, a letter a line, in a narrow popover (story 667).
+  const row = "flex min-h-9 w-full items-center gap-2 text-left whitespace-nowrap tabular-nums";
   const copy = () =>
     navigator.clipboard.writeText(s.dir).then(
       () => toast("已复制目录。"),

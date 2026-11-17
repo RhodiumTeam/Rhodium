@@ -3,7 +3,7 @@
 // is on its own at the end. Each call is drawn with its kind's icon (#206), as T3 Code and Orca do.
 import { cjk } from "@streamdown/cjk";
 import { cn } from "cn";
-import { Bot, Brain, Check, ChevronRight, CircleX, Copy, FilePen, FileText, Globe, Image, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
+import { Bot, Brain, Check, ChevronRight, CircleX, FilePen, FileText, Globe, Image, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
 import { createContext, Fragment, useContext, useEffect, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type MouseEvent } from "react";
 import { defaultComponents, Streamdown, type ExtraProps, type StreamdownProps } from "streamdown";
 import type { FullData } from "../../src/board";
@@ -16,7 +16,7 @@ import { Carried, NoPicture, Picture } from "./media";
 import { Button } from "./components/ui/button";
 import { json, request, type Block } from "./data";
 import { toast } from "./toast";
-import { keep, kept } from "./write";
+import { CopyKey, keep, kept } from "./write";
 
 type Tool = Extract<Block, { kind: "tool" }>;
 type Step = Tool | Extract<Block, { kind: "thinking" }>;
@@ -201,7 +201,7 @@ function CodeBlock({ className, children }: ComponentProps<"code"> & ExtraProps)
     <div className="my-4 rounded-lg border bg-card">
       <div className="flex h-7 items-center pl-3 text-xs text-muted-foreground">
         <span className="font-mono">{/language-(\S+)/.exec(className ?? "")?.[1] ?? "text"}</span>
-        <button aria-label="自动换行" aria-pressed={on} onClick={() => wrap(!on)} className={cn(KEY, "ml-auto aria-pressed:text-foreground")}>
+        <button type="button" aria-label="自动换行" aria-pressed={on} onClick={() => wrap(!on)} className={cn(KEY, "ml-auto aria-pressed:text-foreground")}>
           <TextWrap className="size-3.5" />
         </button>
         <CopyKey text={code} className={KEY} icon="size-3.5" />
@@ -212,21 +212,6 @@ function CodeBlock({ className, children }: ComponentProps<"code"> & ExtraProps)
         <code className={cn("block px-3", !on && "w-max min-w-full")}>{on ? code.split("\n").map(hanging) : code}</code>
       </pre>
     </div>
-  );
-}
-
-/** 复制: copies text as written, a check for 2 s once it did; one it could not says so (story 572). */
-export function CopyKey({ text, className, icon }: { text: string; className: string; icon: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = () =>
-    navigator.clipboard.writeText(text).then(
-      () => (setCopied(true), setTimeout(() => setCopied(false), 2000)),
-      () => toast("没能复制。", true),
-    );
-  return (
-    <button aria-label="复制" onClick={copy} className={className}>
-      {copied ? <Check className={icon} /> : <Copy className={icon} />}
-    </button>
   );
 }
 

@@ -159,7 +159,7 @@ test("stories 252, 254: a slot's events page back to the first, 50 at a time, ol
   const dir = mkdtempSync(join(tmpdir(), "rhodium-test-events-"));
   writeFileSync(join(dir, "config.toml"), `stateDir = "${dir}/state"\n[board]\nport = 0\nlogin = "${BOARD_LOGIN}"\n`, { mode: 0o600 });
   const store = openStore(join(dir, "rh.db"));
-  const server = serveBoard(store, loadConfig(join(dir, "config.toml")));
+  const server = serveBoard(store, loadConfig(join(dir, "config.toml"))).servers[0]!;
   try {
     // 120 events of slot S; the 70th and 71st, on two pages, are of one trace, which another slot had first.
     const [slot, g] = store.tx((tx) => {

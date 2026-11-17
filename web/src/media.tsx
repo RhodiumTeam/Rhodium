@@ -39,7 +39,7 @@ export function Picture({ m }: { m: Media }) {
   if (shown !== "yes") return <NoPicture gone={shown === "gone"} style={size} />;
   return (
     <>
-      <button onClick={() => setOpen(true)} style={size} className={cn(BOX, !size && "size-40")}>
+      <button type="button" onClick={() => setOpen(true)} style={size} className={cn(BOX, !size && "size-40")}>
         <img src={mediaUrl(m.hash, "preview")} alt="图片" loading="lazy" onError={failed} className="size-full object-cover" />
       </button>
       {open && (

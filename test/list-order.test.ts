@@ -26,6 +26,7 @@ const at: Ctx = {
   front: () => false,
   herdr: () => true,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
 };
 
@@ -76,7 +77,7 @@ test("#506: a card says when its slot was last active, as kept; with no turn run
   const home = process.env.HOME;
   process.env.HOME = dir; // the transcripts written below
   const store = openStore(join(dir, "rh.db"));
-  const server = serveBoard(store, config);
+  const server = serveBoard(store, config).servers[0]!;
   try {
     const t = Date.now();
     store.tx((tx) => {

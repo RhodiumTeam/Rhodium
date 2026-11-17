@@ -66,6 +66,7 @@ const ctx = (o: Partial<Ctx> = {}): Ctx => ({
   herdr: () => true,
   front: () => false,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
   ...o,
 });

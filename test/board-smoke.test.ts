@@ -2,7 +2,7 @@
 // what only a browser shows, against rhodium's board serving a store the tests write to. They run on
 // the Chromium playwright-core finds in its cache (~/.cache/ms-playwright), and are skipped without it.
 import { afterAll, beforeAll, expect, onTestFinished, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, devices, type Locator, type Page, type Route } from "playwright-core";
@@ -70,7 +70,7 @@ const create = (name: string) =>
     tx.append({ source: "rh", type: "slot_created", slot: id, data: { ref: `w/${name}` } });
   });
 
-let server: ReturnType<typeof serveBoard> | undefined;
+let server: ReturnType<typeof serveBoard>["servers"][number] | undefined;
 let herdr: Awaited<ReturnType<typeof startFakeHerdr>> | undefined;
 /** The lines the fake Herdr's terminal session controls got so far, as fake.calls has them. */
 const herdrCalls = async () => ((await call(herdr!.socket, "fake.calls")).result.calls as { method: string; params: any }[]).filter((c) => c.method.startsWith("terminal."));
@@ -79,6 +79,9 @@ const hearing = new Set<Hear>();
 /** What the page sent to POST /api/act, and how rhodium answers the next one: by default at once, as /stop does. */
 const acted: { id: string; act: unknown }[] = [];
 let answer = (): Promise<RhReply> => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+/** The conversations whose agent runs, as the slot runner says; and what the board asked of it for the meter. */
+const alive = new Set<string>();
+const meterAsks: { conversation: string; why: string }[] = [];
 beforeAll(async () => {
   if (!browser) return;
   const web = join(base, "web");
@@ -87,7 +90,10 @@ beforeAll(async () => {
     timeoutMs: 60_000,
     env: { ...process.env, NODE_DISABLE_COMPILE_CACHE: "1" },
   });
-  server = serveBoard(store, loadConfig(join(base, "config.toml")), hearing, web, (id, act) => (acted.push({ id, act }), answer()));
+  server = serveBoard(store, loadConfig(join(base, "config.toml")), hearing, web, (id, act) => (acted.push({ id, act }), answer()), new Map(), {
+    ask: (conversation, why) => void meterAsks.push({ conversation, why }),
+    alive: (conversation) => alive.has(conversation),
+  }).servers[0]!;
   // w/term's agent runs in a pane of the fake Herdr.
   herdr = await startFakeHerdr(herdrBin, herdrSession, { HOME: base, PATH: process.env.PATH! });
   const herdrPane = (await call(herdr.socket, "workspace.create", { cwd: base, label: "w" })).result.root_pane.pane_id;
@@ -1434,14 +1440,31 @@ smoke("stories 207, 208: a slot still switching to the terminal shows its chat; 
 
 /** The topology view's sheet (or a wide screen's card) and its height. */
 const sheetOf = (page: Page) => page.getByRole("complementary", { name: "详情" });
-/** The directory picker in sheet (spec web-write "目录选择器"): its path, a workspace's button, a folder's row. */
-const picker = (sheet: Locator) => ({
-  path: sheet.getByRole("textbox", { name: "路径" }),
-  ws: (name: string) => sheet.getByRole("group", { name: "工作区" }).getByRole("button", { name, exact: true }),
-  folders: sheet.getByRole("list", { name: "文件夹" }),
-});
+/** The directory picker in sheet (spec web-write "目录选择器"): its path, its folders dropped down (in
+ *  a layer of their own, over the sheet), and the drop-down they are in. */
+const picker = (sheet: Locator) => {
+  const folders = sheet.page().getByRole("listbox", { name: "文件夹" });
+  return { path: sheet.getByRole("combobox", { name: "路径" }), folders, drop: folders.locator("..") };
+};
 /** A folder under the tests' home, made if need be. */
 const folder = (name: string) => (mkdirSync(join(base, name), { recursive: true }), join(base, name));
+let made = 0;
+/** A conversation of agent's on disk, started in dir, opening with what you said and the agent's reply,
+ *  last changed m minutes past the hour before last: its session id. */
+function conversation(dir: string, said: string, m: number, reply = "", agent: "claude" | "pi" = "claude"): string {
+  const session = `00000000-0000-4000-8000-${String(++made).padStart(12, "0")}`;
+  const line = (role: string, text: string) => JSON.stringify({ parentUuid: null, type: role, message: { role, content: [{ type: "text", text }] }, cwd: dir, gitBranch: "fix/login" }) + "\n";
+  const pi = (role: string, text: string) => JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }] } }) + "\n";
+  const [into, name, text] =
+    agent === "claude"
+      ? [join(base, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-")), `${session}.jsonl`, line("user", said) + (reply ? line("assistant", reply) : "")]
+      : [join(base, ".pi/agent/sessions", `--${dir.slice(1).replace(/\//g, "-")}--`), `2026-01-01T00-00-00-000Z_0199f000-0000-7000-8000-${String(m).padStart(12, "0")}.jsonl`, pi("user", said)];
+  mkdirSync(into, { recursive: true });
+  writeFileSync(join(into, name), text);
+  const at = new Date(Date.now() - 2 * 3_600_000 + m * 60_000);
+  utimesSync(join(into, name), at, at);
+  return session;
+}
 const node = (page: Page, kind: string, text: string) => page.locator(`[data-node=${kind}]`, { hasText: new RegExp(`^${text}`) }).first();
 
 smoke("stories 218, 219, 226, 245: on the topology, a workspace then a slot is tapped; with nothing more to show the sheet is one row; 打开槽位 opens its chat, and back is on the slot again; tapping it lets go of it", async () => {
@@ -2286,12 +2309,12 @@ smoke("#503: a workspace's name reached by Tab rings its name and arrow, as far 
     const what = document.createRange();
     what.selectNodeContents(el);
     const [r, inner] = [el.getBoundingClientRect(), what.getBoundingClientRect()];
-    const card = el.parentElement!.querySelector('a[href^="#/slot/"]')!.parentElement!.parentElement!.getBoundingClientRect();
+    const card = el.closest("[data-slot=collapsible]")!.querySelector('a[href^="#/slot/"]')!.parentElement!.parentElement!.getBoundingClientRect();
     return [inner.top - r.top, r.bottom - inner.bottom, card.top - r.bottom];
   });
   expect(Math.abs(above - below)).toBeLessThanOrEqual(1);
   expect(clear).toBeGreaterThanOrEqual(2);
-  expect(await w.evaluate((el) => ((r) => [r[0], r.at(-1)])([...el.parentElement!.querySelectorAll('a[href^="#/slot/"]')].map((a) => getComputedStyle(a).borderRadius)))).toEqual(["17px 17px 0px 0px", "0px 0px 17px 17px"]);
+  expect(await w.evaluate((el) => ((r) => [r[0], r.at(-1)])([...el.closest("[data-slot=collapsible]")!.querySelectorAll('a[href^="#/slot/"]')].map((a) => getComputedStyle(a).borderRadius)))).toEqual(["17px 17px 0px 0px", "0px 0px 17px 17px"]);
   const archived = page.getByRole("button", { name: /^已归档/ });
   await archived.focus();
   expect(await rung(archived)).toEqual({ style: "solid", inset: 0 });
@@ -2622,7 +2645,7 @@ smoke("stories 431, 445: 收起侧栏 slides the sidebar out whole, its rows and
 smoke("story 445: Ctrl+B with the focus on the line collapses the sidebar, the focus going where you type; with a sheet from the sidebar open, Ctrl+B is the sheet's, its Esc giving the focus back to what opened it", async () => {
   const page = await open(`/slot/${finished}?full`, undefined, wide());
   const side = page.getByRole("navigation", { name: "槽位" });
-  const make = side.getByRole("button", { name: "新建槽位" });
+  const make = side.getByRole("button", { name: "新建槽位", exact: true });
   await side.waitFor();
   await make.click();
   await page.getByRole("dialog").waitFor();
@@ -3157,7 +3180,7 @@ smoke("stories 434-436, 442: on a wide screen the list's rows stay put while the
     expect(await side.locator(`a[href="#/slot/${h2}?full"]`).getAttribute("aria-current")).toBe("page");
 
     // The sidebar's rows stay put too while the mouse is on them.
-    await side.getByRole("button", { name: /^h\s/ }).click();
+    await side.getByRole("button", { name: /^h\s(?!新建槽位|导入)/ }).click();
     await until(async () => (await rows()).length === 4);
     await page.mouse.move(100, 400);
     store.tx((tx) => (tx.update("slot", { id: h1 }, { state: "running" }), tx.append({ source: "board", type: "board_act" })));
@@ -3211,14 +3234,12 @@ smoke("stories 424, 540: the sidebar's 新建槽位 and 导入 start in the open
     return [other, tx.insert("slot", { workspace: other, name: "zs", dir: z, mode: "headless", state: "idle", lifetime: "longterm" }).id];
   });
   const argv = () => (acted.at(-1)!.act as { argv: string[] }).argv;
-  const candidates = [{ label: "Herdr 里 ~/w", command: "/rh_import w1:p1 --name" }];
-  answer = async () =>
-    argv()[0] === "new" ? { ok: true, text: "已建槽位 z/s", slot: rests } : argv()[1] === "--dir" ? { ok: true, text: "导入哪一个？", panel: { head: ["导入哪一个？"], candidates } } : { ok: true, text: "已导入成 w/doc", slot: finished };
+  const session = conversation(z, "导入的文档", 0);
+  answer = async () => (argv()[0] === "new" ? { ok: true, text: "已建槽位 z/s", slot: rests } : { ok: true, text: "已导入成 z/导入的文档", slot: finished });
   try {
     const page = await open(`/topology/slot/${zs}?chat&full`, undefined, wide());
     const sheet = page.getByRole("dialog");
-    await page.getByRole("button", { name: "新建槽位" }).click();
-    await picker(sheet).ws("z").and(page.locator("[aria-pressed=true]")).waitFor();
+    await page.getByRole("button", { name: "新建槽位", exact: true }).click();
     await until(async () => (await picker(sheet).path.inputValue()) === "~/z/");
     await sheet.getByRole("textbox", { name: "槽位名" }).fill("s");
     await sheet.getByRole("button", { name: "新建" }).click();
@@ -3226,17 +3247,662 @@ smoke("stories 424, 540: the sidebar's 新建槽位 and 导入 start in the open
     await page.waitForURL(`**/#/topology/slot/${rests}?chat&full`);
     // Back in z/zs, 导入 too.
     await page.goto(`http://127.0.0.1:${server!.port}/#/topology/slot/${zs}?chat&full`);
-    await page.getByRole("navigation", { name: "槽位" }).getByRole("button", { name: "导入" }).click();
-    await picker(sheet).ws("z").and(page.locator("[aria-pressed=true]")).waitFor();
-    await sheet.getByRole("button", { name: "列出" }).click();
-    await sheet.getByRole("radio", { name: "Herdr 里 ~/w" }).click();
-    expect(argv()).toEqual(["import", "--dir", "~/z"]);
+    await page.getByRole("navigation", { name: "槽位" }).getByRole("button", { name: "导入", exact: true }).click();
+    await until(async () => (await picker(sheet).path.inputValue()) === "~/z/");
+    await sheet.getByRole("radio", { name: /^导入的文档/ }).click();
     await sheet.getByRole("button", { name: "导入" }).click();
+    expect(argv()).toEqual(["import", session, "--name", "导入的文档"]);
     await page.waitForURL(`**/#/topology/slot/${finished}?chat&full`);
     await page.context().close();
   } finally {
     answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
     store.tx((tx) => (tx.delete("slot", { id: zs }), tx.delete("workspace", { id: other })));
+    rmSync(join(base, ".claude/projects", z.replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
+  }
+});
+
+smoke("stories 634-636: on a wide screen a workspace's tab in the sidebar shows its 新建槽位 and 导入 only under the mouse; 新建槽位 opens a dialog in the middle of the screen, in the workspace with no picker, its name filled in, and what it makes opens in maximize mode", async () => {
+  const argv = () => (acted.at(-1)!.act as { argv: string[] }).argv;
+  answer = async () => ({ ok: true, text: "已建槽位 w/w-1", slot: rests });
+  try {
+    const page = await open(`/slot/${finished}?full`, undefined, wide());
+    const side = page.getByRole("navigation", { name: "槽位" });
+    const make = side.getByRole("button", { name: "w 新建槽位" });
+    // Clipped to nothing till the mouse is on the tab's line.
+    const room = () => make.evaluate((b) => b.parentElement!.getBoundingClientRect().width);
+    expect(await room()).toBe(0);
+    await side.getByRole("button", { name: "w", exact: true }).hover();
+    await until(async () => (await room()) > 0);
+    await make.click();
+    const dialog = page.getByRole("dialog");
+    const box = (await dialog.boundingBox())!;
+    expect([Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2), box.width <= 512]).toEqual([720, 450, true]);
+    expect(await dialog.getByRole("combobox", { name: "路径" }).count()).toBe(0);
+    await dialog.getByText("/w", { exact: true }).waitFor();
+    expect(await dialog.getByRole("textbox", { name: "槽位名" }).inputValue()).toBe("w-1");
+    await dialog.getByRole("button", { name: "新建" }).click();
+    expect(argv()).toEqual(["new", "w/w-1", "--agent", "claude"]);
+    await page.waitForURL(`**/#/slot/${rests}?full`);
+  } finally {
+    answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+  }
+});
+
+smoke("stories 634, 635: on a phone a workspace's 新建槽位 and 导入 are always on its name's line, and tapped fold nothing; 导入 comes up from the bottom, in the workspace, listing at once what there is there", async () => {
+  conversation("/w", "写文档", 0);
+  try {
+    const page = await open();
+    const imp = page.getByRole("button", { name: "w 导入" });
+    await page.getByRole("button", { name: "w 新建槽位" }).waitFor();
+    expect(await imp.evaluate((b) => b.parentElement!.getBoundingClientRect().width)).toBeGreaterThan(0);
+    await imp.click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("radio", { name: /^写文档/ }).waitFor();
+    const box = (await dialog.boundingBox())!;
+    expect(Math.round(box.y + box.height)).toBe(page.viewportSize()!.height);
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "detached" });
+    // Not folded.
+    await page.getByText("rests", { exact: true }).waitFor();
+  } finally {
+    rmSync(join(base, ".claude/projects/-w"), { recursive: true });
+  }
+});
+
+smoke("stories 641-648: importing from a workspace on a phone: Claude's conversations there by default, two lines each, 10 then more as you scroll; picked, what you and the agent said opens under it and its name is filled in from its title; ticked, a search finds a word in a reply alone and shows it", async () => {
+  for (let i = 0; i < 12; i++) conversation("/w", `第 ${i} 段：修复登录页窄屏按钮换行`, i, i === 5 ? "在 320px 下量了一遍，quokka 两个按钮现在各占一半" : "好的");
+  // Newer than the pi conversations other tests leave in /w: on the first page.
+  conversation("/w", "pi 的一段", 180, "", "pi");
+  try {
+    const page = await open();
+    await page.getByRole("button", { name: "w 导入" }).click();
+    const dialog = page.getByRole("dialog");
+    const rows = dialog.getByRole("radiogroup", { name: "导入哪一段" }).getByRole("radio");
+    await until(async () => (await rows.count()) === 10);
+    expect(await dialog.getByRole("radio", { name: "claude" }).getAttribute("aria-checked")).toBe("true");
+    const first = await rows.first().innerText();
+    for (const part of ["第 11 段：修复登录页窄屏按钮换行", "2小时前", "fix/login"]) expect(first).toContain(part);
+    await rows.last().scrollIntoViewIfNeeded();
+    await until(async () => (await rows.count()) === 12);
+    const five = dialog.getByRole("radio", { name: /^第 5 段/ });
+    await five.click();
+    expect(await five.getAttribute("aria-checked")).toBe("true");
+    await dialog.getByRole("log", { name: "预览" }).getByText("在 320px 下量了一遍", { exact: false }).waitFor();
+    expect(await dialog.getByRole("textbox", { name: "槽位名" }).inputValue()).toBe("第-5-段-修复登录页窄");
+    // pi's are pi's.
+    await dialog.getByRole("radio", { name: "pi" }).click();
+    await dialog.getByRole("radio", { name: /^pi 的一段/ }).waitFor();
+    await dialog.getByRole("radio", { name: "claude" }).click();
+    // A word in a reply alone: not by title, found once ticked, the bit around it shown.
+    await dialog.getByRole("searchbox", { name: "搜索" }).fill("Quokka");
+    await dialog.getByText("没有找到可导入的会话", { exact: true }).waitFor();
+    await dialog.getByRole("checkbox", { name: "全文搜索" }).click();
+    await until(async () => (await rows.count()) === 1);
+    expect(await rows.first().locator("b").innerText()).toBe("quokka");
+    await page.reload();
+    await page.getByRole("button", { name: "w 导入" }).click();
+    expect(await dialog.getByRole("checkbox", { name: "全文搜索" }).getAttribute("aria-checked")).toBe("true");
+    await page.evaluate(() => localStorage.removeItem("import-full"));
+  } finally {
+    rmSync(join(base, ".claude/projects/-w"), { recursive: true });
+    rmSync(join(base, ".pi/agent/sessions/--w--/2026-01-01T00-00-00-000Z_0199f000-0000-7000-8000-000000000180.jsonl"));
+  }
+});
+
+smoke("story 641: a later page that fails is not asked for again on its own; its row says 没能列出, and tapped asks again", async () => {
+  for (let i = 0; i < 12; i++) conversation("/w", `第 ${i} 段`, i);
+  const later = (u: URL) => u.pathname.endsWith("/api/importable") && u.searchParams.has("cursor");
+  let asked = 0;
+  try {
+    const page = await open("", async (page) => void (await page.route(later, (r) => (asked++, r.abort()))));
+    await page.getByRole("button", { name: "w 导入" }).click();
+    const dialog = page.getByRole("dialog");
+    const rows = dialog.getByRole("radiogroup", { name: "导入哪一段" }).getByRole("radio");
+    await until(async () => (await rows.count()) === 10);
+    await rows.last().scrollIntoViewIfNeeded();
+    const again = dialog.getByRole("button", { name: "没能列出" });
+    await again.waitFor();
+    await page.waitForTimeout(500);
+    expect(asked).toBe(1);
+    await page.unroute(later);
+    await again.click();
+    await until(async () => (await rows.count()) === 12);
+  } finally {
+    rmSync(join(base, ".claude/projects/-w"), { recursive: true });
+  }
+});
+
+smoke("stories 641, 647, 666: on a wide screen the import dialog stays where it is as a row is picked and as a search finds fewer; the picked row opens what you said under it, in its bubble; the search box has no browser's own clear button", async () => {
+  for (let i = 0; i < 5; i++) conversation("/w", `第 ${i} 段`, i, "好的");
+  try {
+    const page = await open(`/slot/${finished}?full`, undefined, wide());
+    const side = page.getByRole("navigation", { name: "槽位" });
+    await side.getByRole("button", { name: "w", exact: true }).hover();
+    await side.getByRole("button", { name: "w 导入" }).click();
+    const dialog = page.getByRole("dialog");
+    const rows = dialog.getByRole("radiogroup", { name: "导入哪一段" }).getByRole("radio");
+    await until(async () => (await rows.count()) === 5);
+    const top = async () => (await page.waitForTimeout(200), Math.round((await dialog.boundingBox())!.y));
+    const at = await top();
+    const two = dialog.getByRole("radio", { name: /^第 2 段/ });
+    await two.click();
+    await dialog.getByRole("log", { name: "预览" }).getByText("第 2 段", { exact: true }).waitFor();
+    await dialog.getByRole("textbox", { name: "槽位名" }).waitFor();
+    expect(await top()).toBe(at);
+    const search = dialog.getByRole("searchbox", { name: "搜索" });
+    await search.fill("第 3");
+    await until(async () => (await rows.count()) === 1);
+    expect(await top()).toBe(at);
+    // Where a browser's own × would be, a click clears nothing.
+    const box = (await search.boundingBox())!;
+    await page.mouse.click(box.x + box.width - 20, box.y + box.height / 2);
+    expect(await search.inputValue()).toBe("第 3");
+  } finally {
+    rmSync(join(base, ".claude/projects/-w"), { recursive: true });
+  }
+});
+
+smoke("story 647: Enter in the import search box, a row picked, imports nothing, but searches at once", async () => {
+  for (let i = 0; i < 3; i++) conversation("/w", `第 ${i} 段`, i, "好的");
+  try {
+    const page = await open(`/slot/${finished}?full`, undefined, wide());
+    const side = page.getByRole("navigation", { name: "槽位" });
+    await side.getByRole("button", { name: "w", exact: true }).hover();
+    await side.getByRole("button", { name: "w 导入" }).click();
+    const dialog = page.getByRole("dialog");
+    const rows = dialog.getByRole("radiogroup", { name: "导入哪一段" }).getByRole("radio");
+    await until(async () => (await rows.count()) === 3);
+    await dialog.getByRole("radio", { name: /^第 1 段/ }).click();
+    await dialog.getByRole("textbox", { name: "槽位名" }).waitFor();
+    const before = acted.length;
+    const search = dialog.getByRole("searchbox", { name: "搜索" });
+    await search.press("Enter");
+    // Typed, then Enter well within the 300 ms the search waits for typing to rest.
+    await search.fill("第 2");
+    await search.press("Enter");
+    await until(async () => (await rows.count()) === 1);
+    await page.waitForTimeout(200);
+    expect(acted.length).toBe(before);
+    expect(await dialog.isVisible()).toBe(true);
+  } finally {
+    rmSync(join(base, ".claude/projects/-w"), { recursive: true });
+  }
+});
+
+smoke("story 649: the top 导入 lists the picker's folder; a search there looks in every folder, each row with its own, and picking one takes the picker to it", async () => {
+  const far = folder("far/proj");
+  conversation(far, "远处的会话 wombat", 0);
+  try {
+    const page = await open();
+    await page.getByRole("button", { name: "新建", exact: true }).click();
+    await page.getByRole("menuitem", { name: "导入" }).click();
+    const dialog = page.getByRole("dialog");
+    await until(async () => (await picker(dialog).path.inputValue()) === "~/");
+    await dialog.getByText("该路径下没有可导入的会话", { exact: true }).waitFor();
+    await dialog.getByRole("searchbox", { name: "搜索" }).fill("wombat");
+    const row = dialog.getByRole("radio", { name: /^远处的会话 wombat/ });
+    await row.getByText("~/far/proj").waitFor();
+    await row.click();
+    await until(async () => (await picker(dialog).path.inputValue()) === "~/far/proj/");
+  } finally {
+    rmSync(join(base, ".claude/projects", far.replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
+  }
+});
+
+for (const [device, label] of [
+  [devices["Pixel 7"], "on a phone"],
+  [wide(), "on a wide screen"],
+] as const)
+  smoke(`stories 661-665 ${label}: the import dialog's name and agent share a line, its name empty till one is picked; only the list scrolls, the name and 导入 staying put; the search box has a magnifier and no placeholder, by 全文搜索; the folders drop down, stay open as you go in, keep the list till they close, and say 空 in one line where there are none`, async () => {
+    const top = folder(`drop-${label.length}`);
+    const a = folder(`drop-${label.length}/a`);
+    folder(`drop-${label.length}/a/b`);
+    for (let i = 0; i < 12; i++) conversation(top, `上层第 ${i} 段`, i);
+    conversation(a, "a 里的一段", 0);
+    try {
+      const page = await open("", undefined, device);
+      await page.getByRole("button", { name: "新建", exact: true }).click();
+      await page.getByRole("menuitem", { name: "导入" }).click();
+      const dialog = page.getByRole("dialog");
+      const { path, folders, drop } = picker(dialog);
+      await path.fill(`~/drop-${label.length}/`);
+      await page.keyboard.press("Escape");
+      expect([await folders.count(), await dialog.isVisible()]).toEqual([0, true]);
+      // includeHidden: while the folders are down, the rest of the dialog is hidden from a screen reader.
+      const rows = dialog.getByRole("radiogroup", { name: "导入哪一段", includeHidden: true }).getByRole("radio", { includeHidden: true });
+      await until(async () => (await rows.count()) === 10);
+      const name = dialog.getByRole("textbox", { name: "槽位名" });
+      const agents = dialog.getByRole("radiogroup", { name: "agent" });
+      const submit = dialog.getByRole("button", { name: "导入", exact: true });
+      const box = async (l: Locator) => (await page.waitForTimeout(100), (await l.boundingBox())!);
+      const [n, g] = [await box(name), await box(agents)];
+      expect(Math.abs(n.y + n.height / 2 - (g.y + g.height / 2))).toBeLessThan(2);
+      expect([await name.inputValue(), await submit.isDisabled()]).toEqual(["", true]);
+      // The search box: a magnifier, no placeholder; the box beside it says 全文搜索.
+      const search = dialog.getByRole("searchbox", { name: "搜索" });
+      expect(await search.getAttribute("placeholder")).toBe(null);
+      expect(await search.locator("xpath=..").locator("svg").count()).toBe(1);
+      await dialog.getByRole("checkbox", { name: "全文搜索", exact: true }).waitFor();
+      // More as you scroll: the name and 导入 do not move.
+      const [nameAt, submitAt] = [await box(name), await box(submit)];
+      await rows.last().scrollIntoViewIfNeeded();
+      await until(async () => (await rows.count()) === 12);
+      expect([await box(name), await box(submit)]).toEqual([nameAt, submitAt]);
+      // The folders drop down over what is under them; gone into twice, they stay, the list as it was.
+      const before = await rows.allInnerTexts();
+      await path.click();
+      await folders.getByRole("option", { name: "a", exact: true }).click();
+      await folders.getByRole("option", { name: "b", exact: true }).click();
+      await until(async () => (await path.inputValue()) === `~/drop-${label.length}/a/b/`);
+      // No folders under b: one 空 line, no room kept empty.
+      await drop.getByText("空", { exact: true }).waitFor();
+      expect((await box(drop)).height).toBeLessThan(60);
+      expect([await drop.isVisible(), await rows.allInnerTexts()]).toEqual([true, before]);
+      await dialog.getByRole("button", { name: "上一级", includeHidden: true }).click();
+      await until(async () => (await path.inputValue()) === `~/drop-${label.length}/a/`);
+      // Esc folds them alone; tapped outside, they fold too, and the list is the new folder's.
+      await page.keyboard.press("Escape");
+      expect([await folders.count(), await dialog.isVisible()]).toEqual([0, true]);
+      await dialog.getByRole("button", { name: "文件夹" }).click();
+      await folders.waitFor();
+      await dialog.getByRole("heading", { name: "导入", includeHidden: true }).click();
+      await until(async () => (await folders.count()) === 0);
+      await until(async () => (await rows.allInnerTexts()).length === 1);
+      expect(await rows.first().innerText()).toContain("a 里的一段");
+    } finally {
+      for (const d of [top, a]) rmSync(join(base, ".claude/projects", d.replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
+    }
+  });
+
+for (const [device, label] of [
+  [devices["Pixel 7"], "on a phone"],
+  [wide(), "on a wide screen"],
+] as const)
+  smoke(`story 666 ${label}: a picked row opens its conversation under it, as the chat has it, at its newest, in a box of its own no higher than its cap; scrolled to its top, the page before comes in above, what you read staying put; picked low on the list, the row and its preview are brought into sight; one that cannot be read says 读不到`, async () => {
+    const dir = folder(`preview-${label.length}`);
+    for (let i = 0; i < 9; i++) conversation(dir, `别的第 ${i} 段`, i + 1);
+    const long = conversation(dir, "最早的一句", 0, "**第一段**回复");
+    const line = (role: string, text: string) => JSON.stringify({ parentUuid: null, type: role, message: { role, content: [{ type: "text", text }] }, cwd: dir }) + "\n";
+    const file = join(base, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-"), `${long}.jsonl`);
+    for (let i = 1; i <= 15; i++) appendFileSync(file, line("user", `问题 ${i}`) + line("assistant", `回答 ${i}`));
+    const at = new Date(Date.now() - 3 * 3_600_000);
+    utimesSync(file, at, at);
+    try {
+      const page = await open("", async (page) => void (await page.route((u) => u.pathname.endsWith("/api/importable/messages") && u.searchParams.get("session") !== long, (r) => r.fulfill({ status: 404 }))), device);
+      await page.getByRole("button", { name: "新建", exact: true }).click();
+      await page.getByRole("menuitem", { name: "导入" }).click();
+      const dialog = page.getByRole("dialog");
+      const { path } = picker(dialog);
+      await path.fill(`~/preview-${label.length}/`);
+      await page.keyboard.press("Escape");
+      const list = dialog.getByRole("radiogroup", { name: "导入哪一段" });
+      const rows = list.getByRole("radio");
+      await until(async () => (await rows.count()) === 10);
+      // The oldest, last on the list.
+      const row = dialog.getByRole("radio", { name: /^最早的一句/ });
+      await row.click();
+      const preview = dialog.getByRole("log", { name: "预览" });
+      await preview.getByText("回答 15", { exact: true }).waitFor();
+      const box = async (l: Locator) => (await page.waitForTimeout(100), (await l.boundingBox())!);
+      // At its newest, below its row, inside the list's room, no higher than its cap.
+      const [p, r, l] = [await box(preview), await box(row), await box(list)];
+      expect(p.y).toBeGreaterThanOrEqual(r.y + r.height - 1);
+      // Both in sight, the newest too: lower than its cap where the list has less room.
+      expect([r.y >= l.y - 1, p.y + p.height <= l.y + l.height + 1]).toEqual([true, true]);
+      expect(p.height).toBeLessThanOrEqual(label === "on a phone" ? (page.viewportSize()!.height * 45) / 100 + 1 : 321);
+      expect(await preview.evaluate((e) => [e.scrollHeight - e.scrollTop - e.clientHeight < 2, getComputedStyle(e).overscrollBehaviorY])).toEqual([true, label === "on a phone" ? "auto" : "contain"]);
+      // Yours on the right in a bubble; the agent's as Markdown.
+      const yours = await box(preview.getByText("问题 15", { exact: true }));
+      expect(yours.x + yours.width).toBeGreaterThan(p.x + p.width / 2);
+      // Scrolled to its top: the page before, above, what was at the top staying where it was.
+      expect(await preview.getByText("最早的一句", { exact: true }).count()).toBe(0);
+      // The first of the page, at the top once scrolled there, stays there.
+      const kept = preview.getByText("问题 6", { exact: true });
+      await preview.evaluate((e) => (e.scrollTop = 0));
+      await preview.getByText("最早的一句", { exact: true }).waitFor();
+      expect(await preview.getByText(/\*\*/).count()).toBe(0);
+      expect(await preview.evaluate((e) => e.scrollTop)).toBeGreaterThan(0);
+      expect(Math.abs((await box(kept)).y - p.y)).toBeLessThan(60);
+      // Another row: this one folds, and one that cannot be read says so.
+      await rows.first().click();
+      await dialog.getByText("读不到", { exact: true }).waitFor();
+      expect(await preview.count()).toBe(0);
+    } finally {
+      // Gone, folder and all: a folder left in ~ would change what a path typed there completes to.
+      for (const d of [join(base, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-")), dir]) rmSync(d, { recursive: true });
+    }
+  });
+
+smoke("story 666 on a phone: a row low on the list whose last page says little, filled by the pages before brought on their own, stays in sight with its preview", async () => {
+  const dir = folder("preview-fill");
+  for (let i = 0; i < 9; i++) conversation(dir, `别的第 ${i} 段`, i + 1);
+  const low = conversation(dir, "最早的一句", 0, "好的");
+  const said = (n: number, at: number) => Array.from({ length: n }, (_, i) => ({ kind: "assistant", text: `回答 ${at + i}`, at: at + i, time: null }));
+  try {
+    const page = await open(
+      "",
+      async (page) =>
+        void (await page.route(
+          (u) => u.pathname.endsWith("/api/importable/messages") && u.searchParams.get("session") === low,
+          // A last page with one thing said, as one cut short by tool calls, then the pages before.
+          (r) => {
+            const before = new URL(r.request().url()).searchParams.get("before");
+            return r.fulfill({ json: before === null ? { blocks: said(1, 100), before: 100 } : { blocks: said(10, 50) } });
+          },
+        )),
+    );
+    await page.getByRole("button", { name: "新建", exact: true }).click();
+    await page.getByRole("menuitem", { name: "导入" }).click();
+    const dialog = page.getByRole("dialog");
+    await picker(dialog).path.fill("~/preview-fill/");
+    await page.keyboard.press("Escape");
+    const list = dialog.getByRole("radiogroup", { name: "导入哪一段" });
+    await until(async () => (await list.getByRole("radio").count()) === 10);
+    const row = dialog.getByRole("radio", { name: /^最早的一句/ });
+    await row.click();
+    const preview = dialog.getByRole("log", { name: "预览" });
+    await preview.getByText("回答 50", { exact: true }).waitFor();
+    await page.waitForTimeout(200);
+    const [p, r, l] = [(await preview.boundingBox())!, (await row.boundingBox())!, (await list.boundingBox())!];
+    expect(p.height).toBeGreaterThan(200);
+    expect([r.y >= l.y - 1, p.y + p.height <= l.y + l.height + 1]).toEqual([true, true]);
+    // The row above still shows, to tap or swipe.
+    expect(r.y - l.y).toBeGreaterThan(40);
+  } finally {
+    for (const d of [join(base, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-")), dir]) rmSync(d, { recursive: true });
+  }
+});
+
+smoke("story 666 on a phone: with a row's preview open, the next row still shows and is picked with a tap; the picked row tapped again folds its preview", async () => {
+  const dir = folder("preview-next");
+  for (let i = 0; i < 9; i++) conversation(dir, `别的第 ${i} 段`, i + 1);
+  const said = (n: number) => Array.from({ length: n }, (_, i) => ({ kind: "assistant", text: `回答 ${i}\n\n第二段\n\n第三段`, at: i, time: null }));
+  try {
+    const page = await open("", async (page) => void (await page.route((u) => u.pathname.endsWith("/api/importable/messages"), (r) => r.fulfill({ json: { blocks: said(20) } }))));
+    await page.getByRole("button", { name: "新建", exact: true }).click();
+    await page.getByRole("menuitem", { name: "导入" }).click();
+    const dialog = page.getByRole("dialog");
+    await picker(dialog).path.fill("~/preview-next/");
+    await page.keyboard.press("Escape");
+    const list = dialog.getByRole("radiogroup", { name: "导入哪一段" });
+    const rows = list.getByRole("radio");
+    await until(async () => (await rows.count()) === 9);
+    await rows.first().click();
+    const preview = dialog.getByRole("log", { name: "预览" });
+    await preview.getByText("回答 19").waitFor();
+    await page.waitForTimeout(200);
+    // The next row shows under the preview, at least its first line, and a tap picks it.
+    const [n, l] = [(await rows.nth(1).boundingBox())!, (await list.boundingBox())!];
+    expect(n.y + 20).toBeLessThan(l.y + l.height);
+    await rows.nth(1).tap();
+    expect(await rows.nth(1).getAttribute("aria-checked")).toBe("true");
+    await preview.getByText("回答 19").waitFor();
+    // Tapped again: folded, nothing picked.
+    await rows.nth(1).tap();
+    await until(async () => (await preview.count()) === 0);
+    expect(await list.getByRole("radio", { checked: true }).count()).toBe(0);
+  } finally {
+    for (const d of [join(base, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-")), dir]) rmSync(d, { recursive: true });
+  }
+});
+
+smoke("stories 664, 666 on a phone: an on-screen keyboard lifts the new slot's and the import's sheets over it, no higher than the room left, the path and the field typed in in sight; the iPhone's zoom-in under 16px is not set off by the path", async () => {
+  const page = await open();
+  // A keyboard, as the visual viewport has it: shorter by what it covers, the layout viewport left as is.
+  // panned: how far up the browser has moved what you see over the page itself, as iOS Safari does.
+  const keyboard = (by: number, panned = 0, scale = 1) =>
+    page.evaluate(
+      ({ by, panned, scale }) => {
+        const v = visualViewport!;
+        for (const [k, x] of [["height", innerHeight - by - panned], ["offsetTop", panned], ["scale", scale]] as const) Object.defineProperty(v, k, { configurable: true, get: () => x });
+        v.dispatchEvent(new Event("resize"));
+      },
+      { by, panned, scale },
+    );
+  const sheet = page.getByRole("dialog");
+  const inSight = async (l: Locator) => {
+    const [b, [top, h]] = [(await l.boundingBox())!, await page.evaluate(() => [visualViewport!.offsetTop, visualViewport!.height])];
+    return b.y >= top - 1 && b.y + b.height <= top + h + 1;
+  };
+  // Enough folders for the drop-down to run to its cap; gone after, as a folder left in ~ would change
+  // what a path typed there completes to.
+  for (let i = 0; i < 12; i++) folder(`kb-dirs/d${i}`);
+  try {
+    for (const which of ["新建槽位", "导入"]) {
+      await page.getByRole("button", { name: "新建", exact: true }).click();
+      await page.getByRole("menuitem", { name: which }).click();
+      const path = picker(sheet).path;
+      await path.fill("~/kb-dirs/");
+      await page.keyboard.press("Escape");
+      expect(await path.evaluate((e) => getComputedStyle(e).fontSize)).toBe("16px");
+      // A tap on it, as a finger's, drops the folders down again.
+      await path.click();
+      await keyboard(330);
+      const room = await page.evaluate(() => innerHeight - 330);
+      // As high as the room left at most, its bottom on the keyboard, once its opening has run.
+      await until(async () => {
+        const b = (await sheet.boundingBox())!;
+        return Math.abs(b.y + b.height - room) <= 1 && b.y >= 0;
+      });
+      expect(await inSight(path)).toBe(true);
+      // The folders dropped down under the path, whole, over the keyboard.
+      const { folders, drop } = picker(sheet);
+      await folders.waitFor();
+      const [f, p] = [(await drop.boundingBox())!, (await path.boundingBox())!];
+      expect(f.height).toBeGreaterThan(250);
+      expect([f.y >= p.y + p.height, f.y + f.height <= room + 1]).toEqual([true, true]);
+      // Moved up already by the browser, as iOS Safari pans: lifted only by what it did not.
+      await keyboard(330, 100);
+      await until(async () => {
+        const b = (await sheet.boundingBox())!;
+        return Math.abs(b.y + b.height - room) <= 1;
+      });
+      expect(await inSight(path)).toBe(true);
+      // Zoomed in, not a keyboard: on the bottom.
+      await keyboard(330, 0, 1.5);
+      const full = await page.evaluate(() => innerHeight);
+      await until(async () => {
+        const b = (await sheet.boundingBox())!;
+        return Math.abs(b.y + b.height - full) <= 1;
+      });
+      await keyboard(330);
+      // The folders down, the rest of the sheet is hidden from a screen reader, as a combobox's is.
+      const name = sheet.getByRole("textbox", { name: "槽位名", includeHidden: true });
+      await name.focus();
+      await page.waitForTimeout(100);
+      expect(await inSight(name)).toBe(true);
+      // Down again: back on the bottom.
+      await keyboard(0);
+      await until(async () => {
+        const b = (await sheet.boundingBox())!;
+        return Math.abs(b.y + b.height - full) <= 1;
+      });
+      await page.keyboard.press("Escape");
+      await page.keyboard.press("Escape");
+      await until(async () => (await sheet.count()) === 0);
+    }
+  } finally {
+    rmSync(join(base, "kb-dirs"), { recursive: true });
+  }
+});
+
+smoke("story 666: a code block's 自动换行 and 复制 in an import's preview do what they say and import nothing", async () => {
+  const dir = folder("preview-code");
+  const session = conversation(dir, "带代码的一段", 0, "好的");
+  const sent = acted.length;
+  try {
+    const page = await open(
+      "",
+      async (page) =>
+        void (await page.route(
+          (u) => u.pathname.endsWith("/api/importable/messages") && u.searchParams.get("session") === session,
+          (r) => r.fulfill({ json: { blocks: [{ kind: "assistant", text: "看：\n\n```ts\nconst a = 1;\n```", at: 1, time: null }] } }),
+        )),
+    );
+    await page.getByRole("button", { name: "新建", exact: true }).click();
+    await page.getByRole("menuitem", { name: "导入" }).click();
+    const dialog = page.getByRole("dialog");
+    await picker(dialog).path.fill("~/preview-code/");
+    await page.keyboard.press("Escape");
+    await dialog.getByRole("radio", { name: /^带代码的一段/ }).click();
+    const preview = dialog.getByRole("log", { name: "预览" });
+    const wrap = preview.getByRole("button", { name: "自动换行" });
+    const was = await wrap.getAttribute("aria-pressed");
+    await wrap.click();
+    expect(await wrap.getAttribute("aria-pressed")).toBe(was === "true" ? "false" : "true");
+    await preview.getByRole("button", { name: "复制" }).click();
+    await page.waitForTimeout(300);
+    expect([acted.length, await dialog.isVisible()]).toEqual([sent, true]);
+    await wrap.click();
+  } finally {
+    for (const d of [join(base, ".claude/projects", dir.replace(/[^a-zA-Z0-9]/g, "-")), dir]) rmSync(d, { recursive: true });
+  }
+});
+
+smoke("#772: on a phone the new slot's path stays put as its folders drop down; typed into after Esc, they drop down again; folded, a path's error shows under it; no blank line under the path where the folder has no git and no sessions", async () => {
+  folder("bare-772");
+  const page = await open("", undefined, devices["Pixel 7"]);
+  await page.getByRole("button", { name: "新建", exact: true }).click();
+  await page.getByRole("menuitem", { name: "新建槽位" }).click();
+  const sheet = page.getByRole("dialog");
+  const { path, folders } = picker(sheet);
+  const box = async (l: Locator) => (await page.waitForTimeout(400), (await l.boundingBox())!);
+  const at = await box(path);
+  await path.click();
+  await folders.waitFor();
+  expect(await box(path)).toEqual(at);
+  await page.keyboard.press("Escape");
+  await until(async () => (await folders.count()) === 0);
+  await path.press("End");
+  await page.keyboard.type("b");
+  await folders.waitFor();
+  await path.fill("~/nope-772/");
+  await page.keyboard.press("Escape");
+  await sheet.getByText("没有这个目录", { exact: true }).waitFor();
+  await path.click();
+  await path.fill("~/bare-772/");
+  await page.keyboard.press("Escape");
+  const [p, n] = [await box(path), await box(sheet.getByRole("textbox", { name: "工作区名" }))];
+  expect(n.y - (p.y + p.height)).toBeLessThan(20);
+});
+
+smoke("story 641: the top 导入 closed and opened again lists each conversation once", async () => {
+  for (let i = 0; i < 2; i++) conversation(base, `家里的第 ${i} 段`, i);
+  try {
+    const page = await open();
+    const dialog = page.getByRole("dialog");
+    const rows = dialog.getByRole("radiogroup", { name: "导入哪一段" }).getByRole("radio");
+    const importing = async () => {
+      const listed = page.waitForResponse((r) => r.url().includes("/api/importable"));
+      await page.getByRole("button", { name: "新建", exact: true }).click();
+      await page.getByRole("menuitem", { name: "导入" }).click();
+      await listed;
+      await until(async () => (await rows.count()) > 0);
+      await page.waitForTimeout(200);
+      return rows.count();
+    };
+    expect(await importing()).toBe(2);
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+    expect(await importing()).toBe(2);
+  } finally {
+    rmSync(join(base, ".claude/projects", base.replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
+  }
+});
+
+smoke("stories 639, 640: a row alone with no workspace's name over it has 新建槽位 and 导入 in its menu, under a line, which open its workspace's sheet; while its menu is up the row looks pointed at, and not once it closes; a row under its workspace's name has neither", async () => {
+  const z = folder("z");
+  const [other, zs] = store.tx((tx) => {
+    const other = tx.insert("workspace", { name: "z", dir: z }).id;
+    return [other, tx.insert("slot", { workspace: other, name: "zs", dir: z, mode: "headless", state: "idle", lifetime: "longterm" }).id];
+  });
+  try {
+    const page = await open("", undefined, wide());
+    const row = page.locator(`a[href$="/slot/${zs}"]`);
+    const ground = () => row.evaluate((a) => getComputedStyle(a).backgroundColor);
+    await row.waitFor();
+    const rest = await ground();
+    await row.click({ button: "right" });
+    const items = page.getByRole("menuitem");
+    await items.first().waitFor();
+    expect(await items.allInnerTexts()).toEqual(["置顶", "开新对话", "改名", "切到终端", "归档", "新建槽位", "导入"]);
+    expect(await page.getByRole("menu").getByRole("separator").count()).toBe(1);
+    // The mouse off it, the row still looks pointed at.
+    await page.mouse.move(5, 5);
+    expect(await ground()).not.toBe(rest);
+    await page.getByRole("menuitem", { name: "新建槽位" }).click();
+    const dialog = page.getByRole("dialog");
+    expect(await dialog.getByRole("textbox", { name: "槽位名" }).inputValue()).toBe("z-1");
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "detached" });
+    await page.mouse.move(5, 5);
+    await until(async () => (await ground()) === rest);
+
+    const more5 = store.tx((tx) => tx.find("slot", { name: "more5" }))[0]!.id;
+    await page.locator(`a[href$="/slot/${more5}"]`).click({ button: "right" });
+    await items.first().waitFor();
+    expect(await items.allInnerTexts()).not.toContain("新建槽位");
+  } finally {
+    store.tx((tx) => (tx.delete("slot", { id: zs }), tx.delete("workspace", { id: other })));
+  }
+});
+
+smoke("story 639: a lone row's 新建槽位 dialog, on a phone's list and in the sidebar, outlives the row moving into its workspace's card, what was typed kept", async () => {
+  const z = folder("z");
+  for (const [hash, device] of [["", undefined], [`/slot/${finished}?full`, wide()]] as const) {
+    const [other, zs] = store.tx((tx) => {
+      const other = tx.insert("workspace", { name: "z", dir: z }).id;
+      return [other, tx.insert("slot", { workspace: other, name: "zs", dir: z, mode: "headless", state: "idle", lifetime: "longterm" }).id];
+    });
+    try {
+      const page = await open(hash, undefined, device);
+      // By its tag: under the dialog the sidebar is hidden from roles.
+      const list = device ? page.locator('nav[aria-label="槽位"]') : page;
+      // Its menu and the dialog by keys, as Android's long press is a right click: no pointer holds the list.
+      await list.locator(`a[href*="/slot/${zs}"]`).evaluate((a) => a.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 50, clientY: a.getBoundingClientRect().top + 5 })));
+      await page.getByRole("menuitem", { name: "新建槽位" }).focus();
+      await page.keyboard.press("Enter");
+      const name = page.getByRole("dialog").getByRole("textbox", { name: "槽位名" });
+      await name.fill("typed");
+      // A second slot in z: the row leaves its own card for z's.
+      const zt = store.tx((tx) => {
+        const zt = tx.insert("slot", { workspace: other, name: "zt", dir: z, mode: "headless", state: "idle", lifetime: "longterm" }).id;
+        tx.append({ source: "board", type: "board_act" });
+        return zt;
+      });
+      await list.locator(`a[href*="/slot/${zt}"]`).waitFor({ state: "attached" });
+      expect(await name.inputValue({ timeout: 500 })).toBe("typed");
+      await page.context().close();
+    } finally {
+      store.tx((tx) => (tx.delete("slot", { workspace: other }), tx.delete("workspace", { id: other }), tx.append({ source: "board", type: "board_act" })));
+    }
+  }
+});
+
+smoke("story 634: on a phone a workspace's long name is truncated on its card, its keys on the line, and in its dialog, the directory in sight, nothing scrolling sideways", async () => {
+  const z = folder("z");
+  const long = "w".repeat(64);
+  const other = store.tx((tx) => {
+    const other = tx.insert("workspace", { name: long, dir: z }).id;
+    for (const name of ["a", "b"]) tx.insert("slot", { workspace: other, name, dir: z, mode: "headless", state: "idle", lifetime: "longterm" });
+    return other;
+  });
+  try {
+    const page = await open();
+    const make = page.getByRole("button", { name: `${long} 新建槽位` });
+    await make.waitFor();
+    expect(await page.evaluate(() => document.scrollingElement!.scrollWidth <= innerWidth)).toBe(true);
+    await make.click();
+    const dialog = page.getByRole("dialog");
+    const dir = dialog.getByText(/\/z$/);
+    const box = (await dir.boundingBox())!;
+    expect([await dir.evaluate((e) => e.scrollWidth <= e.clientWidth), box.x + box.width <= page.viewportSize()!.width]).toEqual([true, true]);
+    expect(await dialog.getByText(long).evaluate((e) => e.scrollWidth > e.clientWidth)).toBe(true);
+    // Nothing but the name's box, filled with the long name, scrolls sideways.
+    expect(await dialog.evaluate((d) => [...d.querySelectorAll(":not(input)")].filter((e) => e.scrollWidth > e.clientWidth + 1 && getComputedStyle(e).overflowX !== "visible" && getComputedStyle(e).textOverflow !== "ellipsis").length)).toBe(0);
+    await page.context().close();
+  } finally {
+    store.tx((tx) => (tx.delete("slot", { workspace: other }), tx.delete("workspace", { id: other })));
   }
 });
 
@@ -3895,7 +4561,7 @@ smoke("#293, story 540: 新槽位 from a workspace's details on the topology sta
   try {
     const page = await open(`/topology/ws/${other}`);
     await sheetOf(page).getByRole("button", { name: "新槽位" }).click();
-    await picker(page.getByRole("dialog")).ws("z").and(page.locator("[aria-pressed=true]")).waitFor();
+    await until(async () => (await picker(page.getByRole("dialog")).path.inputValue()) === "~/z/");
   } finally {
     store.tx((tx) => tx.delete("workspace", { id: other }));
   }
@@ -4097,7 +4763,7 @@ const removes = (id: string, ref: string) => async (): Promise<RhReply> => (
   store.tx((tx) => (tx.delete("slot", { id }), tx.append({ source: "rh", type: "slot_deleted", slot: id, data: { ref } }))), { ok: true, text: `已删除 ${ref}。` }
 );
 
-smoke("stories 535, 537: a row's right click, as Android's long press, opens its menu where it was: 归档 with 撤销 on a live headless slot, 恢复 and 删除 on an archived one, none on one in the terminal; 删除 asks first, then the row is gone", async () => {
+smoke("stories 535, 537: a row's right click, as Android's long press, opens its menu where it was: 归档 with 撤销 on a live headless slot, 恢复 and 删除 on an archived one; 删除 asks first, then the row is gone", async () => {
   let n = acted.length;
   const sent = async () => (await until(() => acted.length === n + 1), n++, acted.at(-1)!.act);
   const old = binned("binned");
@@ -4114,9 +4780,6 @@ smoke("stories 535, 537: a row's right click, as Android's long press, opens its
   await page.getByRole("status").getByRole("button", { name: "撤销" }).waitFor();
   // Tapped, the toast goes, off what is under it.
   await page.getByRole("status").getByText("已归档 w/more5，对话保留。").click();
-  await row(term).click({ button: "right" });
-  await page.waitForTimeout(300);
-  expect(await items.count()).toBe(0);
 
   await page.getByRole("button", { name: /^已归档 \d+$/ }).click();
   await row(old).click({ button: "right" });
@@ -4130,6 +4793,57 @@ smoke("stories 535, 537: a row's right click, as Android's long press, opens its
   expect(await sent()).toEqual({ kind: "rh", argv: ["rm", old] });
   await row(old).waitFor({ state: "detached" });
   answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+});
+
+smoke("stories 659, 660: a slot in the terminal has its last thing said after a terminal icon in its row, and a menu: 改名, 收回终端, asking first, then rh release, and 置顶; on the list and in the sidebar", async () => {
+  let n = acted.length;
+  const sent = async () => (await until(() => acted.length === n + 1), n++, acted.at(-1)!.act);
+  const conversation = store.tx((tx) => {
+    const id = tx.insert("conversation", { slot: term, agent: "pi", sessionId: "term1", startedAt: Date.now() }).id;
+    tx.update("slot", { id: term }, { conversation: id });
+    return id;
+  });
+  const file = join(base, ".pi/agent/sessions/--w--/2026-10-23_term1.jsonl");
+  writeFileSync(file, said("assistant", "终端里改好了"));
+  try {
+    for (const [hash, device, end] of [["", undefined, ""], [`/slot/${rests}?full`, wide(), "?full"]] as const) {
+      const page = await open(hash, undefined, device);
+      const row = page.locator(`a[href$="/slot/${term}${end}"]`);
+      await row.getByText("终端里改好了").waitFor();
+      expect(await row.getByRole("img", { name: "在终端里" }).count()).toBe(1);
+      expect(await row.innerText()).not.toContain("TUI");
+      await row.click({ button: "right" });
+      const items = page.getByRole("menuitem");
+      await items.first().waitFor();
+      expect(await items.allInnerTexts()).toEqual(["置顶", "改名", "收回终端"]);
+      await page.getByRole("menuitem", { name: "收回终端" }).click();
+      const asks = page.getByRole("alertdialog");
+      expect([await asks.getByRole("heading").innerText(), await asks.getByRole("button").allInnerTexts()]).toEqual(["收回终端？", ["取消", "收回"]]);
+      await asks.getByRole("button", { name: "收回" }).click();
+      expect(await sent()).toEqual({ kind: "rh", argv: ["release", term], sure: true });
+      await row.click({ button: "right" });
+      await page.getByRole("menuitem", { name: "置顶" }).click();
+      expect(await sent()).toEqual({ kind: "pin", slot: term, on: true });
+      await row.click({ button: "right" });
+      await page.getByRole("menuitem", { name: "改名" }).click();
+      const box = page.getByRole("textbox", { name: "槽位名" });
+      expect(await box.inputValue()).toBe("term");
+      await box.press("Escape");
+      await box.waitFor({ state: "detached" });
+      await page.context().close();
+    }
+    // Archived, a slot in the terminal has no menu (story 535).
+    store.tx((tx) => tx.update("slot", { id: term }, { archivedAt: Date.now() }));
+    const page = await open();
+    await page.getByRole("button", { name: /^已归档 \d+$/ }).click();
+    await page.locator(`a[href$="/slot/${term}"]`).click({ button: "right" });
+    await page.waitForTimeout(300);
+    expect(await page.getByRole("menuitem").count()).toBe(0);
+    await page.context().close();
+  } finally {
+    rmSync(file, { force: true });
+    store.tx((tx) => (tx.update("slot", { id: term }, { conversation: null, archivedAt: null }), tx.delete("conversation", { id: conversation })));
+  }
 });
 
 smoke("#491: a running headless slot's row menu has 停止 first; 切到终端 asks as the bar's key does, 跑完再切 or 打断; 改名 turns the row's name into a box, the caret in it, where space is the box's, not the sidebar's page key, and Enter renames the slot", async () => {
@@ -4386,6 +5100,133 @@ smoke("story 271: a slot's details on the topology hold what its chat has, a mou
   expect(await asks.getByRole("button").allInnerTexts()).toEqual(["取消", "切换"]);
   await asks.getByRole("button", { name: "切换" }).click();
   expect(await sent()).toEqual({ kind: "rh", argv: ["tui", rests] });
+});
+
+// A Bot's menu on the topology (spec web-bots stories 681-684), over a topology and owners of the test's own.
+const botsTopology = (bots: string[]) => {
+  // Each Bot's id is not its name: what is sent must name the id.
+  const bot = (name: string) => ({ id: `b-${name}`, name, platform: name === "qq" ? "qq" : "telegram", main: name === "qq", conn: "online", target: `w/${name}`, avatar: null });
+  return {
+    bots: bots.map(bot),
+    chats: bots.map((b) => ({ id: `c-${b}`, bot: `b-${b}`, kind: "private", yours: true, name: null, main: b === "qq", avatar: null, verbose: false })),
+    bindings: [],
+    workspaces: [{ id: "w", name: "w" }],
+    slots: bots.map((b) => ({ id: `w/${b}`, ref: `w/${b}`, name: b, workspace: "w", parent: null, agent: "claude", mode: "headless", phase: "idle", state: "空闲", group: "idle", lifetime: "longterm", archived: false, contact: null })),
+  };
+};
+const botsPage = async (device: (typeof devices)[string]) => {
+  const state = { bots: ["qq", "tg"], owners: [{ id: "0a1b2c3d", fixed: true, chat: "c-tg", name: "Mika", avatar: null }, { id: "9f8e7d6c", fixed: false, chat: null, name: null, avatar: null }] };
+  const page = await open("/topology", async (p) => {
+    await p.route("**/api/topology", (route) => route.fulfill({ json: botsTopology(state.bots) }));
+    await p.route("**/api/bots/owners?*", (route) => route.fulfill({ json: { owners: state.owners } }));
+  }, device);
+  await node(page, "bot", "tg").waitFor();
+  return { page, state };
+};
+const WIDE_SCREEN = { viewport: { width: 1440, height: 900 } } as (typeof devices)[string];
+
+smoke("stories 681-684: on a wide screen a right click on a Bot opens its menu under its name: 添加小号 shows the code and its countdown till it is sent; 主人 takes a paired one off; 删除 Bot asks first; the main Bot's is greyed, and says why", async () => {
+  let n = acted.length;
+  const sent = async () => (await until(() => acted.length === n + 1), n++, acted.at(-1)!.act);
+  const { page, state } = await botsPage(WIDE_SCREEN);
+  const menu = page.getByRole("menu");
+  await node(page, "bot", "tg").click({ button: "right", position: { x: 80, y: 20 } });
+  await menu.waitFor();
+  expect(await menu.innerText()).toBe("tg\n添加小号\n主人\n删除 Bot");
+
+  // 添加小号: the code as it is, the bot to send it to, its time left; paired, it closes.
+  answer = async () => ({ ok: true, text: "配对码：K7QM2XPD\n10 分钟内，用你自己的账号在 IM 里私聊 Bot tg，发这个码。" });
+  await page.getByRole("menuitem", { name: "添加小号" }).click();
+  expect(await sent()).toEqual({ kind: "rh", argv: ["pair", "b-tg", "--add"] });
+  const pairing = page.getByRole("dialog", { name: "添加小号" });
+  await pairing.getByText("K7QM2XPD", { exact: true }).waitFor();
+  await pairing.getByText("私聊 tg，发送这个码").waitFor();
+  store.tx((tx) => tx.append({ source: "rh", type: "pair_code", data: { bot: "tg", id: "b-tg", until: Date.now() + 600_000 } }));
+  await pairing.getByText(/^(10:00|9:5\d)$/).waitFor();
+  store.tx((tx) => tx.append({ source: "im", type: "bot_paired", data: { bot: "tg", id: "b-tg" } }));
+  await pairing.waitFor({ state: "detached" });
+  await page.getByRole("status").getByText("已配对").waitFor();
+  answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+
+  // 主人: the config's locked, a paired one by its code, taken off.
+  await node(page, "bot", "tg").click({ button: "right", position: { x: 80, y: 20 } });
+  await page.getByRole("menuitem", { name: "主人" }).click();
+  const owners = page.getByRole("dialog", { name: "主人" });
+  await owners.getByText("9f8e7d6c").waitFor();
+  expect(await owners.getByRole("listitem").allInnerTexts()).toEqual(["Mika", "9f8e7d6c"]);
+  expect(await owners.getByRole("img", { name: "配置里的" }).count()).toBe(1);
+  state.owners = state.owners.slice(0, 1);
+  await owners.getByRole("button", { name: "去掉" }).click();
+  expect(await sent()).toEqual({ kind: "rh", argv: ["pair", "b-tg", "--rm", "9f8e7d6c"] });
+  await owners.getByText("9f8e7d6c").waitFor({ state: "detached" });
+  await page.keyboard.press("Escape");
+  await owners.waitFor({ state: "detached" });
+
+  // 删除 Bot: asks, saying what goes with it; then the Bot is gone.
+  await node(page, "bot", "tg").click({ button: "right", position: { x: 80, y: 20 } });
+  await page.getByRole("menuitem", { name: "删除 Bot" }).click();
+  const asks = page.getByRole("alertdialog", { name: "删除 tg？" });
+  await asks.getByText("其相关的聊天窗口和槽位绑定也将永久删除").waitFor();
+  state.bots = ["qq"];
+  await asks.getByRole("button", { name: "删除" }).click();
+  expect(await sent()).toEqual({ kind: "rh", argv: ["bot", "rm", "b-tg"] });
+  store.tx((tx) => tx.append({ source: "rh", type: "bot_removed", data: { bot: "tg" } }));
+  await node(page, "bot", "tg").waitFor({ state: "detached" });
+
+  // The main Bot's 删除 Bot is greyed, and says why under the mouse.
+  await node(page, "bot", "qq").click({ button: "right", position: { x: 80, y: 20 } });
+  const rm = page.getByRole("menuitem", { name: "删除 Bot" });
+  expect(await rm.getAttribute("aria-disabled")).toBe("true");
+  await rm.hover();
+  await page.getByText("主 Bot 不能删除").waitFor();
+  await rm.click({ force: true });
+  await page.waitForTimeout(200);
+  expect([await page.getByRole("alertdialog").count(), acted.length]).toEqual([0, n]);
+});
+
+smoke("stories 681, 683, 684: on a phone a finger held still on a Bot opens its menu, one that moves none; 主人 and 删除 Bot's confirm are in the middle of the screen, not at its bottom", async () => {
+  const { page } = await botsPage(devices["Pixel 7"]);
+  const box = (await node(page, "bot", "tg").boundingBox())!;
+  const at = { x: box.x + 60, y: box.y + 16 };
+  const f = await finger(page);
+  const items = page.getByRole("menuitem");
+  await f.down(at);
+  await f.move({ x: at.x + 20, y: at.y });
+  await page.waitForTimeout(700);
+  await f.up();
+  expect(await items.count()).toBe(0);
+  const atNow = (await node(page, "bot", "tg").boundingBox())!;
+  const held = { x: atNow.x + 60, y: atNow.y + 16 };
+  await f.down(held);
+  await items.first().waitFor({ timeout: 1_500 });
+  await f.up();
+  expect(await page.getByRole("menu").innerText()).toBe("tg\n添加小号\n主人\n删除 Bot");
+  // Held, it did not focus the Bot.
+  expect(new URL(page.url()).hash).toBe("#/topology");
+  // Its menu closed, the page's own right clicks are the browser's again, as a link's on Android.
+  await page.keyboard.press("Escape");
+  await page.getByRole("menu").waitFor({ state: "detached" });
+  expect(await page.evaluate(() => !document.body.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })))).toBe(false);
+  await f.down(held);
+  await items.first().waitFor({ timeout: 1_500 });
+  await f.up();
+
+  const middle = async (dialog: Locator) => {
+    await dialog.waitFor();
+    await page.waitForTimeout(250);
+    const b = (await dialog.boundingBox())!;
+    const h = page.viewportSize()!.height;
+    expect(Math.abs(b.y + b.height / 2 - h / 2)).toBeLessThan(80);
+  };
+  await page.getByRole("menuitem", { name: "主人" }).click();
+  await middle(page.getByRole("dialog", { name: "主人" }));
+  await page.keyboard.press("Escape");
+  await page.getByRole("dialog").waitFor({ state: "detached" });
+  await f.down(held);
+  await items.first().waitFor({ timeout: 1_500 });
+  await f.up();
+  await page.getByRole("menuitem", { name: "删除 Bot" }).click();
+  await middle(page.getByRole("alertdialog", { name: "删除 tg？" }));
 });
 
 smoke("story 476: on a computer and a phone the terminal key of an idle slot asks first: 取消 sends nothing, 切换 switches; in the terminal, the top bar's switch to the chat log asks nothing", async () => {
@@ -5020,15 +5861,15 @@ smoke("story 279: a command turned away goes back where you typed it, unless you
     expect(await box.inputValue()).toBe("");
   };
   try {
-    await box.fill("/context");
+    await box.fill("/status");
     await turnedAway();
-    reply({ ok: false, error: "看板还不能发 /context。" });
-    await page.getByRole("status").getByText("看板还不能发 /context。").first().waitFor();
-    await until(async () => (await box.inputValue()) === "/context");
+    reply({ ok: false, error: "看板还不能发 /status。" });
+    await page.getByRole("status").getByText("看板还不能发 /status。").first().waitFor();
+    await until(async () => (await box.inputValue()) === "/status");
     await turnedAway();
     await box.fill("别的话");
-    reply({ ok: false, error: "看板还不能发 /context。" });
-    await until(async () => (await page.getByRole("status").getByText("看板还不能发 /context。").count()) === 2);
+    reply({ ok: false, error: "看板还不能发 /status。" });
+    await until(async () => (await page.getByRole("status").getByText("看板还不能发 /status。").count()) === 2);
     expect(await box.inputValue()).toBe("别的话");
     await page.reload();
     expect(await box.inputValue()).toBe("别的话");
@@ -5109,39 +5950,32 @@ smoke("stories 294, 296, 297, 299, 300, 301, #289: / brings up the slot's comman
   }
 });
 
-/** Rhodium's answers to /context, the first 19% used, Claude's with what holds it; the next 96%, pi's
- *  with nothing on what holds it; and to /compact, a receipt. */
-function contextAnswers(): () => Promise<RhReply> {
+/** Rhodium's answers to /status, w/a's first, then w/b's; and to /compact, a receipt. */
+function statusTwice(): () => Promise<RhReply> {
   let n = 0;
-  return async () => {
-    const text = (acted.at(-1)!.act as { text: string }).text;
-    if (text === "/compact") return { ok: true, text: "已压缩上下文。" };
-    if (n++) return { ok: true, text: "上下文", card: { command: "context", usedTokens: 960_000, maxTokens: 1_000_000 } };
-    return { ok: true, text: "上下文", card: { command: "context", usedTokens: 186_000, maxTokens: 1_000_000, categories: [{ name: "消息", tokens: 132_000 }] } };
-  };
+  return async () => ((acted.at(-1)!.act as { text: string }).text === "/compact" ? { ok: true, text: "已压缩上下文。" } : statusCard(n++ ? "b" : "a"));
 }
 
-smoke("stories 387, 389, 390, 400: on a phone /context is an info card over where you type, its parts a tap away; the next answer takes its place, Esc closes it, and /compact's receipt is a toast", async () => {
-  answer = contextAnswers();
+smoke("stories 387, 389, 390, #761: on a phone /status is a popover over where you type, no handle, at the box's left edge, 20rem wide (story 667); the next answer takes its place, Esc closes it, and /compact's receipt is a toast", async () => {
+  answer = statusTwice();
   try {
     const page = await open(`/slot/${rests}`);
     const box = page.getByRole("textbox", { name: "消息" });
-    const card = page.getByRole("dialog", { name: "上下文" });
-    await box.fill("/context");
+    const card = page.getByRole("dialog");
+    await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
-    await card.getByText("186k / 1M").waitFor();
-    const [c, b] = [(await card.boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
-    expect([c.x, c.width]).toEqual([b.x, b.width]);
-    expect(c.y + c.height).toBeLessThanOrEqual(b.y);
-    // Its parts, tapped.
-    await card.getByRole("button", { name: "分项" }).click();
-    await card.getByText("消息").waitFor();
-    // Open, where you type still takes words, and the next answer takes its place, one with no parts
-    // (pi's) too, though the last was unfolded.
-    await box.fill("/context");
+    await card.getByText("~/w").waitFor();
+    expect(await card.getAttribute("aria-label")).toBe("w/a");
+    await until(async () => {
+      const [c, b] = [(await card.boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
+      return c.y + c.height <= b.y && Math.abs(c.x - b.x) < 1 && Math.abs(c.width - 320) < 1;
+    });
+    // A popover: no handle to drag, as the info card has.
+    expect(await card.locator(".cursor-grab").count()).toBe(0);
+    // Open, where you type still takes words, and the next answer takes its place.
+    await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
-    await card.getByText("960k / 1M").waitFor();
-    expect(await card.getByText("96%").evaluate((e) => getComputedStyle(e).color)).not.toBe(await card.getByText("960k / 1M").evaluate((e) => getComputedStyle(e).color));
+    await until(async () => (await card.getAttribute("aria-label")) === "w/b");
     // Esc shuts the commands / brings up first, and only then the card.
     await box.fill("/");
     await page.getByRole("listbox").waitFor();
@@ -5151,7 +5985,7 @@ smoke("stories 387, 389, 390, 400: on a phone /context is an info card over wher
     await box.press("Escape");
     await card.waitFor({ state: "detached" });
     // A tap on the transcript closes it too.
-    await box.fill("/context");
+    await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
     await card.waitFor();
     await page.mouse.click(200, 200);
@@ -5166,12 +6000,12 @@ smoke("stories 387, 389, 390, 400: on a phone /context is an info card over wher
 });
 
 smoke("story 388: on a wide screen beside the topology, the info card is in the chat's column alone, where you type still taking words", async () => {
-  answer = contextAnswers();
+  answer = statusTwice();
   try {
     const page = await open(`/topology/slot/${finished}?chat`, undefined, { viewport: { width: 1440, height: 900 } } as (typeof devices)[string]);
     const box = page.getByRole("textbox", { name: "消息" });
-    const card = page.getByRole("dialog", { name: "上下文" });
-    await box.fill("/context");
+    const card = page.getByRole("dialog", { name: "w/a" });
+    await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
     await card.waitFor();
     const [c, chat, graph] = [(await card.boundingBox())!, (await page.getByRole("log", { name: "对话" }).boundingBox())!, (await page.locator(".react-flow").boundingBox())!];
@@ -5187,38 +6021,212 @@ smoke("story 388: on a wide screen beside the topology, the info card is in the 
   }
 });
 
-smoke("stories 393-396: on a phone /usage is an info card over where you type, a bar for each window, the full one amber; the tokens tapped show their kinds and the cost by model", async () => {
-  const tokens = { input: 1_800, output: 96_000, cacheRead: 18_200_000, cacheWrite: 612_000, total: 18_909_800 };
-  answer = async () => ({
-    ok: true,
-    text: "用量",
-    card: {
-      command: "usage",
-      agent: "claude",
-      limits: [
-        { window: "5h", usedPercent: 28, resetsAt: Date.now() + 106 * 60_000 },
-        { window: "7d", usedPercent: 91, resetsAt: Date.now() + 9 * 3_600_000 },
-      ],
-      session: { cost: 15.35, tokens, models: [{ name: "Opus 5.5", cost: 14.92, tokens }] },
-    },
+const TOKENS = { input: 1_800, output: 96_000, cacheRead: 18_200_000, cacheWrite: 612_000, total: 18_909_800 };
+/** Records what Rhodium heard of slot's conversation, at: 84k of 200k, what holds it, its use; and
+ *  Claude's quota, its 7 days nearly full. Returns the conversation. */
+const hear = (slot: string, at = Date.now(), used = 84_000) =>
+  store.tx((tx) => {
+    const c = tx.get("slot", slot)!.conversation!;
+    const context = { usedTokens: used, maxTokens: 200_000, categories: [{ name: "消息", tokens: 60_000 }], at };
+    tx.update("conversation", { id: c }, { meter: JSON.stringify({ context, session: { cost: 15.35, tokens: TOKENS, models: [{ name: "Opus 5.5", cost: 14.92, tokens: TOKENS }], at } }) });
+    const value = JSON.stringify({ limits: [{ window: "5h", usedPercent: 28, resetsAt: at + 106 * 60_000 }, { window: "7d", usedPercent: 91, resetsAt: at + 9 * 3_600_000 }], at });
+    if (!tx.update("meta", { id: "quota.claude" }, { value })) tx.insert("meta", { id: "quota.claude", value });
+    return c;
   });
+/** Forgets Claude's quota, which every Claude slot of the tests shares. */
+const forget = () => store.tx((tx) => tx.delete("meta", { id: "quota.claude" }));
+const color = (l: Locator) => l.evaluate((e) => getComputedStyle(e).color);
+
+smoke("stories 653, 654, 655, 656, 657, 667: on a phone the ring is before + with no strips; /usage typed with the agent not running opens the popover over it at the box's right edge, grey, starting nothing; its tokens tapped show their kinds and the cost by model", async () => {
+  const slot = withClaude("usage-phone");
+  const conv = hear(slot);
   try {
-    const page = await open(`/slot/${rests}`);
+    const page = await open(`/slot/${slot}`);
     const box = page.getByRole("textbox", { name: "消息" });
-    const card = page.getByRole("dialog", { name: "用量" });
+    const ring = page.getByRole("button", { name: "上下文和额度" });
+    await ring.getByText("42%").waitFor();
+    expect((await ring.boundingBox())!.x).toBeLessThan((await page.getByRole("button", { name: "添加图片或文件" }).boundingBox())!.x);
+    expect(await page.getByRole("button", { name: "额度", exact: true }).isVisible()).toBe(false);
+    const before = acted.length;
     await box.fill("/usage");
     await page.getByRole("button", { name: "发送" }).click();
-    await card.getByText("等效 API 价格").waitFor();
-    const [c, b] = [(await card.boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
-    expect(c.y + c.height).toBeLessThanOrEqual(b.y);
-    expect(await card.getByText("91%").evaluate((e) => getComputedStyle(e).color)).not.toBe(await card.getByText("28%").evaluate((e) => getComputedStyle(e).color));
-    expect(await card.getByText("缓存读").count()).toBe(0);
-    await card.getByRole("button", { name: /Tokens/ }).click();
-    await card.getByText("缓存读").waitFor();
-    await card.getByText("Opus 5.5").waitFor();
-    await card.getByText("$14.92").waitFor();
+    const pop = page.getByRole("dialog", { name: "上下文和额度" });
+    await pop.getByText("Claude 额度").waitFor();
+    expect(acted.length).toBe(before);
+    await until(() => meterAsks.some((a) => a.conversation === conv && a.why === "ask"));
+    // Over the box, not over what you type in it.
+    await until(async () => (await pop.boundingBox())!.y + (await pop.boundingBox())!.height <= (await box.locator("xpath=..").boundingBox())!.y);
+    // At the box's right edge, min(22rem, 100vw - 2rem) wide, half the screen high at most (story 667).
+    await until(async () => {
+      const [p, b] = [(await pop.boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
+      return Math.abs(p.x + p.width - b.x - b.width) < 1 && Math.abs(p.width - 352) < 1 && p.height <= page.viewportSize()!.height / 2;
+    });
+    // Grey: the nearly full window not amber.
+    expect(await color(pop.getByText("91%"))).toBe(await color(pop.getByText("28%")));
+    await pop.getByRole("button", { name: /Tokens/ }).click();
+    for (const words of ["缓存读", "Opus 5.5", "$14.92"]) await pop.getByText(words).waitFor();
+    await page.keyboard.press("Escape");
+    await pop.waitFor({ state: "detached" });
   } finally {
-    answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+    forget();
+  }
+});
+
+smoke("stories 652, 654, 655, 657: on a wide screen the strips, the ring, then + (story 668); the mouse over the strips lists each window; the ring opens the popover, which shows a meter heard anew, and closes it again; /model opens its popover by the model button", async () => {
+  const slot = withClaude("meter-wide");
+  const conv = hear(slot);
+  alive.add(conv);
+  answer = statusAnswers("meter-wide");
+  try {
+    const page = await open(`/slot/${slot}`, undefined, wide());
+    const box = page.getByRole("textbox", { name: "消息" });
+    const ring = page.getByRole("button", { name: "上下文和额度" });
+    const strips = page.getByRole("button", { name: "额度", exact: true });
+    await ring.getByText("42%").waitFor();
+    const xs = await Promise.all([strips, ring, page.getByRole("button", { name: "添加图片或文件" }), page.getByRole("button", { name: "发送" })].map(async (l) => (await l.boundingBox())!.x));
+    expect(xs).toEqual(xs.toSorted((a, b) => a - b));
+    await strips.hover();
+    const tip = page.getByRole("tooltip");
+    for (const words of ["5 小时", "7 天", "28%", "91%"]) await tip.getByText(words).waitFor();
+    // Running and fresh: the nearly full window amber.
+    expect(await color(tip.getByText("91%"))).not.toBe(await color(tip.getByText("28%")));
+    await ring.click();
+    const pop = page.getByRole("dialog", { name: "上下文和额度" });
+    await pop.getByText("84k / 200k").waitFor();
+    // Over the box, its right edge the ring's, and still so with more lines typed under it.
+    const above = (l: Locator, key: Locator, edge: "left" | "right") =>
+      until(async () => {
+        const [p, f, k] = [(await l.boundingBox())!, (await box.locator("xpath=..").boundingBox())!, (await key.boundingBox())!];
+        return p.y + p.height <= f.y && Math.abs(edge === "left" ? p.x - k.x : p.x + p.width - (k.x + k.width)) < 2;
+      });
+    await above(pop, ring, "right");
+    await box.fill("a\nb\nc\nd");
+    await above(pop, ring, "right");
+    await box.fill("");
+    await pop.getByRole("button", { name: "分项" }).click();
+    await pop.getByText("消息").waitFor();
+    await pop.getByRole("button", { name: "压缩" }).waitFor();
+    // Both parts open, taller than the room over the box: still over it by the ring, not flipped beside it.
+    await pop.getByRole("button", { name: /Tokens/ }).click();
+    await pop.getByText("缓存读").waitFor();
+    // The breakdown, last in a popover now capped at 24rem, scrolled into sight (#766).
+    await until(async () => {
+      const [p, last] = [(await pop.boundingBox())!, (await pop.getByRole("listitem").last().boundingBox())!];
+      return last.y + last.height <= p.y + p.height + 1;
+    });
+    await above(pop, ring, "right");
+    await box.fill("a\nb\nc\nd\ne\nf\ng\nh");
+    await above(pop, ring, "right");
+    await box.fill("");
+    hear(slot, Date.now(), 120_000);
+    hearing.forEach((h) => h(conv, { type: "meter", agent: "claude" }));
+    await pop.getByText("120k / 200k").waitFor();
+    await ring.click();
+    await pop.waitFor({ state: "detached" });
+    await box.fill("/model");
+    await page.getByRole("button", { name: "发送" }).click();
+    const models = page.getByRole("dialog", { name: "模型" });
+    await models.getByRole("slider", { name: "思考强度" }).waitFor();
+    await above(models, page.getByRole("button", { name: "模型和思考强度" }), "left");
+    expect((await models.boundingBox())!.width).toBeLessThan(400);
+    // No higher than 24rem (story 667).
+    expect((await models.boundingBox())!.height).toBeLessThanOrEqual(384);
+  } finally {
+    alive.delete(conv);
+    forget();
+    reset();
+  }
+});
+
+smoke("story 667: on a wide screen a long model list keeps /model's popover within 24rem, its levels in sight", async () => {
+  const slot = withClaude("many-wide");
+  const rest = statusAnswers("many-wide");
+  const models: RhReply = { ok: true, text: "换哪个模型？", panel: { head: ["换哪个模型？"], candidates: Array.from({ length: 30 }, (_, i) => ({ label: `m${i}`, command: `/model m${i}` })) } };
+  answer = async () => ((acted.at(-1)!.act as { text: string }).text === "/model" ? models : rest());
+  try {
+    const page = await open(`/slot/${slot}`, undefined, wide());
+    await page.getByRole("button", { name: "模型和思考强度" }).click();
+    const pop = page.getByRole("dialog", { name: "模型" });
+    const level = pop.getByRole("slider", { name: "思考强度" });
+    await pop.getByRole("button", { name: "m29" }).waitFor({ state: "attached" });
+    await level.waitFor();
+    const [p, l] = [(await pop.boundingBox())!, (await level.boundingBox())!];
+    expect(p.height).toBeLessThanOrEqual(384);
+    expect([l.y >= p.y, l.y + l.height <= p.y + p.height]).toEqual([true, true]);
+  } finally {
+    reset();
+  }
+});
+
+smoke("stories 652, 653: on a medium screen, as on a wide one, the strips, the ring, then +", async () => {
+  const slot = withClaude("meter-medium");
+  hear(slot);
+  try {
+    const page = await open(`/slot/${slot}`, undefined, { viewport: { width: 820, height: 1180 } } as (typeof devices)[string]);
+    const ring = page.getByRole("button", { name: "上下文和额度" });
+    const strips = page.getByRole("button", { name: "额度", exact: true });
+    await ring.getByText("42%").waitFor();
+    await strips.waitFor();
+    const xs = await Promise.all([strips, ring, page.getByRole("button", { name: "添加图片或文件" }), page.getByRole("button", { name: "发送" })].map(async (l) => (await l.boundingBox())!.x));
+    expect(xs).toEqual(xs.toSorted((a, b) => a - b));
+  } finally {
+    forget();
+  }
+});
+
+smoke("#752: on a narrow phone the ring makes room: the model's name shows whole and nothing in the model button runs onto the terminal key", async () => {
+  const slot = withClaude("meter-narrow");
+  hear(slot);
+  try {
+    // A wider effort than high too, with no ultracode sign to give way first (#752 round 4).
+    for (const [width, effort, ultracode] of [[360, "high", 1], [320, "high", 1], [360, "medium", 0]] as const) {
+      store.tx((tx) => tx.update("slot", { id: slot }, { effort, ultracode }));
+      const page = await open(`/slot/${slot}`, undefined, { ...devices["Pixel 7"], viewport: { width, height: 760 } });
+      const model = page.getByRole("button", { name: "模型和思考强度" });
+      await model.getByText(effort).waitFor({ state: "attached" });
+      const terminal = (await page.getByRole("button", { name: "切到终端" }).boundingBox())!;
+      const fit = await model.evaluate((k) => ({ whole: k.firstElementChild!.scrollWidth <= k.firstElementChild!.clientWidth, right: Math.max(...[...k.children].map((c) => c.getBoundingClientRect().right)) }));
+      expect([width, effort, fit.whole, fit.right <= terminal.x]).toEqual([width, effort, true, true]);
+    }
+  } finally {
+    forget();
+  }
+});
+
+smoke("stories 654, 655: a slot never heard of has an empty ring, which opens to one line saying so; /usage opens the same popover over it", async () => {
+  const slot = withClaude("unheard");
+  const page = await open(`/slot/${slot}`);
+  const box = page.getByRole("textbox", { name: "消息" });
+  const ring = page.getByRole("button", { name: "上下文和额度" });
+  await ring.waitFor();
+  expect(await ring.innerText()).toBe("");
+  await ring.click();
+  const pop = page.getByRole("dialog", { name: "上下文和额度" });
+  await pop.getByText("还没有数字，agent 跑完一个回合后再看").waitFor();
+  await ring.click();
+  await pop.waitFor({ state: "detached" });
+  await box.fill("/usage");
+  await page.getByRole("button", { name: "发送" }).click();
+  await pop.getByText("还没有数字，agent 跑完一个回合后再看").waitFor();
+  await until(async () => (await pop.boundingBox())!.y + (await pop.boundingBox())!.height <= (await box.locator("xpath=..").boundingBox())!.y);
+});
+
+smoke("story 657: the page left open, the quota goes grey 10 minutes after it was heard, the agent still running", async () => {
+  const slot = withClaude("meter-stale");
+  const conv = hear(slot);
+  alive.add(conv);
+  try {
+    const page = await open(`/slot/${slot}`, (page) => page.clock.install(), wide());
+    const strips = page.getByRole("button", { name: "额度", exact: true });
+    await strips.hover();
+    const tip = page.getByRole("tooltip");
+    await tip.getByText("91%").waitFor();
+    expect(await color(tip.getByText("91%"))).not.toBe(await color(tip.getByText("28%")));
+    await page.clock.fastForward("10:30");
+    await until(async () => (await color(tip.getByText("91%"))) === (await color(tip.getByText("28%"))));
+  } finally {
+    alive.delete(conv);
+    forget();
   }
 });
 
@@ -5264,18 +6272,20 @@ const reset = () => (answer = () => Promise.resolve({ ok: true, text: "已停下
 /** What the page said to slot, in order. */
 const saidTo = (slot: string) => acted.filter((a) => (a.act as { slot?: string }).slot === slot).map((a) => (a.act as { text?: string }).text);
 
-smoke("stories 389, 391, 406: on a phone /status is the info card over where you type, in IM's sections; its 模型 opens the model sheet there, as the bar's button does; the directory tapped is copied, the context tapped opens /context", async () => {
+smoke("stories 389, 391, 406, 655, #761: on a phone /status is a popover over where you type, in IM's sections; its 模型 opens the model popover by the model button, as the bar's button does; the directory tapped is copied, the context tapped opens the ring's popover", async () => {
   const slot = withClaude("picks");
   answer = statusAnswers("picks");
   try {
     const page = await open(`/slot/${slot}`, (page) => page.context().grantPermissions(["clipboard-read", "clipboard-write"]));
     const box = page.getByRole("textbox", { name: "消息" });
     const card = page.getByRole("dialog");
-    const where = async () => {
-      const [c, b] = [(await card.boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
-      expect([c.x, c.width]).toEqual([b.x, b.width]);
-      expect(c.y + c.height).toBeLessThanOrEqual(b.y);
-    };
+    // Over the box, at its left edge, 20rem wide and half the screen high at most, as a phone's
+    // popover is however it lines up (story 667).
+    const where = () =>
+      until(async () => {
+        const [c, b] = [(await card.boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
+        return c.y + c.height <= b.y && Math.abs(c.x - b.x) < 1 && Math.abs(c.width - 320) < 1 && c.height <= page.viewportSize()!.height / 2;
+      });
     await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
     await card.getByRole("button", { name: "模型", exact: true }).waitFor();
@@ -5283,42 +6293,51 @@ smoke("stories 389, 391, 406: on a phone /status is the info card over where you
     for (const text of ["模型设置", "Claude Code", "Opus 5.5", "状态", "~/w", "26%", "额度信息", "7 天", "91%"]) await card.getByText(text, { exact: true }).waitFor();
     expect(await card.getByRole("button", { name: "停止" }).count()).toBe(0);
     await where();
-    // 模型: the model sheet, with the levels and ultracode, in the card's place; not /model's list.
+    // 模型: the model popover, with the levels and ultracode, by the model button; not /model's list.
     await card.getByRole("button", { name: "模型", exact: true }).click();
     await card.getByRole("slider", { name: "思考强度" }).waitFor();
     await card.getByRole("switch", { name: "ultracode" }).waitFor();
     expect(await card.getAttribute("aria-label")).toBe("模型");
     expect(await page.getByText("换哪个模型？").count()).toBe(0);
-    await where();
+    // Waited for: it is drawn once before it is placed, which a loaded machine can show.
+    const byKey = () =>
+      until(async () => {
+        const [m, key, b] = [(await card.boundingBox())!, (await page.getByRole("button", { name: "模型和思考强度" }).boundingBox())!, (await box.locator("xpath=..").boundingBox())!];
+        return m.y + m.height <= key.y && Math.abs(m.x - b.x) < 1 && Math.abs(m.width - 320) < 1 && m.height <= page.viewportSize()!.height / 2;
+      });
+    await byKey();
     expect(saidTo(slot).slice(0, 1)).toEqual(["/status"]);
     expect(saidTo(slot).slice(1).toSorted()).toEqual(["/effort", "/model", "/ultracode"]);
     await page.keyboard.press("Escape");
     await card.waitFor({ state: "detached" });
-    // The directory, copied; the context, /context's card in its place.
+    // The directory, copied; the context, the ring's popover, which asks the agent nothing.
     await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
     await card.getByRole("button", { name: /^目录/ }).click();
     await page.getByRole("status").getByText("已复制目录。").waitFor();
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("~/w");
     await card.getByRole("button", { name: /^上下文/ }).click();
-    await page.getByRole("dialog", { name: "上下文" }).getByText("52k / 200k").waitFor();
-    expect(saidTo(slot).at(-1)).toBe("/context");
-    // The bar's button: the same card, in the same place, which the agent's takes over.
+    await page.getByRole("dialog", { name: "上下文和额度" }).getByText("还没有数字，agent 跑完一个回合后再看").waitFor();
+    expect(saidTo(slot).at(-1)).toBe("/status");
+    // The bar's button: the same popover, which the agent's popover takes over, by the agent's logo.
     await page.keyboard.press("Escape");
     await card.waitFor({ state: "detached" });
     await page.getByRole("button", { name: "模型和思考强度" }).click();
     await card.getByRole("group", { name: "思考强度" }).waitFor();
-    await where();
-    await page.getByRole("button", { name: "换 agent" }).click();
+    await byKey();
+    const logo = page.getByRole("button", { name: "换 agent" });
+    await logo.click();
     await card.getByRole("button", { name: /Claude/ }).getByLabel("现在").waitFor();
     expect(await card.count()).toBe(1);
+    expect(await card.getAttribute("aria-label")).toBe("换 agent");
+    expect(await card.locator(".cursor-grab").count()).toBe(0);
     await where();
   } finally {
     reset();
   }
 });
 
-smoke("stories 388, 389, 391: on a wide screen beside the topology, /status, the model sheet from its 模型 and the agent sheet are in the chat's column alone; where you type still takes words", async () => {
+smoke("stories 388, 389, 391, #761: on a wide screen beside the topology, /status, the model sheet from its 模型 and the agent sheet are in the chat's column alone, popovers over the box lined up with its left edge and the agent's logo's; where you type still takes words", async () => {
   const slot = withClaude("wide-picks");
   answer = statusAnswers("wide-picks");
   try {
@@ -5332,10 +6351,17 @@ smoke("stories 388, 389, 391: on a wide screen beside the topology, /status, the
       expect(c.x).toBeGreaterThanOrEqual(graph.x + graph.width);
       expect(c.height).toBeLessThanOrEqual(900 * 0.7);
     };
+    // Over the box, its left edge that of key.
+    const above = (key: Locator) =>
+      until(async () => {
+        const [c, b, k] = [(await card.boundingBox())!, (await box.locator("xpath=..").boundingBox())!, (await key.boundingBox())!];
+        return c.y + c.height <= b.y && Math.abs(c.x - k.x) < 2 && c.width < 400;
+      });
     await box.fill("/status");
     await page.getByRole("button", { name: "发送" }).click();
     await card.getByRole("button", { name: "模型", exact: true }).waitFor();
     await inChat();
+    await above(box.locator("xpath=.."));
     await box.pressSequentially("hi");
     expect(await box.inputValue()).toBe("hi");
     await box.fill("");
@@ -5345,6 +6371,7 @@ smoke("stories 388, 389, 391: on a wide screen beside the topology, /status, the
     await page.getByRole("button", { name: "换 agent" }).click();
     await card.getByRole("button", { name: /Claude/ }).waitFor();
     await inChat();
+    await above(page.getByRole("button", { name: "换 agent" }));
   } finally {
     reset();
   }
@@ -5557,13 +6584,14 @@ smoke("stories 528, 529: over 8 models, a search box on top finds them by name o
 
 smoke("story 521: an info card's handle dragged a little springs back; a finger dragging it down past a third of the card closes it", async () => {
   const slot = withClaude("drags");
-  answer = statusAnswers("drags");
+  // /resume's card: an info card still, with its handle; /status's is a popover (#761).
+  answer = async () => ({ ok: true, text: "回到哪段对话？", panel: { head: ["回到哪段对话？"], candidates: [{ label: "修登录", command: "/resume s1", current: true }, { label: "写文档", command: "/resume s2" }] } });
   try {
     const page = await open(`/slot/${slot}`);
     const card = page.getByRole("dialog");
-    await page.getByRole("textbox", { name: "消息" }).fill("/status");
+    await page.getByRole("textbox", { name: "消息" }).fill("/resume");
     await page.getByRole("button", { name: "发送" }).click();
-    await card.getByRole("button", { name: "模型", exact: true }).waitFor();
+    await card.getByRole("button", { name: "写文档" }).waitFor();
     const at = (await card.boundingBox())!;
     const [x, y] = [at.x + at.width / 2, at.y + 6];
     await page.mouse.move(x, y);
@@ -5585,7 +6613,7 @@ smoke("story 521: an info card's handle dragged a little springs back; a finger 
     await touch("touchEnd");
     await card.waitFor({ state: "detached" });
     // ✕ tapped at its top edge, by the handle, closes the card too.
-    await page.getByRole("textbox", { name: "消息" }).fill("/status");
+    await page.getByRole("textbox", { name: "消息" }).fill("/resume");
     await page.getByRole("button", { name: "发送" }).click();
     const shut = (await card.getByRole("button", { name: "关闭" }).boundingBox())!;
     await page.mouse.click(shut.x + shut.width / 2, shut.y + 5);
@@ -5881,7 +6909,7 @@ smoke("stories 524-527: on a phone the thinking levels are a slider: the one let
   }
 });
 
-smoke("#276: on a phone the model sheet has ultracode as a switch of its own, where the agent can take it: it stays open as you flip it, the bar marks it on, and /ultracode typed alone opens the sheet", async () => {
+smoke("#276, #761: on a phone the model popover has ultracode as an icon key at the right end of the levels' row, the one level's name alone beside it, where the agent can take it: it stays open as you flip it, lit when on, the bar marks it on, and /ultracode typed alone opens the popover", async () => {
   const slot = store.tx((tx) => {
     const slot = tx.insert("slot", { workspace: ws, name: "ultra", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm", effort: "high" }).id;
     tx.update("slot", { id: slot }, { conversation: tx.insert("conversation", { slot, agent: "claude", sessionId: "s-ultra", startedAt: Date.now() }).id });
@@ -5916,9 +6944,20 @@ smoke("#276: on a phone the model sheet has ultracode as a switch of its own, wh
     // No search box: it fits what is in it as that changes, never held at a height it had.
     expect(await sheet.evaluate((d) => (d as HTMLElement).style.minHeight)).toBe("");
     expect(await toggle.getAttribute("aria-checked")).toBe("false");
-    expect((await toggle.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    const k = (await toggle.boundingBox())!;
+    expect(k.height).toBeGreaterThanOrEqual(44);
+    // An icon alone, in the row of the one level's name, at the popover's right; no row of its own.
+    expect((await toggle.textContent())!.trim()).toBe("");
+    const name = (await sheet.getByText("high", { exact: true }).boundingBox())!;
+    const pop = (await sheet.boundingBox())!;
+    expect(Math.abs(name.y + name.height / 2 - (k.y + k.height / 2))).toBeLessThan(2);
+    expect(name.x + name.width).toBeLessThan(k.x);
+    expect(pop.x + pop.width - (k.x + k.width)).toBeLessThan(12);
+    const lit = () => toggle.evaluate((e) => getComputedStyle(e.firstElementChild!).backgroundColor);
+    const off = await lit();
     await toggle.click();
     await until(async () => (await toggle.getAttribute("aria-checked")) === "true");
+    expect(await lit()).not.toBe(off);
     expect(said().at(-1)).toBe("/ultracode on");
     expect(await sheet.isVisible()).toBe(true);
     await page.keyboard.press("Escape");
@@ -5944,6 +6983,55 @@ smoke("#276: on a phone the model sheet has ultracode as a switch of its own, wh
     release();
   } finally {
     answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+  }
+});
+
+smoke("#761: a model that cannot take ultracode greys its key, which says why on hover and as tapped, sending nothing; with the slider, the key is at the right end of its row; pi's popover has no key", async () => {
+  const slot = withClaude("no-ultra");
+  const panel = (head: string, items: string[], now: string) => ({ ok: true as const, text: head, panel: { head: [head], candidates: items.map((l) => ({ label: l, command: `/effort ${l}`, ...(l === now && { current: true as const }) })) } });
+  let agent = "claude";
+  answer = async () => {
+    const text = (acted.at(-1)!.act as { text: string }).text;
+    if (text === "/model") return { ok: true, text: "换哪个模型？", panel: { head: ["换哪个模型？"], candidates: [{ label: "Haiku", command: "/model haiku", current: true }] } };
+    if (text === "/effort") return panel("思考强度改成哪档？", ["low", "medium", "high"], "high");
+    if (text === "/ultracode") return agent === "pi" ? { ok: false, error: "pi 没有 ultracode。" } : { ok: true, text: "这个模型用不了 ultracode。" };
+    return { ok: true, text: "好。" };
+  };
+  try {
+    const page = await open(`/slot/${slot}`);
+    const sheet = page.getByRole("dialog");
+    await page.getByRole("button", { name: "模型和思考强度" }).click();
+    const toggle = sheet.getByRole("switch", { name: "ultracode" });
+    await toggle.waitFor();
+    expect(await toggle.getAttribute("aria-disabled")).toBe("true");
+    expect(await toggle.getAttribute("title")).toBe("这个模型用不了 ultracode");
+    const [k, slider] = [(await toggle.boundingBox())!, (await sheet.getByRole("slider", { name: "思考强度" }).boundingBox())!];
+    expect(Math.abs(slider.y + slider.height / 2 - (k.y + k.height / 2))).toBeLessThan(2);
+    expect(slider.x + slider.width).toBeLessThan(k.x);
+    const before = saidTo(slot).length;
+    // Greyed with aria-disabled, so a tap still comes.
+    await toggle.click({ force: true });
+    const said = page.getByRole("status").getByText("这个模型用不了 ultracode");
+    await said.waitFor();
+    // Drawn over the popover, which stays open, not under it.
+    expect(await said.evaluate((e) => (({ x, y, width, height }) => e.contains(document.elementFromPoint(x + width / 2, y + height / 2)))(e.getBoundingClientRect()))).toBe(true);
+    expect(saidTo(slot).length).toBe(before);
+    expect(await sheet.isVisible()).toBe(true);
+    // Tapping the toast to dismiss it leaves the popover open: focus moving to it and the press on it,
+    // gone by the time the click lands, are both the popover's own (#761).
+    await said.click();
+    await said.waitFor({ state: "detached" });
+    expect(await sheet.isVisible()).toBe(true);
+    await page.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    agent = "pi";
+    await page.getByRole("button", { name: "模型和思考强度" }).click();
+    await sheet.getByRole("slider", { name: "思考强度" }).waitFor();
+    await until(() => saidTo(slot).filter((t) => t === "/ultracode").length === 2);
+    await page.waitForTimeout(100);
+    expect(await toggle.count()).toBe(0);
+  } finally {
+    reset();
   }
 });
 
@@ -6329,16 +7417,15 @@ smoke("#577, #579: on a phone, files attached past the box's edge, commands past
   expect(await commands.evaluate((el) => el.scrollTop)).toBe(top);
 });
 
-smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, in a workspace by its button, or in a new one named after the folder picked, and imports one, each opening its chat; 详情's settings change as you change them, and go back to their default", async () => {
+smoke("stories 320, 321, 322, 539, 637: on a phone the home's + makes a slot from ~, in a workspace by its folder, or in a new one named after the folder picked, and imports one, each opening its chat; 详情's settings change as you change them, and go back to their default", async () => {
   const argv = () => (acted.at(-1)!.act as { argv: string[] }).argv;
   const replies: Record<string, RhReply> = {
     ws: { ok: true, text: "已建工作区 n，默认目录 /n" },
     new: { ok: true, text: "已建槽位 w/s：pi，无头，目录 /w", slot: rests },
-    "import --dir": { ok: true, text: "导入哪一个？", panel: { head: ["导入哪一个？"], candidates: [{ label: "Herdr 里 ~/w", command: "/rh_import w1:p1 --name" }, { label: "~/w 写文档", command: "/rh_import s2 --name" }] } },
     import: { ok: true, text: "已导入成 w/doc", slot: finished },
     set: { ok: true, text: "已改。" },
   };
-  answer = async () => replies[argv()[1] === "--dir" ? "import --dir" : argv()[0]!]!;
+  answer = async () => replies[argv()[0]!]!;
   let n = acted.length;
   // In the order sent: two sent within one look, as a new workspace and then its slot, are each told.
   const sent = async () => (await until(() => acted.length > n), (acted[n++]!.act as { argv: string[] }).argv);
@@ -6348,6 +7435,7 @@ smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, 
   // w's directory, there to go to; n, a folder no workspace has.
   store.tx((tx) => tx.update("workspace", { id: ws }, { dir: folder("w") }));
   folder("n");
+  const doc = conversation(folder("w"), "写文档", 0);
   try {
     const page = await open();
     const plus = page.getByRole("button", { name: "新建", exact: true });
@@ -6356,10 +7444,15 @@ smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, 
     await plus.click();
     await page.getByRole("menuitem", { name: "新建槽位" }).click();
     const sheet = page.getByRole("dialog");
-    const { path, ws: wsButton, folders } = picker(sheet);
+    const { path, folders } = picker(sheet);
     expect(await path.inputValue()).toBe("~/");
-    await wsButton("w").click();
-    await wsButton("w").and(page.locator("[aria-pressed=true]")).waitFor();
+    // No workspaces' buttons (story 637).
+    expect(await sheet.getByRole("group", { name: "工作区" }).count()).toBe(0);
+    // The folders drop down from the path, and fold on Esc (story 664).
+    await path.click();
+    await folders.getByRole("option", { name: "w", exact: true }).click();
+    expect(await path.inputValue()).toBe("~/w/");
+    await page.keyboard.press("Escape");
     await sheet.getByRole("textbox", { name: "槽位名" }).fill("s");
     await sheet.getByRole("radio", { name: "pi" }).click();
     await sheet.getByRole("button", { name: "新建" }).click();
@@ -6370,8 +7463,10 @@ smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, 
     await page.goto(`http://127.0.0.1:${server!.port}/#`);
     await plus.click();
     await page.getByRole("menuitem", { name: "新建槽位" }).click();
-    await folders.getByRole("button", { name: "n", exact: true }).click();
+    await path.click();
+    await folders.getByRole("option", { name: "n", exact: true }).click();
     expect(await path.inputValue()).toBe("~/n/");
+    await page.keyboard.press("Escape");
     await until(async () => (await sheet.getByRole("textbox", { name: "工作区名" }).inputValue()) === "n");
     await sheet.getByRole("textbox", { name: "槽位名" }).fill("main");
     await sheet.getByRole("button", { name: "新建" }).click();
@@ -6379,18 +7474,19 @@ smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, 
     expect(await sent()).toEqual(["new", "n/main", "--agent", "claude"]);
     await page.waitForURL(`**/#/slot/${rests}`);
 
-    // 导入: what there is, for the workspace's directory once listed; one picked and named.
+    // 导入: what there is in the workspace's directory; one picked and named.
     await page.goto(`http://127.0.0.1:${server!.port}/#`);
     await plus.click();
     await page.getByRole("menuitem", { name: "导入" }).click();
-    await wsButton("w").click();
-    await wsButton("w").and(page.locator("[aria-pressed=true]")).waitFor();
-    await sheet.getByRole("button", { name: "列出" }).click();
-    expect(await sent()).toEqual(["import", "--dir", "~/w"]);
-    await sheet.getByRole("radio", { name: "~/w 写文档" }).click();
+    // The folders drop down from the path, and fold on Esc (story 664).
+    await path.click();
+    await folders.getByRole("option", { name: "w", exact: true }).click();
+    expect(await path.inputValue()).toBe("~/w/");
+    await page.keyboard.press("Escape");
+    await sheet.getByRole("radio", { name: /^写文档/ }).click();
     await sheet.getByRole("textbox", { name: "槽位名" }).fill("doc");
     await sheet.getByRole("button", { name: "导入" }).click();
-    expect(await sent()).toEqual(["import", "s2", "--name", "doc"]);
+    expect(await sent()).toEqual(["import", doc, "--name", "doc"]);
     await page.waitForURL(`**/#/slot/${finished}`);
 
     // 详情's settings, folded: a switch sends on, a duration as picked; one of its own goes back to its default.
@@ -6409,6 +7505,7 @@ smoke("stories 320, 321, 322, 539: on a phone the home's + makes a slot from ~, 
   } finally {
     store.tx((tx) => (tx.update("slot", { id: finished }, { reapAfter: reap }), tx.update("workspace", { id: ws }, { dir: "/w" })));
     answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+    rmSync(join(base, ".claude/projects", folder("w").replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
   }
 });
 
@@ -6457,40 +7554,39 @@ smoke("#288: the round trip's icon is for a wide screen only, there where it fit
   expect((await split.locator("main header > :last-child").evaluate((b) => b.getBoundingClientRect().right)) - (line.x + line.width / 2)).toBeLessThanOrEqual(0);
 });
 
-smoke("#280, story 542: the import sheet stays as wide as the phone with a long label, its check mark in sight; a folder is looked in once you list it, a pane picked there shows no workspace for it, and a conversation picked in one no workspace has imports with nothing sent first; an open chat does not ask for /api/board", async () => {
-  const argv = () => (acted.at(-1)!.act as { argv: string[] }).argv;
-  const long = "Herdr 里 ~/Rhodium-wt/ww-267-with-a-rather-long-worktree-name 10:15 改一下导入单子";
-  answer = async () =>
-    argv()[1] === "--dir" ? { ok: true, text: "导入哪一个？", panel: { head: ["导入哪一个？"], candidates: [{ label: long, command: "/rh_import w1:p1 --name" }, { label: "~/x 写文档", command: "/rh_import s2 --name" }] } } : { ok: true, text: "已导入成 x/s2", slot: finished };
+smoke("#280, story 542: the import sheet stays as wide as the phone with a long title, its check mark in sight; a pane picked shows no workspace for it, and a conversation picked in a folder no workspace has imports with nothing sent first; an open chat does not ask for /api/board", async () => {
+  const long = "改一下导入单子 ~/Rhodium-wt/ww-267-with-a-rather-long-worktree-name 下面那一行太长";
+  answer = async () => ({ ok: true, text: "已导入成 x/s2", slot: finished });
   let n = acted.length;
   // In the order sent: two sent within one look, as a new workspace and then its slot, are each told.
   const sent = async () => (await until(() => acted.length > n), (acted[n++]!.act as { argv: string[] }).argv);
+  // A conversation in ~ open in a pane of Herdr's; one in x, a folder no workspace has.
+  const paned = conversation(base, long, 0);
+  const s2 = conversation(folder("x"), "写文档", 1);
+  const herdrDo = async (method: string, params: object) => (await call(herdr!.socket, method, params)).result;
+  const pane = (await herdrDo("workspace.create", { cwd: base, label: "imp" })).root_pane.pane_id;
+  await herdrDo("pane.report_agent_session", { pane_id: pane, source: "herdr:claude", agent: "claude", agent_session_id: paned });
   try {
-    folder("x");
     const page = await open();
     await page.getByRole("button", { name: "新建", exact: true }).click();
     await page.getByRole("menuitem", { name: "导入" }).click();
     const sheet = page.getByRole("dialog");
-    await sheet.getByRole("button", { name: "列出" }).click();
-    expect(await sent()).toEqual(["import", "--dir", "~"]);
     await sheet.getByRole("textbox", { name: "工作区名" }).fill("");
-    await sheet.getByRole("radio", { name: long }).click();
+    await sheet.getByRole("radio", { name: new RegExp(`^${long}`) }).click();
     // A pane lands by its own directory: no workspace for this folder, shown or needed.
     expect([await sheet.getByRole("textbox", { name: "工作区名" }).count(), await sheet.getByRole("button", { name: "导入" }).isEnabled()]).toEqual([0, true]);
     const width = page.viewportSize()!.width;
     expect(await sheet.locator("form").evaluate((f) => f.scrollWidth <= f.clientWidth)).toBe(true);
-    const check = (await sheet.getByRole("radio", { name: long }).locator("svg").boundingBox())!;
+    const check = (await sheet.getByRole("radio", { name: new RegExp(`^${long}`) }).locator("svg").first().boundingBox())!;
     expect(check.x + check.width <= width).toBe(true);
 
-    // Another folder, no workspace's: looked in when you list it; the import makes its workspace, by the
-    // name suggested.
-    await picker(sheet).folders.getByRole("button", { name: "x", exact: true }).click();
-    expect(await sheet.getByRole("radio").count()).toBe(0);
-    await sheet.getByRole("button", { name: "列出" }).click();
-    expect(await sent()).toEqual(["import", "--dir", "~/x"]);
-    await sheet.getByRole("radio", { name: "~/x 写文档" }).click();
+    // Another folder, no workspace's: the import makes its workspace, by the name suggested.
+    await picker(sheet).path.click();
+    await picker(sheet).folders.getByRole("option", { name: "x", exact: true }).click();
+    await page.keyboard.press("Escape");
+    await sheet.getByRole("radio", { name: /^写文档/ }).click();
     await sheet.getByRole("button", { name: "导入" }).click();
-    expect(await sent()).toEqual(["import", "s2"]);
+    expect((await sent()).slice(0, 2)).toEqual(["import", s2]);
     await page.waitForURL(`**/#/slot/${finished}`);
 
     // In the chat, the import sheet closed: what the page asks for again on an event is not the board's.
@@ -6502,16 +7598,17 @@ smoke("#280, story 542: the import sheet stays as wide as the phone with a long 
     expect(asked).not.toContain("/api/board");
   } finally {
     answer = () => Promise.resolve({ ok: true, text: "已停下这一回合，对话留着。" });
+    await herdrDo("pane.close", { pane_id: pane });
+    for (const d of [base, folder("x")]) rmSync(join(base, ".claude/projects", d.replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
   }
 });
 
-smoke("stories 538, 541, 542: the picker's path completes as you type, by a folder's start in any case, and on Tab, which leaves it, as Shift+Tab does, when there is no more to add; a folder tapped is gone into, the sheet staying put while it is listed and the path showing its end, its branch, its new workspace's name and its files shown, how many more too; hidden folders show once you type a dot; Enter goes in without making anything", async () => {
-  mkdirSync(join(base, "proj/.git"), { recursive: true });
-  writeFileSync(join(base, "proj/.git/HEAD"), "ref: refs/heads/main\n");
+smoke("stories 538, 541, 542, 637, 638: the picker's path completes as you type, by a folder's start in any case, and on Tab, which leaves it, as Shift+Tab does, when there is no more to add; a folder tapped is gone into, the sheet staying put while it is listed and the path showing its end, its branch and its new workspace's name shown, its files not; hidden folders show once you type a dot; Enter goes in without making anything", async () => {
+  Bun.spawnSync(["git", "init", "-q", "-b", "main", folder("proj")]);
   writeFileSync(join(folder("proj/src"), "index.ts"), "");
   folder("proj/sandbox");
   const long = "a-folder-named-long-enough-to-run-past-the-path-field";
-  for (let i = 0; i < 9; i++) writeFileSync(join(folder(`proj/src/${long}`), `file-${i}.ts`), "");
+  folder(`proj/src/${long}`);
   const before = acted.length;
   const page = await open();
   await page.getByRole("button", { name: "新建", exact: true }).click();
@@ -6519,19 +7616,20 @@ smoke("stories 538, 541, 542: the picker's path completes as you type, by a fold
   const sheet = page.getByRole("dialog");
   const { path, folders } = picker(sheet);
   await path.fill("~/PR");
-  await folders.getByRole("button", { name: "proj", exact: true }).waitFor();
+  await folders.getByRole("option", { name: "proj", exact: true }).waitFor();
   await path.press("Tab");
   expect(await path.inputValue()).toBe("~/proj/");
-  await folders.getByRole("button", { name: "src", exact: true }).click();
+  await folders.getByRole("option", { name: "src", exact: true }).click();
   expect(await path.inputValue()).toBe("~/proj/src/");
   await sheet.getByText("main", { exact: true }).waitFor();
-  await sheet.getByText("index.ts").waitFor();
-  expect(await sheet.getByRole("textbox", { name: "工作区名" }).inputValue()).toBe("src");
+  expect(await sheet.getByText("index.ts").count()).toBe(0);
+  // While the folders are down, the rest of the sheet is hidden from a screen reader, as a combobox's is.
+  expect(await sheet.getByRole("textbox", { name: "工作区名", includeHidden: true }).inputValue()).toBe("src");
   await path.fill("~/proj/");
-  await folders.getByRole("button", { name: "src", exact: true }).waitFor();
-  expect(await folders.getByRole("button", { name: ".git" }).count()).toBe(0);
+  await folders.getByRole("option", { name: "src", exact: true }).waitFor();
+  expect(await folders.getByRole("option", { name: ".git" }).count()).toBe(0);
   await path.fill("~/proj/.");
-  await folders.getByRole("button", { name: ".git" }).waitFor();
+  await folders.getByRole("option", { name: ".git" }).waitFor();
   const focused = () => path.evaluate((f) => f === document.activeElement);
   await path.fill("~/proj/s");
   await path.press("Tab");
@@ -6550,12 +7648,86 @@ smoke("stories 538, 541, 542: the picker's path completes as you type, by a fold
   await page.route("**/api/dirs?*", async (r) => (await held, await r.continue()));
   const top = () => sheet.evaluate((e) => e.getBoundingClientRect().top);
   const was = await top();
-  await folders.getByRole("button", { name: long }).click();
+  await folders.getByRole("option", { name: long }).click();
   expect([await path.inputValue(), await top()]).toEqual([`~/proj/src/${long}/`, was]);
   await until(() => path.evaluate((f) => f.scrollLeft > 0 && f.scrollLeft + f.clientWidth >= f.scrollWidth - 1));
   release();
-  const more = (await sheet.getByText("+1", { exact: true }).boundingBox())!;
-  expect(more.x + more.width <= page.viewportSize()!.width).toBe(true);
+  await page.context().close();
+});
+
+smoke("#777: on a wide screen the picker's folders go by the keys: ↑↓ light one, Enter goes in and keeps them down, Esc folds them alone; Tab completes a name begun to one folder or as far as several start alike, goes into the folder lit with nothing typed, and with neither leaves the path", async () => {
+  for (const n of ["alpha", "beta/x", "beta/y", "beta/z", "betx"]) folder(`kbd-777/${n}`);
+  const before = acted.length;
+  const page = await open("", undefined, wide());
+  await page.getByRole("button", { name: "新建", exact: true }).click();
+  await page.getByRole("menuitem", { name: "新建槽位" }).click();
+  const sheet = page.getByRole("dialog");
+  const { path, folders } = picker(sheet);
+  const focused = () => path.evaluate((f) => f === document.activeElement);
+  await path.fill("~/kbd-777/");
+  await folders.getByRole("option", { name: "betx" }).waitFor();
+  await path.press("ArrowDown");
+  await path.press("ArrowDown");
+  expect(await folders.getByRole("option", { name: "beta" }).getAttribute("data-highlighted")).toBe("");
+  await path.press("Enter");
+  await until(async () => (await path.inputValue()) === "~/kbd-777/beta/");
+  await folders.getByRole("option", { name: "z", exact: true }).waitFor();
+  expect([await sheet.isVisible(), acted.length]).toEqual([true, before]);
+  // Gone in, none of its folders is lit: a second Enter stays where it is.
+  const lit = () => folders.locator("[data-highlighted]").count();
+  expect(await lit()).toBe(0);
+  await path.press("Enter");
+  expect([await path.inputValue(), await lit()]).toEqual(["~/kbd-777/beta/", 0]);
+  await path.press("Escape");
+  await until(async () => (await folders.count()) === 0);
+  expect(await sheet.isVisible()).toBe(true);
+
+  await path.fill("~/kbd-777/al");
+  await folders.getByRole("option", { name: "alpha" }).waitFor();
+  await path.press("Tab");
+  expect([await path.inputValue(), await focused()]).toEqual(["~/kbd-777/alpha/", true]);
+  await path.fill("~/kbd-777/b");
+  await folders.getByRole("option", { name: "betx" }).waitFor();
+  await path.press("Tab");
+  expect([await path.inputValue(), await focused()]).toEqual(["~/kbd-777/bet", true]);
+
+  await path.fill("~/kbd-777/");
+  await folders.getByRole("option", { name: "alpha" }).waitFor();
+  await path.press("ArrowDown");
+  await path.press("ArrowDown");
+  await path.press("Tab");
+  expect([await path.inputValue(), await focused()]).toEqual(["~/kbd-777/beta/", true]);
+  await folders.getByRole("option", { name: "z", exact: true }).waitFor();
+  expect(await lit()).toBe(0);
+  await path.fill("~/kbd-777/");
+  await folders.getByRole("option", { name: "alpha" }).waitFor();
+  await path.press("Tab");
+  expect([await path.inputValue(), await focused()]).toEqual(["~/kbd-777/", false]);
+  await page.context().close();
+  rmSync(join(base, "kbd-777"), { recursive: true });
+});
+
+smoke("story 638: on a wide screen the git line, come or gone after the folders, keeps its room: the list under it does not move as you go", async () => {
+  Bun.spawnSync(["git", "init", "-q", "-b", "main", folder("gitline-repo/a")]);
+  folder("gitline-plain/b");
+  const page = await open("", undefined, wide());
+  await page.getByRole("button", { name: "新建", exact: true }).click();
+  await page.getByRole("menuitem", { name: "新建槽位" }).click();
+  const sheet = page.getByRole("dialog");
+  const { path, folders, drop } = picker(sheet);
+  const top = () => drop.evaluate((e) => e.getBoundingClientRect().top);
+  const branch = sheet.getByText("main", { exact: true });
+  await path.fill("~/gitline-plain/");
+  await folders.getByRole("option", { name: "b", exact: true }).waitFor();
+  await sheet.evaluate((e) => Promise.all(e.getAnimations({ subtree: true }).map((a) => a.finished)));
+  const plain = await top();
+  await path.fill("~/gitline-repo/a/");
+  await branch.waitFor();
+  expect(await top()).toBe(plain);
+  await path.fill("~/gitline-plain/");
+  await folders.getByRole("option", { name: "b", exact: true }).waitFor();
+  await until(async () => (await branch.count()) === 0);
+  expect(await top()).toBe(plain);
   await page.context().close();
 });
 
@@ -6583,7 +7755,7 @@ smoke("#356, #386: once the list has come and the page is idle, it fetches the c
   const files = await later(page);
   expect(files.length).toBeGreaterThan(3);
   await until(() => files.every((f) => done.has(f)) && done.has("/api/topology"), 10_000);
-  await page.getByRole("button", { name: "新建" }).waitFor();
+  await page.getByRole("button", { name: "新建", exact: true }).waitFor();
   expect(files.filter((f) => /\/(create|write|sheet|lib-shared)-/.test(f))).toEqual([]);
   expect(files.filter((f) => /\/(slot|lib~slot|topology|lib~topology)-/.test(f))).toHaveLength(5);
   // Each of the chat's files asked again, as its code runs, came from the cache.
@@ -6659,7 +7831,7 @@ smoke("#356: in a browser that saves data, the page fetches nothing ahead; the +
     await page.addInitScript(() => Object.defineProperty(navigator, "connection", { value: { saveData: true } }));
     page.on("request", (r) => void asked.push(new URL(r.url()).pathname));
   });
-  await page.getByRole("button", { name: "新建" }).waitFor();
+  await page.getByRole("button", { name: "新建", exact: true }).waitFor();
   const files = await later(page);
   await Bun.sleep(500);
   expect(asked.filter((p) => p === "/api/topology" || files.includes(p))).toEqual([]);
@@ -6996,4 +8168,68 @@ smoke("#595: with 终端入口 off in the settings, no way to switch a slot to t
   await none.keyboard.press("Escape");
   expect(await ways(none)).toEqual({ row: false, key: false, topology: false });
   await none.context().close();
+});
+
+smoke("story 650: on a wide screen ↑ from the message box's first line brings back what you said in the slot, from IM too, and ↓ from its last goes forward, past the newest to your draft, which stays kept through a reload mid-way; edited, what came back is the draft; in a wrapped draft ↑ off the first line only moves the caret; not on a phone", async () => {
+  const [slot, file] = store.tx((tx) => {
+    const id = tx.insert("slot", { workspace: ws, name: "recall", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
+    tx.update("slot", { id }, { conversation: tx.insert("conversation", { slot: id, agent: "pi", sessionId: "r650", startedAt: Date.now() }).id });
+    return [id, join(base, ".pi/agent/sessions/--w--/2026-11-16_r650.jsonl")];
+  });
+  writeFileSync(file, said("user", "[来自 QQ 私聊]\nIM 发的") + said("assistant", "好"));
+  // What you send is written down as rhodium would.
+  const was = answer;
+  answer = async () => (appendFileSync(file, said("user", `[来自 网页]\n${(acted.at(-1)!.act as { text: string }).text}`)), { ok: true, text: "开始新回合" });
+  try {
+    const page = await open(`/slot/${slot}`, undefined, wide());
+    const box = page.getByRole("textbox", { name: "消息" });
+    const send = async (text: string) => (await box.fill(text), await box.press("Control+Enter"), await until(async () => (await box.inputValue()) === ""));
+    const keys = async (...ks: string[]) => {
+      for (const k of ks) await box.press(k);
+      await page.waitForTimeout(100);
+      return box.inputValue();
+    };
+    await send("第一条");
+    await send("第二条");
+    await box.fill("草稿");
+    expect(await keys("ArrowUp")).toBe("第二条");
+    expect(await keys("ArrowUp")).toBe("第一条");
+    expect(await keys("ArrowUp", "ArrowUp")).toBe("IM 发的");
+    expect(await keys("ArrowDown", "ArrowDown")).toBe("第二条");
+    expect(await keys("ArrowDown")).toBe("草稿");
+    expect(await keys("ArrowDown")).toBe("草稿");
+    // Sent from this page after the first ↑, it is the newest.
+    await send("第三条");
+    expect(await keys("ArrowUp")).toBe("第三条");
+    // Mid-way the draft kept is still yours.
+    await box.fill("草稿二");
+    expect(await keys("ArrowUp")).toBe("第三条");
+    await page.reload();
+    await until(async () => (await box.inputValue()) === "草稿二");
+    // Edited, what came back is the draft: ↑ starts at the newest again, ↓ back to it.
+    await box.press("ArrowUp");
+    await until(async () => (await box.inputValue()) === "第三条");
+    await page.keyboard.type("改");
+    expect(await keys("ArrowUp")).toBe("第三条");
+    expect(await keys("ArrowDown")).toBe("改第三条");
+    // Three lines wrapped, the caret on the last: ↑ moves it up a line, the words stay.
+    const long = "一段会自动折行的很长的草稿".repeat(12);
+    await box.fill(long);
+    const lines = await box.evaluate((b) => Math.floor(b.scrollHeight / parseFloat(getComputedStyle(b).lineHeight)));
+    expect(lines).toBeGreaterThanOrEqual(3);
+    expect(await keys("ArrowUp")).toBe(long);
+    expect(await box.evaluate((b) => (b as HTMLTextAreaElement).selectionStart)).toBeLessThan(long.length);
+    // On the first line, the next ↑ brings back what you said.
+    expect(await keys(...Array<string>(lines - 2).fill("ArrowUp"))).toBe(long);
+    expect(await keys("ArrowUp")).toBe("第三条");
+    // Not on a phone, say with a keyboard attached.
+    const phone = await open(`/slot/${slot}`);
+    const there = phone.getByRole("textbox", { name: "消息" });
+    await there.fill("手机草稿");
+    await there.press("ArrowUp");
+    await phone.waitForTimeout(200);
+    expect(await there.inputValue()).toBe("手机草稿");
+  } finally {
+    answer = was;
+  }
 });

@@ -14,6 +14,7 @@ import type { AgentDriver, AgentEmit, AgentEvent, AgentKind, AgentMessage, Capab
 import { log, type Loop } from "./daemon";
 import { connectHolder, holderPaths, spawnHolder, unitGone, type HolderEvents, type HolderLink } from "./holder";
 import { forAgent, pictureType } from "./media";
+import { heardAt, record } from "./meter";
 import { moment } from "./panels";
 import { PiDriver } from "./pi";
 import { systemPrompt, withSentAt } from "./prompt";
@@ -86,6 +87,10 @@ export function agentBaseEnv(cfg: Config): Record<string, string> {
 const RESUME_SHOWN = 20;
 const OPENING = 12; // characters of a conversation's first message in the /resume list (docs/im-style.md §2.5)
 const PROGRAM_RETRY = 2000; // ms between looks for an agent program not there (start)
+// What Rhodium asks a running agent for its record of context and use (architecture §7.11): how long
+// it waits for each answer, and how long after the last record a page opening the chat, or asking, asks again.
+const METER_WAIT = 5_000;
+const METER_AGAIN = { open: 60_000, ask: 10_000 };
 // What a start-failure notice quotes of err.log (docs/im-style.md §6.1): lines, characters, and the bytes read for them.
 const [ERR_LINES, ERR_CHARS, ERR_BYTES] = [3, 300, 4096];
 
@@ -159,6 +164,7 @@ export type Runner = ReturnType<typeof createRunner>;
  * writing: each piece of text the agent writes of a message as it writes it, then the whole message,
  *   as its driver reports them, and the process's exit, which ends a message never whole: for the
  *   board, which does not keep them (architecture §7.7). Not those of output fed again after a restart.
+ * metered: what was heard of the conversation's context, use or its agent's quota was recorded (architecture §7.11).
  */
 export function createRunner(o: {
   cfg: Config;
@@ -169,10 +175,13 @@ export function createRunner(o: {
   onVersion?: (version: string) => void;
   inUse: (session: string) => Promise<string | null>;
   writing?: (conversation: string, e: Extract<AgentEvent, { type: "text_delta" | "item" | "exit" }>) => void;
+  metered?: (conversation: string, agent: AgentKind) => void;
 }) {
   const { cfg, store, boot, loop } = o;
   const live = new Map<string, Live>(); // by conversation id
   const answering = new Set<string>(); // asks whose answer is being written
+  const metering = new Set<string>(); // conversations whose agent is being asked for the meter
+  const askedAt = new Map<string, number>(); // when each conversation's agent was last asked for it, ms: a quota alone sets no heardAt
   let batch: AgentEvent[] | null = null; // what the driver reports while fed one chunk of output
 
   const report = (event: AgentEvent) => loop.enqueue({ kind: "agent", event });
@@ -316,7 +325,12 @@ export function createRunner(o: {
       // The driver's own lines are acked too; they are no agent input, so nothing changes.
       ack: (inputId) => report({ type: "written", inputId, conv: conversation, proc }),
       exit: (code, signal) => exit(code, signal, "agent"),
-      close: () => exit(null, null, "holder"),
+      // Gone without its exit message, lost say as a write failed just as the holder closed: the exit
+      // file it wrote first says how the agent ended (architecture §4.3). None: the holder itself broke.
+      close: () => {
+        const e = readExit(holderPaths(cfg, conversation).dir);
+        exit(e?.code ?? null, e?.signal ?? null, e?.from ?? "holder");
+      },
     };
     try {
       const link = await open(me, on);
@@ -443,6 +457,7 @@ export function createRunner(o: {
       writes.push({ op: "update", table: "conversation", where: { id: conversation }, patch: { sessionId: session } });
     }
     if (writes.length) loop.batch(events.map((event) => ({ kind: "agent", event })), writes);
+    if (events.some((e) => e.type === "turn_end")) void meter(conversation, "turn");
   }
 
   /** Writes the conversation's queued inputs, oldest first, one at a time: queued, writing, then
@@ -690,11 +705,49 @@ export function createRunner(o: {
       if (e.command === "resume") result = await resume(e.conversation, e.args.trim());
       else if (!l?.link) throw new Error(l?.missing ? `找不到 ${l.missing} 程序` : "agent 没在运行");
       else result = await l.driver.command(e.command, e.args);
+      heard(e.conversation, result);
     } catch (err) {
       result = { error: (err as Error).message };
     }
     report({ type: "command_result", command: e.command, chat: e.chat, inbound: e.inbound, result, conv: e.conversation, proc: l?.proc ?? 0, ...(e.panel && { panel: e.panel }) });
   }
+
+  /** Records what a usage, context or status result says (architecture §7.11), whoever asked. */
+  function heard(conversation: string, r: CommandResult): void {
+    const agent = store.tx((tx) => (record(tx, conversation, r) ? tx.get("conversation", conversation)!.agent : null));
+    if (agent) o.metered?.(conversation, agent);
+  }
+
+  /**
+   * Asks the conversation's agent for its context and use, for the record alone (architecture §7.11):
+   * at its turn's end; as a page opens its chat, unless heard or asked within METER_AGAIN.open; as the
+   * page asks, unless heard or asked within METER_AGAIN.ask. Only a process running: none is started. Never while
+   * it is asked already. What it answers goes to no chat and changes nothing of the slot; one slow or
+   * failing leaves what was heard before.
+   */
+  async function meter(conversation: string, why: "turn" | keyof typeof METER_AGAIN): Promise<void> {
+    const l = live.get(conversation);
+    if (!l?.link || l.stopping || metering.has(conversation)) return;
+    if (why !== "turn") {
+      const c = store.tx((tx) => tx.get("conversation", conversation));
+      if (!c || Date.now() - Math.max(heardAt(c), askedAt.get(conversation) ?? 0) < METER_AGAIN[why]) return;
+    }
+    metering.add(conversation);
+    try {
+      const ask = (name: "usage" | "context") =>
+        Promise.race([l.driver.command(name, ""), Bun.sleep(METER_WAIT).then(() => Promise.reject(new Error("no answer in time")))]).then(
+          (r) => heard(conversation, r),
+          (err) => log("meter not heard", { conversation, what: name, error: String(err) }),
+        );
+      await Promise.all([ask("usage"), ask("context")]);
+    } finally {
+      askedAt.set(conversation, Date.now());
+      metering.delete(conversation);
+    }
+  }
+
+  /** Whether the conversation's agent process runs, attached. */
+  const alive = (conversation: string): boolean => !!live.get(conversation)?.link;
 
   /** Gives the agent the answer on record, and marks it delivered once the holder has written it.
    *  With no agent attached, or one that fails to take it, it stays answered: the next handshake's
@@ -729,5 +782,5 @@ export function createRunner(o: {
     });
   }
 
-  return { start, deliver, stop, interrupt, command, recover, answer, approval };
+  return { start, deliver, stop, interrupt, command, recover, answer, approval, meter, alive };
 }

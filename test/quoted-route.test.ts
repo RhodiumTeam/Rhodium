@@ -22,6 +22,7 @@ const ctx: Ctx = {
   front: () => false,
   herdr: () => false,
   retarget: () => null,
+  dropBot: () => {},
   inboundOf: () => [],
 };
 const slot = (id: string) => ({ id, workspace: "w", name: id, dir: "/w", mode: "headless", state: "idle", conversation: `c${id}`, parent: null, lifetime: "longterm", archivedAt: null, herdrPane: null, nextAgent: null });

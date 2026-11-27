@@ -1,11 +1,13 @@
 // A slot's pane in the terminal (spec web-terminal): the board passes Herdr's frames of it over a
 // WebSocket, and ghostty-web draws them as Herdr's own Ghostty does (ADR-0012). The chat loads this,
 // and ghostty-web with it, only for a slot in the terminal.
-import { FitAddon, init, Terminal } from "ghostty-web";
+import { FitAddon, init, Terminal, type GhosttyCell, type GhosttyTerminal } from "ghostty-web";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CornerDownLeft } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "cn";
-import { Connecting, Key } from "./write";
+import type { RhReply } from "../../src/router";
+import { Connecting, Key, MAX_FILES, post } from "./write";
+import { toast } from "./toast";
 import { loginHolds, refresh } from "./data";
 // ⏴–⏺, Claude's ⏵⏵ of its mode line and ⏸ of plan mode, which no Android font has as text: Noto Sans
 // Symbols 2 v2.008's (SIL OFL 1.1; its notice is in the font and the licence in full in NOTICE.md), cut to them: python3 -m fontTools.subset
@@ -42,6 +44,10 @@ export function cut(text: string): string[] {
  *  not the pane's modes (measured 2026-10-26), so the page cannot tell. The cursor keys go as plain,
  *  not application, ones for the same reason. */
 const pasted = (text: string) => `\x1b[200~${text}\x1b[201~`;
+
+/** Kept files' paths as pasted into the terminal (spec web-terminal "贴图片和文件"), apart by spaces,
+ *  one with a space in it in single quotes, as a shell reads it. */
+export const pathsPasted = (paths: string[]) => paths.map((p) => (/\s/.test(p) ? `'${p}'` : p)).join(" ");
 
 /** The keys over a phone's box (story 348), each pressed as on a keyboard: ghostty-web encodes it. */
 const KEYS: { label: string; face: ReactNode; key: KeyboardEventInit }[] = [
@@ -83,6 +89,78 @@ function drawnOnDemand(term: Terminal, hidden: () => boolean): () => void {
   if (t.selectionManager) t.selectionManager.requestRender = draw;
   term.onScroll(draw);
   return draw;
+}
+
+type Spot = { col: number; absoluteRow: number };
+
+/** The text from a to b, either first, of wasm's rows, scrollback then screen: as ghostty-web 0.4.0's
+ *  SelectionManager.getSelection, but a wide character's second cell, a spacer, adds nothing, where
+ *  that wrote a space after each CJK character; a start on one takes the character. The blank Ghostty
+ *  leaves at a row's end where a wide character didn't fit is width 0 too, but follows no wide one. An empty cell is a
+ *  space, a row's trailing blanks go, and each row but the last ends a line (#805). */
+export function selectedText(wasm: GhosttyTerminal, a: Spot, b: Spot): string {
+  if (a.absoluteRow > b.absoluteRow || (a.absoluteRow === b.absoluteRow && a.col > b.col)) [a, b] = [b, a];
+  const back = wasm.getScrollbackLength();
+  const rows: string[] = [];
+  for (let r = a.absoluteRow; r <= b.absoluteRow; r++) {
+    const old = r < back;
+    const cells = old ? wasm.getScrollbackLine(r) : wasm.getLine(r - back);
+    if (!cells) continue;
+    let from = r === a.absoluteRow ? a.col : 0;
+    if (cells[from]?.width === 0 && cells[from - 1]?.width === 2) from--;
+    let text = "";
+    let kept = 0;
+    for (let c = from; c <= (r === b.absoluteRow ? b.col : cells.length - 1); c++) {
+      const cell = cells[c];
+      if (cell?.width === 0) continue;
+      const ch = !cell?.codepoint ? " " : cell.grapheme_len > 0 ? (old ? wasm.getScrollbackGraphemeString(r, c) : wasm.getGraphemeString(r - back, c)) : String.fromCodePoint(cell.codepoint);
+      text += ch;
+      if (ch.trim()) kept = text.length;
+    }
+    rows.push(text.slice(0, kept));
+  }
+  return rows.join("\n");
+}
+
+/** The cells of the word at col of a row, for a double click: a run of [\w-] as ghostty-web 0.4.0's
+ *  getWordAtCell has it; else the word Intl.Segmenter finds in lang there, as CJK, which that took for
+ *  none (#805); on a blank or a mark, none. */
+export function wordAt(cells: GhosttyCell[], col: number, lang: string): { startCol: number; endCol: number } | null {
+  if (cells[col]?.width === 0 && cells[col - 1]?.width === 2) col--;
+  const word = (c: number) => !!cells[c]?.codepoint && /[\w-]/.test(String.fromCodePoint(cells[c]!.codepoint));
+  if (word(col)) {
+    let [start, end] = [col, col];
+    while (start > 0 && word(start - 1)) start--;
+    while (end < cells.length - 1 && word(end + 1)) end++;
+    return { startCol: start, endCol: end };
+  }
+  // The row as text, each character's first cell beside it; empty cells as spaces.
+  let text = "";
+  const cellOf: number[] = [];
+  cells.forEach((cell, c) => {
+    if (cell.width === 0) return;
+    const ch = cell.codepoint ? String.fromCodePoint(cell.codepoint) : " ";
+    for (let i = 0; i < ch.length; i++) cellOf.push(c);
+    text += ch;
+  });
+  const i = cellOf.indexOf(col);
+  if (i < 0) return null;
+  const hit = new Intl.Segmenter(lang, { granularity: "word" }).segment(text).containing(i);
+  if (!hit?.isWordLike) return null;
+  const last = cellOf[hit.index + hit.segment.length - 1]!;
+  return { startCol: cellOf[hit.index]!, endCol: last + (cells[last]!.width || 1) - 1 };
+}
+
+/** term's selection copies CJK as drawn (#805). Patches ghostty-web 0.4.0's SelectionManager: check
+ *  getSelection and getWordAtCell again on an upgrade. */
+function wideAware(term: Terminal) {
+  const s = (term as unknown as { selectionManager?: { wasmTerm: GhosttyTerminal; selectionStart: Spot | null; selectionEnd: Spot | null; getSelection(): string; getWordAtCell(col: number, row: number): unknown } }).selectionManager;
+  if (!s) return;
+  s.getSelection = () => (s.selectionStart && s.selectionEnd ? selectedText(s.wasmTerm, s.selectionStart, s.selectionEnd) : "");
+  s.getWordAtCell = (col, row) => {
+    const cells = s.wasmTerm.getLine(row);
+    return cells && wordAt(cells, col, document.documentElement.lang);
+  };
 }
 
 /** Puts term's box you type in at the pane's cursor, where an input method opens its window, and in
@@ -175,6 +253,9 @@ export default function TerminalView({ slot, font, shown, boxed = false }: { slo
   const now = useRef({ font, shown });
   const [live, setLive] = useState(false);
   const [text, setText] = useState("");
+  // Files pasted or dropped being kept; a drag of files over it.
+  const [uploading, setUploading] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const press = (key: KeyboardEventInit) => box.current?.dispatchEvent(new KeyboardEvent("keydown", { ...key, bubbles: true, cancelable: true }));
   // The box's words as one paste, then Enter on its own: Claude's box tells a paste by its timing, and
   // takes an Enter right after it as a line of it, not as sending.
@@ -199,6 +280,7 @@ export default function TerminalView({ slot, font, shown, boxed = false }: { slo
       const fit = new FitAddon();
       t.loadAddon(fit);
       t.open(box.current!);
+      wideAware(t);
       // What you type goes into ghostty-web's hidden box, as a tap's always did, not into the terminal
       // made editable: that showed the browser's caret at its top-left, and the words an input method
       // was making at its bottom. Drawn, the box goes to the pane's cursor.
@@ -223,17 +305,39 @@ export default function TerminalView({ slot, font, shown, boxed = false }: { slo
       setTimeout(() => t.blur());
       const sent = (m: object) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m));
       t.onData((d) => cut(d).forEach((part) => sent({ t: "in", d: part })));
+      // Files pasted or dropped are kept by the board, and their paths go in as one paste, as a local
+      // terminal's; Claude and Codex take a picture's as the picture (spec web-terminal "贴图片和文件").
+      // Not kept, nothing goes in.
+      const upload = async (files: File[]) => {
+        if (files.reduce((n, f) => n + f.size, 0) > MAX_FILES) return toast("文件一次最多 20MB。", true);
+        const form = new FormData();
+        for (const f of files) form.append("file", f);
+        setUploading(true);
+        const r = (await post("api/upload", { body: form })) as RhReply & { paths?: string[] };
+        setUploading(false);
+        if (!r.ok) return toast(r.error, true);
+        if (!over) t.input(pasted(pathsPasted(r.paths!)), true);
+      };
       // Each paste, Ctrl+V's or the menu's, where the caret is in it or not: ghostty-web's own goes bare.
       box.current!.addEventListener(
         "paste",
         (e) => {
           e.preventDefault();
           e.stopImmediatePropagation();
+          // Words, even with a picture of them as from a spreadsheet, are words (as the composer's, #286).
           const text = e.clipboardData?.getData("text/plain");
-          if (text) t.input(pasted(text), true);
+          if (text) return t.input(pasted(text), true);
+          const files = [...(e.clipboardData?.files ?? [])];
+          if (files.length) void upload(files);
         },
         { capture: true, signal: stop.signal },
       );
+      // Files dragged over it light it up, as long as the drag goes on over it; dropped, they are not
+      // the chat's to attach, as elsewhere on its page.
+      let dragged: ReturnType<typeof setTimeout> | undefined;
+      const files = (e: DragEvent) => !!e.dataTransfer?.types.includes("Files") && (e.preventDefault(), e.stopPropagation(), true);
+      box.current!.addEventListener("dragover", (e) => files(e) && (setDragging(true), clearTimeout(dragged), (dragged = setTimeout(() => setDragging(false), 150))), { signal: stop.signal });
+      box.current!.addEventListener("drop", (e) => files(e) && (clearTimeout(dragged), setDragging(false), void upload([...e.dataTransfer!.files])), { signal: stop.signal });
       // ⌘ keys are the page's, ⌘K its jump box (spec web-maximize), and the browser's, as ⌘C, ⌘V, ⌘R, ⌘F
       // and ⌘+. ghostty-web never sees them: it prevents the default of each key it takes.
       const input = (t as unknown as { inputHandler: { keydownListener(e: KeyboardEvent): void; isPrintableCharacter(e: KeyboardEvent): boolean } }).inputHandler;
@@ -369,7 +473,8 @@ export default function TerminalView({ slot, font, shown, boxed = false }: { slo
       <section aria-label="终端" className={cn("relative min-h-0 flex-1 bg-[#0a0a0a]", !shown && "hidden")}>
         <div ref={box} className="absolute inset-0 touch-none overflow-hidden px-1 pt-1" />
         {!drawn && !away && <Connecting />}
-        {note && <p className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-3 py-1 text-xs text-neutral-300">{note}</p>}
+        {dragging && <div className="pointer-events-none absolute inset-0 bg-running/10 ring-2 ring-running ring-inset" />}
+        {(uploading || note) && <p className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-black/60 px-3 py-1 text-xs text-neutral-300">{uploading ? "正在上传…" : note}</p>}
         {away && (
           <div className="absolute inset-0 grid place-content-center justify-items-center gap-3 bg-[#0a0a0a] text-sm text-neutral-300">
             <p>已在别处打开</p>

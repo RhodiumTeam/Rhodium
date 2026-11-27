@@ -38,7 +38,7 @@ test("an empty config uses the documented defaults", () => {
   expect(c.durations.qqPassiveWindow).toBe(60 * 60_000);
   expect(c.limits.qqActive).toBe(1000);
   expect(c.durations.qqActiveWindow).toBe(24 * 3_600_000);
-  expect(c.durations.feishuEdit).toBe(3000); // a Feishu card's edits, at most one every 3 s (story 456)
+  expect(c.durations.feishuEdit).toBe(400); // a Feishu card's edits, at most one every 400 ms (stories 456, 783)
   expect(c.unitPrefix).toBe("rh-");
   expect(c.stateDir).toBe("/home/u/.local/state/rhodium");
   expect(c.socketDir).toBe("/run/user/1000/rhodium");

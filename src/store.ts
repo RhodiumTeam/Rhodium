@@ -268,6 +268,9 @@ export type Quota = Row & {
 };
 
 // Small key-value facts such as the boot number; id is the key.
+// Remove the metadata older Windows previews stored for imported slots when deleting the slot.
+export const importedSessionKey = (slot: string) => `imported-session:${slot}`;
+
 export type Meta = Row & { value: string };
 
 // A local picture in what an agent said, checked once (architecture §8.3): the conversation, the path
@@ -723,7 +726,7 @@ export function openStore(path: string, opts: { machine?: string } = {}): Store 
   const machine = opts.machine ?? hostname();
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const db = new Database(path, { create: true });
-  chmodSync(path, 0o600); // quoted text and pending messages are private
+  if (process.platform !== "win32") chmodSync(path, 0o600); // quoted text and pending messages are private
   db.run("PRAGMA journal_mode = WAL");
   // Another process on rh.db, say one reading it, may hold a lock a moment: wait for it rather than
   // fail, which would drop the inputs of that transaction (architecture §7). The main loop is

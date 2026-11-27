@@ -69,13 +69,13 @@ export function CardFrame({ icon: Icon, logo, title, sub, close, top, foot, chil
     <>
       {/* Over the transcript, unseen, to take the tap that closes it: the chat's top bar paints over it. */}
       <div aria-hidden onClick={close} className="absolute inset-x-0 bottom-full h-dvh" />
-      <div ref={room} className="pointer-events-none absolute inset-x-0 bottom-full px-3 pb-2">
+      <div ref={room} className="chat-inset pointer-events-none absolute inset-x-0 bottom-full px-3 pb-2">
         <div
           ref={card}
           role="dialog"
           aria-label={title}
           style={drag ? { transform: `translateY(${drag.by}px)` } : undefined}
-          className={cn("card-scroll pointer-events-auto mx-auto flex max-h-(--card) max-w-3xl flex-col overflow-y-auto rounded-2xl border bg-popover text-popover-foreground shadow-lg tall:overflow-hidden not-tall:[clip-path:border-box]", !drag && "transition-transform")}
+          className={cn("card-scroll pointer-events-auto mx-auto flex max-h-(--card) chat-column flex-col overflow-y-auto rounded-2xl border bg-popover text-popover-foreground shadow-lg tall:overflow-hidden not-tall:[clip-path:border-box]", !drag && "transition-transform")}
         >
           <div className="shrink-0">
             {/* Held, it keeps the caret where you type, and takes no text along. A finger's reach, over the

@@ -92,7 +92,8 @@ test("story 118: rhodium killed mid-turn and started again; each turn's reply ar
 
   await posts(3);
   await Bun.sleep(300); // anything sent twice would show up by now
-  expect((await rhodium.im.log("q", ME)).map((p) => ({ text: p.text, replyTo: p.replyTo }))).toEqual(
+  // The script's last message is not what it streamed before it: each streams in, then "40" goes (#797).
+  expect((await rhodium.im.log("q", ME)).filter((p) => !p.stream).map((p) => ({ text: p.text, replyTo: p.replyTo }))).toEqual(
     sent.map((replyTo) => ({ text: "40", replyTo })),
   );
   // One agent all along, and it got each message once. A restart of Rhodium is no crash.
@@ -124,6 +125,9 @@ test("story 118: killed after a message ended and before anything came after it:
   await slotA({ script: "progress-then-tool" });
   const { messageId } = await rhodium.im.inject("q", { chat: ME, sender: ME, text: "go" });
   await until(() => outLog().includes('"type":"assistant"')); // the agent pauses after the message
+  // It streamed in, closing once whole: killed before its closing frame went out, that frame is never
+  // sent (a race of the edit queue's 0.5 s, not defended against, #802).
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.final));
   await rhodium.kill9();
   await rhodium.start();
   await until(async () => (await state()) === "空闲", 15_000);

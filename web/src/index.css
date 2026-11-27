@@ -351,3 +351,8 @@
     background-color: var(--quiet);
   }
 }
+
+.chat-column { max-width: 48rem; }
+[data-chat-width="wide"] .chat-column { max-width: 64rem; }
+[data-chat-width="full"] .chat-column { max-width: none; }
+[data-chat-width="full"] .chat-inset { padding-inline: 1.5rem 3.5rem; }

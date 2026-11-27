@@ -13,7 +13,7 @@ import { errorKind } from "./avatars";
 import { buttonRows } from "./panels";
 import { feishuCapabilities } from "./platforms";
 import { clockAt } from "./prompt";
-import { clip } from "./render";
+import { clip, PANELS } from "./render";
 
 export { feishuCapabilities }; // the platform table's (platforms.ts), as tests know it
 
@@ -39,10 +39,28 @@ const PRESS_WAIT_MS = 2500;
 // The cards sent or edited last whose content is kept, by message id: Feishu reads a card back only as a placeholder.
 const CARDS = 500;
 const SLASH = "/open-apis/application/v7/app_slash_commands";
+const CARDKIT = "/open-apis/cardkit/v1/cards";
+// How a streaming card types its text out: a character every 120 ms, a little slower than the edits
+// come (durations.feishuEdit plus the call's own time), so it never stops to wait between two. Settled
+// by eye on a phone.
+const TYPING = { print_frequency_ms: { default: 120 }, print_step: { default: 1 }, print_strategy: "fast" };
+// A card's text streams only in streaming mode: closed by hand (300309), or by Feishu after 10 minutes (200850).
+const STREAM_CLOSED = [300309, 200850];
+// The card is being changed by the answer to a press on it: tried again once, after this wait.
+const CARD_BUSY = 200810;
+const BUSY_WAIT_MS = 1000;
+// More changes than this to a card's elements go as one replacement of the whole card instead.
+const MOST_OPS = 4;
 // The commands any agent's / menu has: the app's own others are left alone (spec "/ 菜单").
 const OURS = new Set(AGENT_KINDS.flatMap((a) => slashMenu(a)).map((i) => i.command.slice(1)));
 
 type Log = (msg: string) => void;
+/** A part of a card: its text in Markdown, or plain; a tool part as a folding panel, its text inside. */
+type El = { id: string; text: string; plain?: true; panel?: { title: string; open: boolean } };
+/** A card sent as a CardKit card entity (spec "发出的卡片"): the entity's id, when it was made (ms),
+ *  the last sequence of a change to it, whether its streaming mode is on as far as known, and what it
+ *  shows: its parts and buttons, null where not known (after a restart, or a change of unknown outcome). */
+type Entity = { id: string; born: number; seq: number; streaming: boolean; shown: { els: El[]; buttons: string } | null };
 type Attachment = NonNullable<InboundMessage["attachments"]>[number];
 type Options = {
   editEvery: number; // durations.feishuEdit
@@ -55,9 +73,12 @@ type Options = {
   since?: number;
   /** Whether rhodium has taken the message in already (its inbound table): acked, and not read again. */
   seen?: (chat: string, messageId: string) => boolean;
+  /** The card entity a message was sent as ("<card id> <made at ms>"), kept across restarts. */
+  entity?: (messageId: string) => string | undefined;
+  saveEntity?: (messageId: string, entity: string) => void;
 };
 /** A call's outcome: Feishu's answer, or the SendResult it fails with. */
-type Answer = { ok: true; data: any } | { ok: false; result: Extract<SendResult, { status: "failed" | "unknown" }> };
+type Answer = { ok: true; data: any } | { ok: false; result: Extract<SendResult, { status: "failed" | "unknown" }>; code?: number };
 /** A message as Feishu pushes it (or a backfill's, made to look so), or a press read already,
  *  waiting for rhodium to take it: took acks it, dropped fails its ack. */
 type Pending = { event?: any; press?: InboundMessage; took: () => void; dropped: (e: Error) => void };
@@ -81,7 +102,7 @@ export class FeishuAdapter implements ImAdapter {
   private readonly timeout: number;
   private client?: Promise<Lark.Client>;
   private chat?: string;
-  private readonly cards = new Map<string, OutboundMessage>(); // the last CARDS cards, oldest first
+  private readonly cards = new Map<string, { m: OutboundMessage; e?: Entity }>(); // the last CARDS cards, oldest first
   private readonly presses = new Map<string, (notice: string) => void>(); // presses waiting for answerPress, by event id
 
   /** appId, secret and an optional apiRoot (a test's fake Feishu) come from the [bots.<name>] table. */
@@ -346,16 +367,24 @@ export class FeishuAdapter implements ImAdapter {
     const data = e?.action?.value?.d;
     const card = e?.context?.open_message_id;
     if (!who || typeof data !== "string" || !card) return null;
-    const text = this.cards.get(card)?.text;
+    const text = this.cards.get(card)?.m.text;
     return { bot: this.botId, chat: who, messageId: e.event_id, sender: who, text: "", at: Date.now(), button: { data, message: card, ...(text !== undefined && { text }) } };
   }
 
+  /** A text message: a card entity made, then sent by its id (spec "发出的卡片"). Making it sends
+   *  nothing, so one that fails, or whose outcome is not known, fails the message. */
   async send(chat: string, message: OutboundMessage): Promise<SendResult> {
     if (message.file) return this.sendFile(chat, message.file);
-    const post = (card: object) => this.call("POST", "/open-apis/im/v1/messages", { receive_id: chat, msg_type: "interactive", content: JSON.stringify(card) }, { receive_id_type: "open_id" });
-    const a = await this.markdownOr(message, post);
+    const born = Date.now();
+    let plain = false;
+    const made = await this.markdownOr(message, (p) => ((plain = p), this.call("POST", CARDKIT, { type: "card_json", data: JSON.stringify(card(message, p, false)) })));
+    if (!made.ok) return { ...made.result, status: "failed" };
+    const id: string = made.data.card_id;
+    const content = JSON.stringify({ type: "card", data: { card_id: id } });
+    const a = await this.call("POST", "/open-apis/im/v1/messages", { receive_id: chat, msg_type: "interactive", content }, { receive_id_type: "open_id" });
     if (!a.ok) return a.result;
-    this.keep(a.data.message_id, message);
+    this.opts.saveEntity?.(a.data.message_id, `${id} ${born}`);
+    this.keep(a.data.message_id, message, { id, born, seq: 0, streaming: false, shown: { els: elements(message, plain), buttons: buttonsOf(message) } });
     // Rhodium sends only to you, so the chat the answer names is your private chat.
     if (a.data.chat_id && a.data.chat_id !== this.chat) {
       this.chat = a.data.chat_id;
@@ -388,35 +417,106 @@ export class FeishuAdapter implements ImAdapter {
     return a.ok ? { status: "sent", messageId: a.data.message_id } : a.result;
   }
 
-  /** The whole card replaced (PATCH), its buttons with it: none left out. */
+  /** The card changed to show message (spec "改卡片"). A card entity: text that grew streams in, typed
+   *  out; a panel folded or retitled, or a part added, is changed alone; anything else, buttons among
+   *  them, replaces the whole card. The last edit (final) closes its streaming mode. A card sent before
+   *  card entities, with none on record, is replaced whole (PATCH). */
   async edit(_chat: string, messageId: string, message: OutboundMessage): Promise<SendResult> {
-    const a = await this.markdownOr(message, (card) => this.call("PATCH", `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, { content: JSON.stringify(card) }));
+    const e = this.entity(messageId);
+    const a = e ? await this.change(e, message) : await this.markdownOr(message, (plain) => this.call("PATCH", `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, { content: JSON.stringify(card(message, plain)) }));
     if (!a.ok) return a.result;
-    this.keep(messageId, message);
+    // The chat list's summary too, which a change to a part leaves as it was, and streaming mode has as 生成中.
+    if (e && message.final) {
+      const closed = await this.cardkit(e, "PATCH", `${CARDKIT}/${e.id}/settings`, { settings: JSON.stringify({ config: { streaming_mode: false, summary: summary(message) } }) });
+      // Left on, Feishu closes it itself after 10 minutes.
+      if (closed.ok) e.streaming = false;
+      else this.log(`card's streaming mode not closed: ${closed.result.error}`);
+    }
+    this.keep(messageId, message, e);
     return { status: "sent", messageId };
   }
 
-  /** What the card shows now, the newest last; the oldest forgotten past CARDS. */
-  private keep(id: string, m: OutboundMessage): void {
+  /** The card entity a message was sent as: known, else on record from before a restart. */
+  private entity(messageId: string): Entity | undefined {
+    const known = this.cards.get(messageId);
+    if (known) return known.e;
+    const [id, born] = this.opts.entity?.(messageId)?.split(" ") ?? [];
+    // Taken as off: its first edit replaces it whole, and a card with buttons must not stream (plan).
+    // One left on is closed by that replacement or the last edit; text that streams after opens it again.
+    return id && born ? { id, born: Number(born), seq: 0, streaming: false, shown: null } : undefined;
+  }
+
+  /** The card entity e changed to show m: by the changes plan finds, else replaced whole. */
+  private async change(e: Entity, m: OutboundMessage): Promise<Answer> {
+    const want = { els: elements(m, false), buttons: buttonsOf(m) };
+    const ops = plan(e.shown, want);
+    if (!ops) return this.replace(e, m);
+    for (const op of ops) {
+      const at = `${CARDKIT}/${e.id}/elements`;
+      let a: Answer | undefined;
+      if ("add" in op) a = await this.cardkit(e, "POST", at, { type: "append", elements: JSON.stringify(op.add.map(element)) });
+      else if (op.head) a = await this.cardkit(e, "PATCH", `${at}/${op.el.id}`, { partial_element: JSON.stringify({ expanded: op.el.panel!.open, header: header(op.el.panel!.title) }) });
+      else {
+        const put = () => this.cardkit(e, "PUT", `${at}/${op.el.panel ? `${op.el.id}t` : op.el.id}/content`, { content: op.el.text });
+        // Streaming mode is opened for the first text that streams, and again once Feishu closed it.
+        if (e.streaming) a = await put();
+        if (!a || (!a.ok && STREAM_CLOSED.includes(a.code!))) {
+          const opened = await this.cardkit(e, "PATCH", `${CARDKIT}/${e.id}/settings`, { settings: JSON.stringify({ config: { streaming_mode: true } }) });
+          a = opened.ok ? ((e.streaming = true), await put()) : opened;
+        }
+      }
+      if (!a.ok && (a.result.status === "unknown" || a.result.quota || a.result.flood)) return (e.shown = null), a;
+      // Turned down otherwise: the whole card replaced instead.
+      if (!a.ok) {
+        this.log(`card's part not changed, replacing the card: ${a.result.error}`);
+        return this.replace(e, m);
+      }
+    }
+    e.shown = want;
+    return { ok: true, data: {} };
+  }
+
+  /** The card entity e replaced whole, to show m. */
+  private async replace(e: Entity, m: OutboundMessage): Promise<Answer> {
+    let plain = false;
+    const a = await this.markdownOr(m, (p) => ((plain = p), this.cardkit(e, "PUT", `${CARDKIT}/${e.id}`, { card: { type: "card_json", data: JSON.stringify(card(m, p, e.streaming)) } })));
+    e.shown = a.ok ? { els: elements(m, plain), buttons: buttonsOf(m) } : null;
+    return a;
+  }
+
+  /** A change to card entity e, with the next sequence: increasing, as the ms since it was made, so
+   *  none need be kept across restarts; Feishu's changes to one card go one at a time (daemon.ts).
+   *  One made while a press on the card is being answered is tried again once, after a wait. */
+  private async cardkit(e: Entity, method: "POST" | "PUT" | "PATCH", url: string, data: object): Promise<Answer> {
+    for (let tries = 1; ; tries++) {
+      e.seq = Math.max(e.seq + 1, Date.now() - e.born);
+      const a = await this.call(method, url, { ...data, sequence: e.seq });
+      if (a.ok || a.code !== CARD_BUSY || tries > 1) return a;
+      await sleep(BUSY_WAIT_MS);
+    }
+  }
+
+  /** What the card shows now, the newest last; the oldest forgotten past CARDS. e: its card entity. */
+  private keep(id: string, m: OutboundMessage, e?: Entity): void {
     this.cards.delete(id);
-    this.cards.set(id, m);
+    this.cards.set(id, { m, ...(e && { e }) });
     if (this.cards.size > CARDS) this.cards.delete(this.cards.keys().next().value!);
   }
 
-  /** The card in Markdown where there is any, else plain text. Plain text too when Feishu turns the
-   *  Markdown down (230099, say, for over 3 tables), so a message never fails for its formatting. */
-  private async markdownOr(m: OutboundMessage, call: (card: object) => Promise<Answer>): Promise<Answer> {
-    if (m.markdown === undefined) return call(card(m, { tag: "div", text: { tag: "plain_text", content: m.text } }));
-    const a = await call(card(m, { tag: "markdown", content: m.markdown }));
+  /** The card in Markdown where there is any, else plain text (call(true)). Plain text too when Feishu
+   *  turns the Markdown down (230099, say, for over 3 tables), so a message never fails for its formatting. */
+  private async markdownOr(m: OutboundMessage, call: (plain: boolean) => Promise<Answer>): Promise<Answer> {
+    if (m.markdown === undefined) return call(true);
+    const a = await call(false);
     if (a.ok || a.result.status === "unknown" || a.result.quota || a.result.flood) return a;
     this.log(`card's Markdown turned down, sending plain text: ${a.result.error}`);
-    return call(card(m, { tag: "div", text: { tag: "plain_text", content: m.text } }));
+    return call(true);
   }
 
   /** The card edited to what it last showed, without its buttons. One the bot does not know, sent
    *  before rhodium restarted or too long ago, fails: Feishu can't give it back. */
   async dropButtons(chat: string, messageId: string): Promise<SendResult> {
-    const m = this.cards.get(messageId);
+    const m = this.cards.get(messageId)?.m;
     if (!m) return { status: "failed", error: "the card's content is not known" };
     return this.edit(chat, messageId, { text: m.text, ...(m.markdown !== undefined && { markdown: m.markdown }) });
   }
@@ -480,7 +580,7 @@ export class FeishuAdapter implements ImAdapter {
    *  all; past that it fails, for its flood. Out of the month's quota it fails at once, for its quota.
    *  data: a function for a form, whose files are streams read once, so made anew each try.
    *  multipart: data goes as a form. bytes: the answer is a file's, given as its bytes. */
-  private async call(method: "GET" | "POST" | "PATCH" | "DELETE", url: string, data?: object | (() => object), params?: Record<string, string>, { as, most = FLOOD_TRIES }: { as?: "multipart" | "bytes"; most?: number } = {}): Promise<Answer> {
+  private async call(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", url: string, data?: object | (() => object), params?: Record<string, string>, { as, most = FLOOD_TRIES }: { as?: "multipart" | "bytes"; most?: number } = {}): Promise<Answer> {
     const client = await this.api();
     for (let tries = 1; ; tries++) {
       let status = 200;
@@ -512,7 +612,7 @@ export class FeishuAdapter implements ImAdapter {
       // The bot's info has its bot beside code, not under data.
       if (status < 300 && code === 0) return { ok: true, data: body.data ?? body };
       const error = this.redact(`HTTP ${status} ${code ?? ""} ${body?.msg ?? ""}`.replace(/ +/g, " ").trim());
-      if (code === QUOTA) return { ok: false, result: { status: "failed", error, quota: true } };
+      if (code === QUOTA) return { ok: false, result: { status: "failed", error, quota: true }, code };
       if (FLOOD.includes(code) || status === 429) {
         const wait = reset === undefined ? 1 : Number(reset);
         if (wait <= FLOOD_WAIT_MAX && tries < most) {
@@ -520,9 +620,9 @@ export class FeishuAdapter implements ImAdapter {
           await sleep(wait * 1000);
           continue;
         }
-        return { ok: false, result: { status: "failed", error, flood: true } };
+        return { ok: false, result: { status: "failed", error, flood: true }, code };
       }
-      return { ok: false, result: status >= 500 ? { status: "unknown", error } : { status: "failed", error } };
+      return { ok: false, result: status >= 500 ? { status: "unknown", error } : { status: "failed", error }, code };
     }
   }
 
@@ -531,11 +631,10 @@ export class FeishuAdapter implements ImAdapter {
   }
 }
 
-/** A JSON 2.0 card (spec "发出的卡片"): full width, editable; the element, then a column set for each
- *  row of buttons, a column for each, as wide as its label; its summary in the chat list the last
- *  line of text that has any, cut to 50 characters. */
-function card(m: OutboundMessage, element: object): object {
-  const last = m.text.split("\n").findLast((l) => l.trim()) ?? "";
+/** A JSON 2.0 card (spec "发出的卡片"): full width, editable; its parts (elements), then a column set
+ *  for each row of buttons, a column for each, as wide as its label; its summary. streaming: a card
+ *  entity's streaming mode, with how it types; left out for a card sent as itself. */
+function card(m: OutboundMessage, plain: boolean, streaming?: boolean): object {
   const rows = buttonRows(m.buttons ?? []).map((row) => ({
     tag: "column_set",
     flex_mode: "flow",
@@ -545,7 +644,69 @@ function card(m: OutboundMessage, element: object): object {
       elements: [{ tag: "button", text: { tag: "plain_text", content: b.label }, type: b.muted ? "default" : "primary", behaviors: [{ type: "callback", value: { d: b.data } }] }],
     })),
   }));
-  return { schema: "2.0", config: { update_multi: true, width_mode: "fill", summary: { content: clip(last.trim(), 50) } }, body: { elements: [element, ...rows] } };
+  const config = { update_multi: true, width_mode: "fill", summary: summary(m), ...(streaming !== undefined && { streaming_mode: streaming, streaming_config: TYPING }) };
+  return { schema: "2.0", config, body: { elements: [...elements(m, plain).map(element), ...rows] } };
+}
+
+/** A card's summary in the chat list: the last line of text that has any, cut to 50 characters. */
+const summary = (m: OutboundMessage) => ({ content: clip((m.text.split("\n").findLast((l) => l.trim()) ?? "").trim(), 50) });
+
+/** A message's parts: its Markdown, each tool part in it (render.ts PANEL) a panel, the text between
+ *  a part each; else, plain, its text. Each has an id by its place. */
+function elements(m: OutboundMessage, plain: boolean): El[] {
+  if (plain || m.markdown === undefined) return [{ id: "e0", text: m.text, plain: true }];
+  const md = m.markdown;
+  const els: El[] = [];
+  const text = (t: string) => (t = t.replace(/^\n+|\n+$/g, "")) && els.push({ id: `e${els.length}`, text: t });
+  let at = 0;
+  for (const p of md.matchAll(PANELS)) {
+    text(md.slice(at, p.index));
+    els.push({ id: `e${els.length}`, text: p[3]!, panel: { open: p[1] === "+", title: p[2]! } });
+    at = p.index + p[0].length;
+  }
+  text(md.slice(at));
+  return els.length ? els : [{ id: "e0", text: "" }];
+}
+
+/** A part as the card's element: Markdown, plain text, or a folding panel with its text in it. */
+function element(e: El): object {
+  if (e.plain) return { tag: "div", element_id: e.id, text: { tag: "plain_text", content: e.text } };
+  if (!e.panel) return { tag: "markdown", element_id: e.id, content: e.text };
+  return { tag: "collapsible_panel", element_id: e.id, expanded: e.panel.open, header: header(e.panel.title), border: { color: "grey" }, elements: [{ tag: "markdown", element_id: `${e.id}t`, content: e.text }] };
+}
+
+const header = (title: string) => ({ title: { tag: "plain_text", content: title } });
+const buttonsOf = (m: OutboundMessage) => JSON.stringify(m.buttons ?? []);
+
+type Op = { add: El[] } | { el: El; head?: true };
+
+/** The changes that take a card entity from showing shown to showing want, part by part: a part's
+ *  text changed, a panel folded or retitled, parts added at the end, empty, their text then streamed in. null where the whole card is to be
+ *  replaced instead: what it shows is not known, it has buttons or had them, a part's kind changed, a
+ *  part went, plain text changed (it does not stream), or more than MOST_OPS changes. */
+function plan(shown: Entity["shown"], want: NonNullable<Entity["shown"]>): Op[] | null {
+  // A card with buttons, a panel or an ask, never streams: its streaming mode would stay on, as nothing closes it.
+  if (!shown || shown.buttons !== "[]" || want.buttons !== "[]" || want.els.length < shown.els.length) return null;
+  const ops: Op[] = [];
+  // A part added goes empty, its text streamed in after, so that even a short one is typed out.
+  const fill: Op[] = [];
+  for (const [i, el] of want.els.entries()) {
+    const was = shown.els[i];
+    if (!was) {
+      const add = el.plain || !el.text ? el : (fill.push({ el }), { ...el, text: "" });
+      const last = ops.at(-1);
+      if (last && "add" in last) last.add.push(add);
+      else ops.push({ add: [add] });
+      continue;
+    }
+    if (!!was.panel !== !!el.panel || !!was.plain !== !!el.plain) return null;
+    if (was.panel && (was.panel.title !== el.panel!.title || was.panel.open !== el.panel!.open)) ops.push({ el, head: true });
+    if (was.text === el.text) continue;
+    if (el.plain) return null;
+    ops.push({ el });
+  }
+  ops.push(...fill);
+  return ops.length > MOST_OPS ? null : ops;
 }
 
 /** A text message's text as you wrote it. A note added to a forward comes as HTML in <p>: a line a
@@ -669,6 +830,7 @@ function safeJson(v: unknown): string {
 /** The daemon's Feishu bot (id: its row id), with what it keeps for the backfill (spec "配置"): your
  *  private chat's id, kept by the app's id; and when this bot row first took the app in, by both, as
  *  a bot new to rhodium has nothing on record for the backfill to skip. */
+// ponytail: a meta row per card sent, never dropped; drop those past the entity's 14 days if meta grows too big.
 export function makeFeishu(id: string, name: string, bot: BotConfig, { kept, seen, durations }: AdapterDeps): FeishuAdapter {
   const [chatKey, sinceKey] = [`feishuChat:${bot.appId}`, `feishuSince:${id}:${bot.appId}`];
   if (kept.get(sinceKey) === undefined) kept.set(sinceKey, String(Date.now()));
@@ -678,5 +840,7 @@ export function makeFeishu(id: string, name: string, bot: BotConfig, { kept, see
     saveChat: (chat) => kept.set(chatKey, chat),
     since: Number(kept.get(sinceKey)),
     seen,
+    entity: (message) => kept.get(`feishuCard:${message}`),
+    saveEntity: (message, entity) => kept.set(`feishuCard:${message}`, entity),
   });
 }

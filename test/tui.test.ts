@@ -461,7 +461,7 @@ test("/rh_tui from IM focuses the slot's pane in Herdr once it is open; an agent
 test("a message turned away while the slot is in the terminal does not make its chat the contact chat (2026-10-21)", async () => {
   // Bots q and t both go to w/a.
   await begin({ bots: { q: { like: "qq", owner: ME, target: "w/a" }, t: { like: "telegram", owner: ME, target: "w/a" } } });
-  const t = async () => (await rhodium.im.log("t", ME)).map((p) => p.text);
+  const t = async () => (await rhodium.im.log("t", ME)).filter((p) => p.kind !== "draft").map((p) => p.text);
   const sayT = (text: string) => rhodium.im.inject("t", { chat: ME, sender: ME, text });
   await sayT("hi");
   await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
@@ -477,7 +477,7 @@ test("a message turned away while the slot is in the terminal does not make its 
 test("/rh_tui and /rh_release naming a slot another chat goes to: how the switch went, and the confirm request, come to the chat that asked (product §5.9)", async () => {
   // Bot q goes to w/a, bot t to w/b; t's chat has talked with w/b, so it is w/b's contact chat.
   await begin({ bots: { q: { like: "qq", owner: ME, target: "w/a" }, t: { like: "telegram", owner: ME, target: "w/b" } } });
-  const t = async () => (await rhodium.im.log("t", ME)).map((p) => p.text);
+  const t = async () => (await rhodium.im.log("t", ME)).filter((p) => p.kind !== "draft").map((p) => p.text);
   await rhodium.im.inject("t", { chat: ME, sender: ME, text: "hi" });
   await until(async () => (await t()).includes("done"), 15_000);
   await say("/rh_tui w/b");

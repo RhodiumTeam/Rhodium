@@ -34,8 +34,8 @@ async function begin(opts: InstanceOptions & { only?: "q" | "t"; tb?: true } = {
   await rhodium.slots(...(tb ? ["a", "b"] : ["a"]));
 }
 
-/** What bot posted in your private chat with it. */
-const log = (bot: "q" | "t"): Promise<Posted[]> => rhodium.im.log(bot, bot === "q" ? QQ_ME : TG_ME);
+/** What bot posted in your private chat with it; a turn's draft not (#784), the message it ends in does. */
+const log = async (bot: "q" | "t"): Promise<Posted[]> => (await rhodium.im.log(bot, bot === "q" ? QQ_ME : TG_ME)).filter((p) => p.kind !== "draft");
 async function posts(bot: "q" | "t", n: number): Promise<Posted[]> {
   await until(async () => (await log(bot)).length >= n, 15_000);
   return log(bot);

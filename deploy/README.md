@@ -190,7 +190,10 @@ rm -rf ~/.local/opt/<实例> <stateDir> ~/.config/rhodium/<实例> ~/.local/bin/
 - 发版用公开仓库的 GitHub Action `.github/workflows/release.yml`。它只能手动触发，私有仓库里不跑。
   1. 先升版本：`package.json` 和 `holder/Cargo.toml` 一起改。
   2. 在公开仓库的 Actions 页选 `Release packages`，点 Run workflow；或者 `gh workflow run release.yml -R <公开仓库>`。
-  3. 它在 GitHub 的 x86_64 和 arm64 机器上各跑一遍 `scripts/package.sh`，再建一个草稿 Release：标签 `v<版本>`，附上两个包和 `SHA256SUMS`。
+  3. 它在 GitHub 的机器上打四个包，再建一个草稿 Release：标签 `v<版本>`，附上四个包和 `SHA256SUMS`。
+     - Linux 的 x86_64 和 arm64：各跑一遍 `scripts/package.sh`。
+     - Windows x64 预览：在 Windows 机器上跑 `scripts/windows-build.ps1` 和 `scripts/windows-package.ps1`，包名是 `rhodium-<版本>-windows-preview-<提交>-win-x64.zip`，说明在 `release/windows-preview/`。
+     - Apple Silicon 预览：在 arm64 的 Mac 机器上跑 `scripts/macos-package.sh`，包名是 `rhodium-<版本>-macos-preview-<提交>-arm64.tar.gz`，说明在 `release/macos-preview/`。
   4. 去 Release 页看草稿，写好说明，再点发布。发布时才建标签。
 - 同一个版本再跑一遍：草稿的附件换成新打的，说明不动。这个版本已经发布过的话，它报错退出，什么都不改。
 - Action 装的 Bun 是 `release/licenses/bun-<版本>.md` 写的那个版本。升 Bun 时换掉这份说明，Action 就跟着换。

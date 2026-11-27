@@ -124,11 +124,11 @@ for (const like of LIKES) {
     await bot(like, { claude: { script: "progress-pause" } });
     await say({ text: "go" });
     await answered(1);
-    // Telegram edits one message to the end; QQ sends it whole once the agent has said it all.
+    // Telegram shows a draft to the end, then sends it as a message (#784); QQ sends it whole once the agent has said it all.
     const shown = PROGRESS_PIECES.join("").trimEnd();
-    await until(async () => (await rhodium.im.log("b", ME)).at(-1)?.text === shown, 15_000); // the last edit is paced
-    const [first] = await rhodium.im.log("b", ME);
-    await say({ text: "and this?", quote: { ref: first!.messageId } });
+    const last = async () => (await rhodium.im.log("b", ME)).at(-1);
+    await until(async () => (await last())?.text === shown && (await last())?.kind === "send", 15_000); // the last edit is paced
+    await say({ text: "and this?", quote: { ref: (await last())!.messageId } });
     await answered(2);
     // Its first 100 characters, the last of the first piece a newline, which the … takes the place of.
     expect(textOf(frames()[1]!)).toBe(`> ${PROGRESS_PIECES[0]!.trimEnd()}…\n\nand this?`);

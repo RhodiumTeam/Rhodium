@@ -16,7 +16,7 @@ import { RhodiumView } from "../web/src/rhodium";
 import { ahead, behind, ChatView, fullEsc, inTerminal, KEPT_BLOCKS, keepCollapsed, keepTerminalFont, sideCollapsed, sideWidth, SlotPage, terminalFont, visit, visits, type EscKey } from "../web/src/slot";
 import { Details, EventRow, look } from "../web/src/details";
 import { afterClose, retryIn } from "../web/src/terminal";
-import { folded, kindOf, MARKDOWN, SaidOf } from "../web/src/tools";
+import { Sent as SentMessage, folded, kindOf, MARKDOWN, SaidOf } from "../web/src/tools";
 import { Streamdown } from "streamdown";
 import { shortText } from "../src/tool-line";
 import { sendOf } from "../src/transcript";
@@ -25,7 +25,7 @@ import { act, byPage, draft, forAgent, frame, givenBack, keepDraft, keyMode, Toa
 import { InfoCard, resetsIn, Status, tone } from "../web/src/card";
 import type { InfoCard as Info } from "../src/router";
 import { answerText } from "../web/src/asks";
-import { cut } from "../web/src/terminal";
+import { cut, pathsPasted } from "../web/src/terminal";
 import { Answer, matching } from "../web/src/palette";
 import { greyOf, MeterBody, Ring, Strips } from "../web/src/meter";
 import { Face } from "../web/src/faces";
@@ -516,6 +516,12 @@ test("story 562: an rh send's words show once the board found its send_me event,
   await log.newer();
   expect(asked).toContain("&after=50");
   expect(log.blocks.flatMap((b) => (b.kind === "tool" ? [b.send?.media] : []))).toEqual([[]]);
+});
+
+test("sent Markdown keeps a soft break and the original code lines", () => {
+  const html = render(<SentMessage send={{ to: "me", files: [], text: "**one**\ntwo\n\n~~~txt\na\nb\n~~~" }} />);
+  expect(html).toMatch(/data-streamdown="strong">one<\/span><br\s*\/?>(?:\n)?two/);
+  expect(html).toContain("a\nb");
 });
 
 test("story 576: rh send web 测试过了, then another Bash, the two folded into one line: its words show with the line unopened", () => {
@@ -1459,7 +1465,7 @@ test("#206, #495: a call that failed has a red icon and a red ⓧ, 出错 to scr
     expect(line).toMatch(/text-destructive[^>]*><svg[^>]*lucide-terminal/);
   }
   // A single call that failed: the ⓧ alone, no count, right after its name, no word.
-  expect(fold!.replace(/<[^>]+>/g, "")).toBe("Read、Bash ");
+  expect(fold!.replace(/<[^>]+>/g, "")).toBe("2 步Read、Bash ");
   // Only the kind that failed is red, and a call that did not fail says nothing.
   expect(fold).toMatch(/text-tool-look[^>]*><svg[^>]*lucide-file-text/);
   expect(read).not.toContain("出错");
@@ -1494,7 +1500,7 @@ test("#501: a fold's chevron sits at its row's right end, a step's too, its ⓧ 
   // At the top, 6px (wide: 4px) down: where a row of one line, 32px (28px) high, has them.
   expect(fold![0]).toEqual(expect.arrayContaining(["items-start", "py-1.5", "lg:py-1", "min-h-8", "lg:min-h-7"]));
   // The line takes the room the icons leave; the chevron after it, last, 3px down: by its first line.
-  expect(fold![1]).toMatch(/<span class="min-w-0 flex-1">[^]*<\/span><svg[^>]*mt-\[3px\][^>]*>[^]*?<\/svg>$/);
+  expect(fold![1]).toMatch(/<span class="relative min-w-0 flex-1">[^]*<\/span><svg[^>]*mt-\[3px\][^>]*>[^]*?<\/svg>$/);
   expect(step![1]).toMatch(/<span class="min-w-0 flex-1 truncate">[^]*<\/span><span role="img" aria-label="出错"[^]*<\/span><svg[^>]*lucide-chevron-right[^>]*>[^]*?<\/svg>$/);
 });
 
@@ -1510,7 +1516,7 @@ test("#501: a fold's line wraps inside a name too long for a line, so the chat n
   );
   const [two, one] = [...html.matchAll(/group\/fold[^>]*><summary[^>]*>([^]*?)<\/summary>/g)].map((m) => m[1]!);
   // Only the names wrap anywhere, not the whole line, which a phone would then break before a 、.
-  expect(two).toContain('<span class="min-w-0 flex-1"><span class="wrap-anywhere">');
+  expect(two).toContain('<span class="group-open/fold:invisible"><span class="wrap-anywhere">');
   expect(two).toContain(`${long}</span><span class="whitespace-nowrap"> ×3 <span role="img" aria-label="出错 1 次"`);
   // With no ×N: its last part, after a . _ or - or from a capital, so a name that fits a line but not with its ⓧ
   // breaks there; else its last letter.
@@ -2066,6 +2072,11 @@ test("story 340: the page draws the terminal for a slot in the terminal with its
   expect(inTerminal(slot())).toBe(false);
   expect(inTerminal(slot({ mode: "tui" }))).toBe(false);
   expect(inTerminal(slot({ mode: "tui", pane: "w4Q:p2", herdrLost: true }))).toBe(false);
+});
+
+test("stories 687, 688: kept files' paths go into the terminal apart by spaces, one with a space in it in single quotes", () => {
+  expect(pathsPasted(["/s/media/ab.png"])).toBe("/s/media/ab.png");
+  expect(pathsPasted(["/s/media/ab.png", "/my state/media/cd.pdf"])).toBe("/s/media/ab.png '/my state/media/cd.pdf'");
 });
 
 test("spec web-terminal: what you type goes in frames of 64KB at most as sent, in order, no character cut in two", () => {

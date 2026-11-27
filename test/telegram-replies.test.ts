@@ -25,16 +25,20 @@ async function telegram(opts: InstanceOptions = {}, bot: Record<string, string> 
 
 const say = (text: string) => rhodium.im.inject("t", { chat: ME, sender: ME, text });
 
-/** What the bot posted in your chat, once the last of it shows text. */
-async function lastShows(text: string, bot = "t", chat = ME): Promise<Posted[]> {
-  await until(async () => (await rhodium.im.log(bot, chat)).at(-1)?.text === text, 15_000);
+/** What the bot posted in your chat, once the last of it shows text: a message, or with draft, a draft. */
+async function lastShows(text: string, bot = "t", chat = ME, draft = false): Promise<Posted[]> {
+  await until(async () => {
+    const last = (await rhodium.im.log(bot, chat)).at(-1);
+    return last?.text === text && (draft || last.kind !== "draft");
+  }, 15_000);
   return rhodium.im.log(bot, chat);
 }
 
 test("story 25: on Telegram you talk with the slot, and its reply comes back to your chat", async () => {
   await telegram();
   await say("hello");
-  expect((await lastShows("fake reply")).map((p) => ({ kind: p.kind, text: p.text }))).toEqual([{ kind: "send", text: "fake reply" }]);
+  await lastShows("fake reply");
+  expect((await rhodium.im.shown("t", ME)).map((p) => ({ kind: p.kind, text: p.text }))).toEqual([{ kind: "send", text: "fake reply" }]);
 }, 30_000);
 
 /** The tool part of the progress scripts' turn: it reads notes.txt and runs ls. */
@@ -42,18 +46,20 @@ const TOOLS = "[🔧 Read] notes.txt\n[🔧 Bash] ls";
 /** What the progress scripts' turn shows in the end: its tools, then its reply. */
 const PROGRESS_SHOWN = `${TOOLS}\n\n${PROGRESS_PIECES.join("").trimEnd()}`;
 
-test("stories 66-69: a turn is one message, edited as it goes: tool lines as the tools run, the text growing under them, the final reply its last part", async () => {
+test("stories 66-69: a turn is one message, a draft as it goes: tool lines as the tools run, the text growing under them, the final reply its last part, sent as a message at the end", async () => {
   await telegram({ claude: { script: "progress-fast" } });
   await say("look around");
   const posts = await lastShows(PROGRESS_SHOWN);
 
-  // Story 66: sent once, then only edited.
-  const [first, ...edits] = posts;
-  expect(first!.kind).toBe("send");
-  expect(edits.map((p) => ({ kind: p.kind, messageId: p.messageId }))).toEqual(edits.map(() => ({ kind: "edit", messageId: first!.messageId })));
+  // Story 66: one draft, updated, then sent as a message that stands for it (#784).
+  const [first, ...drafts] = posts.slice(0, -1);
+  expect(first!.kind).toBe("draft");
+  expect(drafts.map((p) => ({ kind: p.kind, messageId: p.messageId }))).toEqual(drafts.map(() => ({ kind: "draft", messageId: first!.messageId })));
+  expect(posts.at(-1)).toMatchObject({ kind: "send", ends: first!.messageId, final: true });
 
-  // Story 67: a line for each tool as it starts, there till it is done; in Markdown, a quote.
-  expect(first!.text).toBe("[🔧 Read] notes.txt，正在运行");
+  // Story 67: a line for each tool as it starts, there till it is done; in Markdown, a block folded
+  // open while the tools run.
+  expect(first).toMatchObject({ text: "[🔧 Read] notes.txt，正在运行", markdown: "<details open><summary>🔧 工具 ×1（运行中）</summary>\n\n[🔧 Read] `notes.txt`，正在运行\n\n</details>" });
   const progress = posts.slice(0, -1).map((p) => p.text);
 
   // Story 68: under them, the text so far, longer each time.
@@ -64,16 +70,27 @@ test("stories 66-69: a turn is one message, edited as it goes: tool lines as the
     if (i) expect(body.length).toBeGreaterThan(bodies[i - 1]!.length);
   });
 
-  // Story 69: the turn over, the message keeps how it went, the final reply its last part.
-  expect(posts.at(-1)).toMatchObject({ text: PROGRESS_SHOWN, markdown: `> [🔧 Read] \`notes.txt\`  \n> [🔧 Bash] \`ls\`\n\n${PROGRESS_PIECES.join("").trimEnd()}` });
+  // Story 69: the turn over, the message keeps how it went, the tools folded, the final reply its last part.
+  const tools = "<details><summary>🔧 Read、Bash</summary>\n\n[🔧 Read] `notes.txt`\n\n[🔧 Bash] `ls`\n\n</details>";
+  expect(posts.at(-1)).toMatchObject({ text: PROGRESS_SHOWN, markdown: `${tools}\n\n${PROGRESS_PIECES.join("").trimEnd()}` });
+}, 30_000);
+
+test("#781: the turn's last edit reaches an adapter with finalEdit marked final, its text unchanged, the edits before it not", async () => {
+  await telegram({ claude: { script: "progress-fast" } }, { draftTtl: "0" }); // a message edited in place
+  await say("look around");
+  await lastShows(PROGRESS_SHOWN);
+  await until(async () => (await rhodium.im.log("t", ME)).at(-1)?.final === true, 15_000);
+  const edits = (await rhodium.im.log("t", ME)).filter((p) => p.kind === "edit");
+  expect(edits.length).toBeGreaterThanOrEqual(2);
+  expect(edits.map((p) => p.final ?? false)).toEqual([...edits.slice(1).map(() => false), true]);
 }, 30_000);
 
 test("a turn's events arriving all at once make a few edits, not one each: newer text replaces text not yet sent", async () => {
   await telegram({ claude: { script: "progress" } }); // 13 events with no pause between them
   await say("look around");
   const posts = await lastShows(PROGRESS_SHOWN);
-  expect(posts[0]!.kind).toBe("send");
-  expect(posts.length).toBeLessThanOrEqual(4); // the send and at most 3 edits
+  expect(posts[0]!.kind).toBe("draft");
+  expect(posts.length).toBeLessThanOrEqual(5); // the draft, at most 3 updates of it, and the message
 }, 30_000);
 
 test("requests to one chat, sends and edits alike, go out about a second apart, as Telegram's limit asks", async () => {
@@ -90,7 +107,7 @@ test("requests to one chat, sends and edits alike, go out about a second apart, 
     return posts.at(-1)?.text === reply && posts.filter((p) => p.kind === "send").length === 2;
   }, 15_000);
   const posts = await rhodium.im.log("t", ME);
-  expect(posts.filter((p) => p.kind === "edit").length).toBeGreaterThanOrEqual(2);
+  expect(posts.filter((p) => p.kind === "draft").length).toBeGreaterThanOrEqual(2);
   // A request the fake IM takes in late makes the gap before it long and the one after it short;
   // the span shows they went out a second apart all the same (#575). Each is paced from the one
   // before's scheduled time, so a late first request shortens the span: allow it the same 300 ms.
@@ -100,7 +117,7 @@ test("requests to one chat, sends and edits alike, go out about a second apart, 
 }, 30_000);
 
 test("a send the platform took but never answered is unknown, not failed, and rhodium does not send it again", async () => {
-  const d = await telegram();
+  const d = await telegram({}, { draftTtl: "0" }); // a message, no draft
   await rhodium.im.next("t", "timeout", "send");
   await say("hello");
   await until(() => d.logs.some((l) => l.msg === "send failed" && l.status === "unknown"), 15_000);
@@ -109,8 +126,24 @@ test("a send the platform took but never answered is unknown, not failed, and rh
   expect((await rhodium.im.log("t", ME)).map((p) => ({ kind: p.kind, text: p.text }))).toEqual([{ kind: "send", text: "fake reply" }]);
 }, 30_000);
 
+test("#784: a draft's final edit, sending it as a message, that the platform took but never answered is not sent again", async () => {
+  const d = await telegram();
+  await rhodium.im.next("t", "timeout", "send");
+  await say("hello");
+  await until(() => d.logs.some((l) => l.msg === "edit outcome unknown"), 15_000);
+  await until(async () => (await rhodium.state("w/a")) === "空闲", 15_000);
+  await Bun.sleep(400); // past an edit's wait, so a resend would be there by now
+  expect((await rhodium.im.log("t", ME)).map((p) => ({ kind: p.kind, text: p.text }))).toEqual([
+    { kind: "draft", text: "fake reply" },
+    { kind: "send", text: "fake reply" },
+  ]);
+}, 30_000);
+
+// The tests of a message edited in place that went wrong set draftTtl 0: as Feishu's, and Telegram's
+// own once a draft was turned down.
+
 test("story 72: when the turn's only message failed, there is nothing to edit, and the final reply comes as a new message", async () => {
-  await telegram();
+  await telegram({}, { draftTtl: "0" });
   await rhodium.im.next("t", "fail", "send");
   await say("hello");
   await until(async () => (await rhodium.im.log("t", ME)).length > 0, 15_000);
@@ -122,7 +155,7 @@ test.each([
   ["failed", "fail", 1],
   ["may not have arrived", "timeout", 2],
 ] as const)("story 72: when the turn's first message %s, its progress goes on in a new message, which becomes the final reply", async (_, outcome, sends) => {
-  await telegram({ claude: { script: "progress-fast" } });
+  await telegram({ claude: { script: "progress-fast" } }, { draftTtl: "0" });
   await rhodium.im.next("t", outcome, "send");
   await say("look around");
   const posts = await lastShows(PROGRESS_SHOWN);
@@ -132,14 +165,56 @@ test.each([
   expect(posts.slice(sends - 1).every((p) => p.messageId === posts.at(-1)!.messageId)).toBe(true);
 }, 30_000);
 
-test("story 72: an edit Telegram turns down sends the text as a new message, which the turn edits from then on", async () => {
+test("story 72: a draft update Telegram turns down sends the text as a message, which the turn edits from then on", async () => {
   await telegram({ claude: { script: "progress-fast" } });
-  await rhodium.im.next("t", "fail", "edit");
+  await rhodium.im.next("t", "ok", "draft"); // the draft's first showing
+  await rhodium.im.next("t", "fail", "draft");
   await say("look around");
   const posts = await lastShows(PROGRESS_SHOWN);
-  const sends = posts.filter((p) => p.kind === "send");
-  expect(sends).toHaveLength(2);
+  const sent = posts.find((p) => p.kind === "send")!;
+  expect(posts.slice(posts.indexOf(sent) + 1).map((p) => ({ kind: p.kind, messageId: p.messageId }))).toEqual(posts.slice(posts.indexOf(sent) + 1).map(() => ({ kind: "edit", messageId: sent.messageId })));
+  // The draft, never sent as a message, is gone in Telegram by now.
   expect(messages(posts)).toEqual(["[🔧 Read] notes.txt，正在运行", PROGRESS_SHOWN]);
+}, 30_000);
+
+test("#784: a draft's final edit Telegram turns down sends the text as a new message all the same", async () => {
+  await telegram({ claude: { script: "progress-fast" } });
+  await rhodium.im.next("t", "fail", "send");
+  await say("look around");
+  const posts = await lastShows(PROGRESS_SHOWN);
+  expect(posts.filter((p) => p.kind === "send").map((p) => ({ text: p.text, ends: p.ends }))).toEqual([{ text: PROGRESS_SHOWN, ends: undefined }]);
+}, 30_000);
+
+/** A turn that runs sleep 600, which is done after ms, then says done. */
+const sleeps = (ms: number): Script => ({
+  on,
+  steps: [...startTurn, toolUse("toolu_sleep", "Bash", { command: "sleep 600" }), { sleep: ms }, toolResult("toolu_sleep"), ...endTurn("done"), { goto: 0 }],
+});
+const SLEEPING = "[🔧 Bash] sleep 600，正在运行";
+
+test("#784: a draft that does not change goes again before Telegram drops it, five sixths of draftTtl on; once sent as a message, no more", async () => {
+  await telegram({ claude: { script: sleeps(4_000) } }, { draftTtl: "1200" });
+  await say("go");
+  await lastShows("[🔧 Bash] sleep 600\n\ndone");
+  const posts = await rhodium.im.log("t", ME);
+  const running = posts.filter((p) => p.kind === "draft" && p.text === SLEEPING);
+  expect(running.length).toBeGreaterThanOrEqual(3);
+  running.slice(1).forEach((p, i) => expect(p.at - running[i]!.at).toBeGreaterThanOrEqual(900));
+  await Bun.sleep(1_500);
+  expect(await rhodium.im.log("t", ME)).toHaveLength(posts.length);
+}, 30_000);
+
+test("#784: after a restart, the turn's draft goes again at once; the message sent for it at the end is what a quote of it names", async () => {
+  await telegram({ claude: { script: sleeps(8_000) } });
+  await say("go");
+  await lastShows(SLEEPING, "t", ME, true);
+  await rhodium.kill9();
+  const before = (await rhodium.im.log("t", ME)).length;
+  await rhodium.start();
+  await until(async () => (await rhodium.im.log("t", ME)).slice(before).some((p) => p.kind === "draft" && p.text === SLEEPING), 10_000);
+  const done = (await lastShows("[🔧 Bash] sleep 600\n\ndone")).at(-1)!;
+  expect(done.kind).toBe("send");
+  await recorded(rhodium, `SELECT 1 FROM outbound WHERE platformMsgId = '${done.messageId}' AND ref = '${done.messageId}'`);
 }, 30_000);
 
 /** A turn that reads a file and says "Looking.", pauses for that to show, then does middle, then
@@ -159,10 +234,31 @@ test("story 72: an ask mid-turn comes as a message of its own, and the turn goes
   await say("build it");
   await until(async () => (await rhodium.im.log("t", ME)).some((p) => p.buttons?.length), 15_000);
   const ask = (await rhodium.im.log("t", ME)).find((p) => p.buttons?.length)!;
+  // The draft above it went as a message first, so it stays above it (#784).
+  const before = (await rhodium.im.log("t", ME)).filter((p) => p.kind === "send");
+  expect(before.map((p) => p.text)).toEqual(["[🔧 Read] notes.txt\n\nLooking.", ask.text]);
   await rhodium.im.inject("t", { chat: ME, sender: ME, text: "", button: { data: ask.buttons![0]!.data, message: ask.messageId } });
   const posts = await lastShows("Built.");
   // The message the ask came under stops without the call it showed running.
   expect(messages(posts)).toEqual(["[🔧 Read] notes.txt\n\nLooking.", ask.text, "已允许运行这条命令。", "Built."]);
+}, 30_000);
+
+test("#784: a turn's draft Telegram turns down goes through another bot, and the ask its final edit holds back comes all the same: the send queue never waits for itself", async () => {
+  rhodium = newInstance({
+    bots: { t: { like: "telegram", owner: ME, target: "w/a" }, q: { like: "qq", owner: "you-qq-id", target: "w/a" } },
+    claude: { script: { on, steps: [...startTurn, ...endTurn("ok"), ...startTurn, ...askingCall(["p-1", "Bash", { command: "make" }]), ...endTurn("Built."), { goto: 0 }] } },
+  });
+  const d = await rhodium.start();
+  await rhodium.slots("a");
+  await rhodium.im.inject("q", { chat: "you-qq-id", sender: "you-qq-id", text: "hi" }); // a chat with you on q
+  await until(async () => (await rhodium.im.log("q", "you-qq-id")).length === 1, 15_000);
+  await rhodium.im.next("t", "refuse", "draft");
+  await say("build it");
+  // The ask, held for the draft's final edit, comes all the same; so does the draft, through q.
+  const asked = async () => [...(await rhodium.im.log("t", ME)), ...(await rhodium.im.log("q", "you-qq-id"))].some((p) => p.text.includes("允许吗"));
+  await until(asked, 15_000);
+  expect(d.logs.filter((l) => l.msg === "send failed")).toEqual([expect.objectContaining({ error: "fake-im: set to refuse" })]);
+  await until(async () => (await rhodium.im.log("q", "you-qq-id")).some((p) => p.text.includes("[🔧 Bash] make")), 15_000);
 }, 30_000);
 
 test("story 72: an approval as the turn's first step: the message that showed the call running stops with its line, done, never empty", async () => {
@@ -176,7 +272,7 @@ test("story 72: an approval as the turn's first step: the message that showed th
   await rhodium.im.inject("t", { chat: ME, sender: ME, text: "", button: { data: ask.buttons![0]!.data, message: ask.messageId } });
   const posts = await lastShows("Built.");
   expect(posts[0]!.text).toBe("[🔧 Bash] make，正在运行");
-  expect(posts.filter((p) => p.kind === "edit" && !p.text)).toEqual([]);
+  expect(posts.filter((p) => (p.kind === "edit" || p.kind === "draft") && !p.text)).toEqual([]);
   expect(messages(posts)).toEqual(["[🔧 Bash] make", ask.text, "已允许运行这条命令。", "Built."]);
   expect(d.logs.filter((l) => l.msg === "send failed" || l.msg === "edit failed")).toEqual([]);
 }, 30_000);
@@ -185,7 +281,7 @@ test("story 72: when the last edit of a message the turn has moved on from is tu
   const make: FakeAsk = ["p-1", "Bash", { command: "make" }];
   // The ask comes before "Looking." can show: the turn moves on from its message with that edit still to make.
   const steps = [...startTurn, toolCall("toolu_read", "Read", { file_path: "notes.txt" }), { emit: [textDelta("Looking.")] }, ...askOnce(make), ...endTurn("Built."), { goto: 0 }];
-  await telegram({ claude: { script: { on, steps } } });
+  await telegram({ claude: { script: { on, steps } } }, { draftTtl: "0" });
   await rhodium.im.next("t", "fail", "edit");
   await say("build it");
   const looking = "[🔧 Read] notes.txt\n\nLooking.";
@@ -238,7 +334,7 @@ test("story 40: the turn rh send me took over still ends with the last edit of i
   ];
   // Once a second: the edit that ends the ls step is still waiting its turn when the turn ends, and
   // the turn's last edit takes its place.
-  await telegram({ claude: { script: { on, steps } } }, { perChatPerSecond: "1" });
+  await telegram({ claude: { script: { on, steps } } }, { perChatPerSecond: "1", draftTtl: "0" });
   await rhodium.im.next("t", "ok", "edit"); // stopping the first message, at rh send me
   await rhodium.im.next("t", "fail", "edit"); // the last of the message under it
   await say("go");
@@ -318,7 +414,7 @@ test.each([
   await until(async () => (await rhodium.state("w/a")) === settled, 15_000);
   await Bun.sleep(400); // past an edit's wait, so one more would be there by now
   const posts = await rhodium.im.log("t", ME);
-  const shows = posts.filter((p) => p.messageId === posts[0]!.messageId).map((p) => p.text);
+  const shows = posts.filter((p) => p.messageId === posts[0]!.messageId || p.ends === posts[0]!.messageId).map((p) => p.text);
   expect(shows.slice(shows.indexOf(LOOP_RUNNING))).toEqual([LOOP_RUNNING, "开始跑循环。"]);
 }, 30_000);
 
@@ -335,7 +431,7 @@ test("story 40: a turn rh send me took over, then cut short by rh stop, ends its
   ];
   await telegram({ claude: { script: { on, steps } } });
   await say("go");
-  await lastShows("[🔧 Bash] sleep 600，正在运行");
+  await lastShows("[🔧 Bash] sleep 600，正在运行", "t", ME, true);
   await rhodium.ok("stop", "w/a");
   await until(async () => (await rhodium.state("w/a")) === "未运行", 15_000);
   await Bun.sleep(400); // past an edit's wait, so one more would be there by now
@@ -351,7 +447,7 @@ test.each([
   await rhodium.start();
   await rhodium.slots("a");
   await rhodium.im.inject("b", { chat: ME, sender: ME, text: "hi" });
-  const [post] = await lastShows(reply, "b");
+  const post = (await lastShows(reply, "b")).at(-1);
   expect(post).toMatchObject({ kind: "send", text: reply, markdown: md });
 }, 30_000);
 
@@ -364,16 +460,18 @@ test("story 158: a QQ bot and a Telegram bot, both enabled, each take your messa
   const q = await rhodium.im.inject("q", { chat: ME, sender: ME, text: "hello from QQ" });
   await say("hello from Telegram");
   expect(await lastShows("fake reply", "q")).toMatchObject([{ kind: "send", text: "fake reply", replyTo: q.messageId }]);
-  expect(await lastShows("fake reply", "t")).toMatchObject([{ kind: "send", text: "fake reply" }]);
+  await lastShows("fake reply", "t");
+  expect(await rhodium.im.shown("t", ME)).toMatchObject([{ kind: "send", text: "fake reply" }]);
 }, 30_000);
 
 /** 45 lines of 99 characters, 4,499 characters in all: over Telegram's 4,096. */
 const LONG = Array.from({ length: 45 }, (_, i) => String(i % 10).repeat(99)).join("\n");
 
-/** What each message the bot sent shows in the end, in the order they were sent. */
+/** What each message the bot sent shows in the end, in the order they were sent: a draft what the
+ *  message sent for it shows, if any. */
 function messages(posts: Posted[]): string[] {
   const last = new Map<string, string>();
-  for (const p of posts) if (p.kind === "send" || p.kind === "edit") last.set(p.messageId, p.text);
+  for (const p of posts) if (p.kind === "send" || p.kind === "edit" || p.kind === "draft") last.set(p.ends ?? p.messageId, p.text);
   return [...last.values()];
 }
 
@@ -391,7 +489,7 @@ test("story 72: a turn outgrowing its message goes on in a new one, cut between 
 
 test("story 72: when the turn ends right after its text outgrew the message, and the edit cutting that message down is turned down, its text comes in a new message all the same", async () => {
   const steps: Step[] = [...startTurn, toolCall("toolu_read", "Read", { file_path: "notes.txt" }), { emit: [textDelta(LONG)] }, ...endTurn(LONG), { goto: 0 }];
-  await telegram({ claude: { script: { on, steps } } });
+  await telegram({ claude: { script: { on, steps } } }, { draftTtl: "0" });
   await rhodium.im.next("t", "fail", "edit");
   await say("write a lot");
   const want = ["[🔧 Read] notes.txt，正在运行", LONG.slice(0, 3999), LONG.slice(4000), "[🔧 Read] notes.txt"];

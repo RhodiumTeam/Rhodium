@@ -160,6 +160,9 @@ function parseLine(line: string): Record<string, unknown> {
 export { withoutSource } from "../src/prompt";
 
 /** Polls check every 20 ms until it holds; fails after timeoutMs (under bun test's 5 s default). */
+/** Whether every QQ stream (#797) in a chat's log has closed: what each shows is all it will. */
+export const settled = (log: { frames?: string[]; final?: true }[]) => log.every((p) => !p.frames || p.final);
+
 export async function until(check: () => boolean | Promise<boolean>, timeoutMs = 4_000): Promise<void> {
   const end = Date.now() + timeoutMs;
   while (!(await check())) {

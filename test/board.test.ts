@@ -233,6 +233,28 @@ function picture(w: number, h: number, noisy: number, as: "png" | "jpeg"): Promi
 }
 const sha = (data: Uint8Array | string) => new Bun.CryptoHasher("sha256").update(data).digest("hex");
 
+test("stories 687, 688: /api/upload keeps each file under media by its content with the extension its name had, and answers their paths, sending nothing; from the board's own page alone, with your login, at most 20MB", async () => {
+  await withWeb(async (at, _web, _store, dir) => {
+    const upload = (headers: Record<string, string>, files: File[] | string = [new File(["png"], "a.png")], method = "POST") => {
+      const form = new FormData();
+      if (typeof files !== "string") for (const f of files) form.append("file", f);
+      return fetch(`${at}/api/upload`, { method, headers: { "Tailscale-User-Login": BOARD_LOGIN, ...headers }, ...(method === "GET" ? {} : { body: typeof files === "string" ? files : form }) });
+    };
+    const same = { "sec-fetch-site": "same-origin" };
+    const r = await (await upload(same, [new File(["png"], "屏幕 截图.PNG", { type: "image/png" }), new File(["%PDF"], "notes.pdf"), new File(["x"], "Makefile"), new File(["y"], "odd.a b")])).json();
+    const media = join(dir, "state/media");
+    expect(r).toEqual({ ok: true, text: "", paths: [`${media}/${sha("png")}.PNG`, `${media}/${sha("%PDF")}.pdf`, `${media}/${sha("x")}`, `${media}/${sha("y")}`] });
+    expect(r.paths.map((p: string) => readFileSync(p, "utf8"))).toEqual(["png", "%PDF", "x", "y"]);
+    for (const site of ["same-site", "cross-site", "none"]) expect([site, (await upload({ "sec-fetch-site": site })).status]).toEqual([site, 403]);
+    expect((await upload({})).status).toBe(403);
+    expect((await fetch(`${at}/api/upload`, { method: "POST", headers: same, body: new FormData() })).status).toBe(403);
+    expect((await upload(same, [], "GET")).status).toBe(405);
+    expect((await upload(same, [])).status).toBe(400);
+    expect((await upload({ ...same, "content-type": "text/plain" }, "hi")).status).toBe(400);
+    expect((await upload(same, [new File([new Uint8Array(20 << 20)], "big.bin")])).status).toBe(413);
+  });
+});
+
 test("stories 564-566, spec web-images 安全: /api/media gives a kept file by its hash alone, to the board's own page alone; only a picture, by its first bytes, as one, anything else as a download; a preview and a viewing copy, each made once, never enlarged; 404 once it is gone", async () => {
   await withWeb(async (at, _web, _store, dir) => {
     const media = join(dir, "state/media");
@@ -1392,7 +1414,7 @@ describe("the import list (architecture §7.10)", () => {
     expect(((await (await get(`/api/folder?path=${encodeURIComponent("~/proj/sub/none")}`, BOARD_LOGIN, own, undefined, at)).json()) as object)).toEqual({});
   });
 
-  test("story 641: the agent's panes in Herdr that report a conversation in the folder come first on the first page, once; another folder's are not listed", async () => {
+  test("story 641: the agent's panes in Herdr that report a conversation in the folder come first on the first page, once; another folder's are not listed; a search in every folder lists each it finds as its pane", async () => {
     const herdr = async (method: string, params: object = {}) => (await call(inst.herdr.socket, method, params)).result;
     const ids = (await page("agent=claude&dir=~/proj")).list.map((c) => c.session);
     const mine = await herdr("workspace.create", { cwd: join(inst.home, "proj"), label: "mine" });
@@ -1407,6 +1429,29 @@ describe("the import list (architecture §7.10)", () => {
     // A search lists the pane only if it finds it.
     expect((await page("agent=claude&dir=~/proj&q=said 7")).list).toEqual([expect.objectContaining({ pane: mine.root_pane.pane_id })]);
     expect((await page("agent=claude&dir=~/proj&q=said 8")).list.map((c) => c.pane)).toEqual([undefined]);
+    // A search in every folder lists it as the pane too, once: imported from disk, it would be refused.
+    expect((await page("agent=claude&q=said 7")).list).toEqual([expect.objectContaining({ session: ids[3], pane: mine.root_pane.pane_id, dir: "~/proj" })]);
+  });
+
+  test("#811: pi's panes come first too, by the id in the session file they report", async () => {
+    const herdr = async (method: string, params: object = {}) => (await call(inst.herdr.socket, method, params)).result;
+    const dir = join(inst.home, `.pi/agent/sessions/--${join(inst.home, "proj").slice(1).replace(/\//g, "-")}--`);
+    const id = "0199f000-0000-7000-8000-000000000002";
+    const file = join(dir, `2026-01-01T00-00-01-000Z_${id}.jsonl`);
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(join(inst.home, "proj"), { recursive: true });
+    writeFileSync(file, JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "pi in a pane" }] } }) + "\n");
+    const mine = await herdr("workspace.create", { cwd: join(inst.home, "proj"), label: "pi" });
+    await herdr("pane.report_agent_session", { pane_id: mine.root_pane.pane_id, source: "herdr:pi", agent: "pi", agent_session_path: file });
+    const list = (await page("agent=pi&dir=~/proj")).list;
+    expect(list[0]).toMatchObject({ session: id, pane: mine.root_pane.pane_id, title: "pi in a pane" });
+    expect(list.filter((c) => c.session === id)).toHaveLength(1);
+    await herdr("tab.close", { tab_id: mine.tab.tab_id });
+    // pi resumes another folder's session where it runs: a search in every folder still finds it, as the pane.
+    const far = await herdr("workspace.create", { cwd: join(inst.home, "other"), label: "pi far" });
+    await herdr("pane.report_agent_session", { pane_id: far.root_pane.pane_id, source: "herdr:pi", agent: "pi", agent_session_path: file });
+    expect((await page("agent=pi&q=in a pane")).list).toEqual([expect.objectContaining({ session: id, pane: far.root_pane.pane_id })]);
+    await herdr("tab.close", { tab_id: far.tab.tab_id });
   });
 
   test("story 648: a search whose page goes away midway stops scanning", async () => {

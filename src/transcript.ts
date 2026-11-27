@@ -1,9 +1,9 @@
 // Transcript reader: pages through an agent's own transcript file (Claude's, pi's or
 // Codex's, one JSON object per line) by byte offset, never loading the whole file, and
 // lists the conversations a directory has. Read-only: Rhodium never writes these files.
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import fs, { readFileSync, statSync } from "node:fs";
 import { open, readdir, stat, type FileHandle } from "node:fs/promises";
-import { homedir } from "node:os";
+import { insideDirectory, localCandidate, localDrivePath, sameDirectory, userHome } from "./paths";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { plain, quoteOf, type AgentKind, type Used } from "./contracts";
@@ -226,6 +226,7 @@ export type LocalImage = Media | { why: string } | { pending: true } | { gone: t
 /** What an agent's message refers to on this machine, by path as decoded (src/local.ts): each picture's
  *  check, and whether each link gives a file to download, is a code reference, or neither. */
 export type Local = { images: Record<string, LocalImage>; links: Record<string, "file" | "code" | "none"> };
+
 type Body =
   /** id: what the agent's record names it by, where that is what Rhodium sent it as: Claude's uuid
    *  (frameUuid of its input's id), Codex's client_id (its input's id). media: what it carried, in
@@ -397,9 +398,11 @@ const VIEWED_MAX = 50 * 2 ** 20;
  *  four pictures by its first bytes. None for any other, whose path alone the page shows; throws for
  *  one gone. */
 function viewed(path: string, dir: string, media: string): Media[] {
-  const real = realpathSync(resolve(dir, path));
-  if (!real.startsWith(join(realpathSync(dir), "/"))) return [];
-  const s = statSync(real);
+  const candidate = localCandidate(dir, path);
+  if (!candidate || !localCandidate(dir, dir)) return [];
+  const real = fs.realpathSync(candidate);
+  if (!insideDirectory(fs.realpathSync(dir), real)) return [];
+  const s = fs.statSync(real);
   if (!s.isFile() || s.size > VIEWED_MAX) return [];
   const data = readFileSync(real);
   return pictureType(data) ? [{ kind: "image", hash: basename(saveMedia(media, data)), name: basename(real) }] : [];
@@ -407,33 +410,42 @@ function viewed(path: string, dir: string, media: string): Media[] {
 
 /** The tools that run a shell command: Claude's, pi's and Codex's. */
 const SHELLS = new Set(["Bash", "bash", "exec_command"]);
-/** A slot's id, which rh send takes for a slot as it does w/name. */
-const SLOT_ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
 /** The first rh send to you in a shell command (spec web-images "消息块里的图和 rh send 的话"): the word
  *  after send, me, a platform's or a bot's name, and not a slot's, with a / or its id; its --file paths
  *  as written; and its text, its other words, read as the shell would, quoted or not, a here-document
  *  in $(cat <<EOF …) as one. null for a command with none. */
-// ponytail: no $VAR nor $(…) but that one is expanded, and only the first rh send is read; parse the
-// shell fully if agents write them otherwise.
+// ponytail: no $VAR nor $(…) but that one is expanded; only the first rh send to you is read. Parse the shell
+// fully if agents write them otherwise.
 export function sendOf(command: string): Omit<Send, "media"> | null {
+  const docs: string[] = [];
   const flat = command
     .replace(/("?)\$\(cat\s*<<-?\s*(['"]?)(\w+)\2[ \t]*\n([\s\S]*?)\n[ \t]*\3[ \t]*\n?\s*\)\1/g, (...m) => `'${m[4].replaceAll("'", "'\\''")}'`)
     // Any other here-document is what a command reads, not commands: gone, the rest of its line kept.
-    .replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, "$3");
+    .replace(/<<(-?)[ \t]*(['"]?)(\w+)\2([^\n]*)\n([\s\S]*?)^\t*\3[ \t]*(?=\n|$)/gm, (_, strip, _quote, _end, tail, body: string) => {
+      docs.push((strip ? body.replace(/^\t+/gm, "") : body).replace(/\n$/, ""));
+      return ` <DOC${docs.length - 1} ${tail}`;
+    });
   const words = shellWords(flat);
   for (let i = 0; i + 2 < words.length; i++) {
     const [rh, send, to] = words.slice(i, i + 3);
     if (!(rh === "rh" || rh?.endsWith("/rh")) || send !== "send") continue;
     // A command's own words, not another's, as echo's.
     if (i > 0 && words[i - 1] !== null && !["then", "do", "else", "!", "{"].includes(words[i - 1]!)) continue;
-    if (!to || to.includes("/") || SLOT_ID.test(to)) return null;
+    if (!to) continue;
+    const slot = to.includes("/") || /^[0-9A-HJKMNP-TV-Z]{26}$/.test(to);
     const files: string[] = [];
     let j = i + 3;
-    for (; words[j] === "--file" && words[j + 1]; j += 2) files.push(words[j + 1]!);
+    for (; !slot && words[j] === "--file" && words[j + 1]; j += 2) files.push(words[j + 1]!);
     const rest: string[] = [];
     for (; words[j] !== undefined && words[j] !== null; j++) rest.push(words[j]!);
-    return { to, text: rest.join(" "), files };
+    if (slot) {
+      i = j;
+      continue;
+    }
+    const doc = rest.length === 1 && rest[0] === "-" && /^DOC(\d+)$/.exec(words[j + 1] ?? "");
+    const text = rest.length === 1 && rest[0] === "-" ? (doc && docs[Number(doc[1])]) || "" : rest.join(" ");
+    return { to, text, files };
   }
   return null;
 }
@@ -753,13 +765,11 @@ type Format = {
   settings: (file: string, since: number, side: "after" | "before") => Promise<Used>;
 };
 
-// Read HOME on every call (os.homedir() caches it) so tests can point it elsewhere.
-const userHome = () => process.env.HOME || homedir();
 const codexHome = (home: string) => process.env.CODEX_HOME || join(home, ".codex");
 
 const FORMATS: Record<AgentKind, Format> = {
   claude: {
-    root: (home) => join(home, ".claude/projects"),
+    root: (home) => process.platform === "win32" && process.env.CLAUDE_CONFIG_DIR ? join(process.env.CLAUDE_CONFIG_DIR, "projects") : join(home, ".claude/projects"),
     folder: (dir) => claudeProjectDir(dir),
     idOf: (file) => basename(file, ".jsonl"),
     glob: (prefix) => `*/${prefix}*.jsonl`,
@@ -833,12 +843,12 @@ function gone(e: any): undefined {
 // ponytail: reads the first line of each of Codex's files at each look; keep them by mtime if that gets slow.
 async function startedThere(dir: string, agent: AgentKind): Promise<string[]> {
   const f = FORMATS[agent];
-  if (f.folder) return jsonlFiles(join(f.root(userHome()), f.folder(dir)));
+  if (f.folder) return jsonlFiles(sessionsDir(dir, agent));
   const heads = await Promise.all(
     (await globbed(agent, "")).map(async (file) => {
       const [first] = (await readPage(file, 0, 1, "forward").catch(gone))?.entries ?? [];
       const head = first && parseObject(first.raw);
-      return head?.type === "session" && head.cwd === dir && !head.subagent ? file : undefined;
+      return head?.type === "session" && typeof head.cwd === "string" && sameDirectory(head.cwd, dir) && !head.subagent ? file : undefined;
     }),
   );
   return heads.filter((h) => h !== undefined);
@@ -894,7 +904,7 @@ export async function startedIn(file: string): Promise<string | null> {
 
 /** Where the agent keeps the transcripts of conversations started in the (absolute) dir: Codex, all of them in one. */
 export function sessionsDir(dir: string, agent: AgentKind): string {
-  return join(FORMATS[agent].root(userHome()), FORMATS[agent].folder?.(dir) ?? "");
+  return join(FORMATS[agent].root(userHome()), FORMATS[agent].folder?.(process.platform === "win32" ? localDrivePath(dir) : dir) ?? "");
 }
 
 export type Message = { role: "user" | "assistant"; text: string };

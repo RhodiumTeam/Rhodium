@@ -7,12 +7,16 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { headlessEnv } from "./agents";
-import { ClaudeDriver, refuseBare } from "./claude";
+import { ClaudeDriver } from "./claude";
 import { CodexDriver, codexModelNames } from "./codex";
 import { entryName, formatGB, formatMB, hasHerdr, locate, type BoardEntry, type Config } from "./config";
 import { log } from "./daemon";
 import { request, sessionSocket } from "./herdr";
 import { daily, freeDisk } from "./ops";
+import { doctorBare } from "./pi-pane-credentials";
+import { detached, holderExecutable } from "./detached";
+import { nativeHolders } from "./native-holders";
+import { sameDirectory } from "./paths";
 import { activeHolders, agentBaseEnv } from "./runner";
 import { modelNames, setMeta, setModelNames, type Store } from "./store";
 
@@ -113,10 +117,10 @@ const HANDSHAKE = [
  * get_context_usage, which use no quota (probe 2), then closes it. Returns the answers' key paths,
  * whether the process runs with --bare, and how it is logged in (login).
  */
-async function handshake(cfg: Config): Promise<{ fields: string[]; bare: boolean; login: string | null; models: unknown }> {
+async function handshake(cfg: Config): Promise<{ fields: string[]; bare: boolean | null; login: string | null; models: unknown }> {
   const spec = new ClaudeDriver({ conv: "doctor", boot: 0, emit: () => {} }).spawn({ ...launch(cfg), approval: cfg.defaults.approval, program: cfg.programs.claude });
   // No session file: a check a day would leave an empty one in ~/.claude/projects each time.
-  const proc = Bun.spawn([...spec.argv, "--no-session-persistence"], { cwd: spec.cwd, env: spec.env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+  const proc = Bun.spawn([...spec.argv, "--no-session-persistence"], { windowsHide: true, cwd: spec.cwd, env: spec.env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
   const answers: Record<string, any>[] = [];
   const ask = () => {
     const [subtype, fields] = HANDSHAKE[answers.length]!;
@@ -143,19 +147,7 @@ async function handshake(cfg: Config): Promise<{ fields: string[]; bare: boolean
     }
     const failed = answers.find((a) => a.subtype !== "success");
     if (failed) throw new Error(`${HANDSHAKE[answers.indexOf(failed)]![0]} 应答出错：${failed.error}`);
-    // What the process really got, a wrapper's additions included.
-    const argv = readFileSync(`/proc/${proc.pid}/cmdline`, "utf8").split("\0");
-    const env = Object.fromEntries(
-      readFileSync(`/proc/${proc.pid}/environ`, "utf8")
-        .split("\0")
-        .map((kv) => [kv.slice(0, kv.indexOf("=")), kv.slice(kv.indexOf("=") + 1)]),
-    );
-    let bare = false;
-    try {
-      refuseBare({ argv, env, cwd: "" });
-    } catch {
-      bare = true;
-    }
+    const bare = doctorBare(proc.pid);
     const fields = new Set<string>();
     answers.forEach((a, i) => fieldsOf(a, HANDSHAKE[i]![0], fields));
     return { fields: [...fields].sort(), bare, login: login(answers[0]!.response?.account), models: answers[0]!.response?.models };
@@ -215,7 +207,7 @@ class CodexAnswer extends Error {}
 async function askCodex(cfg: Config) {
   const spec = new CodexDriver({ conv: "doctor", boot: 0, emit: () => {} }).spawn({ ...launch(cfg), approval: false, program: cfg.programs.codex });
   const { cwd } = spec;
-  const proc = Bun.spawn(spec.argv, { cwd, env: spec.env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+  const proc = Bun.spawn(spec.argv, { windowsHide: true, cwd, env: spec.env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
   const waiting = new Map<number, (m: any) => void>();
   const reading = (async () => {
     for await (const m of jsonLines(proc.stdout)) if (m?.method === undefined) waiting.get(m?.id)?.(m);
@@ -277,7 +269,7 @@ function codexLogin(account: Record<string, any> | null, config: Record<string, 
  *  them, as going back fixes none; a failed handshake (initialize refused, no answer, codex gone) it
  *  does go back on, as the new version may have launched Codex wrong. */
 async function checkCodex(cfg: Config, store: Store, codex: string, info: string[], error: (text: string) => void, warn: (text: string) => void) {
-  const said = Bun.spawn([codex, "--version"], { env: headlessEnv("codex", agentBaseEnv(cfg)), stdout: "pipe", stderr: "ignore", timeout: 10_000 });
+  const said = Bun.spawn([codex, "--version"], { windowsHide: true, env: headlessEnv("codex", agentBaseEnv(cfg)), stdout: "pipe", stderr: "ignore", timeout: 10_000 });
   const version = (await new Response(said.stdout).text()).trim().split(/\s+/).at(-1) || null; // codex-cli 0.162.1
   const last = store.tx((tx) => tx.get("meta", CODEX_META))?.value ?? null;
   const changed = version !== last;
@@ -338,7 +330,8 @@ const HERDR_PROTOCOL = 22;
 /** Herdr's resume_agents_on_restore, from its config file; unset, its default, on in 0.9.1.
  *  ponytail: the file rhodium's own HERDR_CONFIG_PATH names; Herdr's server may run with another. */
 function herdrResumes(): boolean {
-  const file = process.env.HERDR_CONFIG_PATH || join(homedir(), ".config/herdr/config.toml");
+  const dir = (process.platform !== "linux" && process.env.XDG_CONFIG_HOME) || (process.platform === "win32" ? process.env.APPDATA || join(homedir(), "AppData", "Roaming") : join(homedir(), ".config"));
+  const file = process.env.HERDR_CONFIG_PATH || join(dir, "herdr", "config.toml");
   try {
     return (Bun.TOML.parse(readFileSync(file, "utf8")) as any).session?.resume_agents_on_restore ?? true;
   } catch {
@@ -423,7 +416,8 @@ async function check(cfg: Config, store: Store, deaf: ReadonlyMap<string, string
         const h = await handshake(cfg);
         // The latest list of models, for /status to name a remembered one by (store's MODEL_NAMES).
         if (Array.isArray(h.models)) setModelNames(store, h.models);
-        if (h.bare) error("claude 的启动参数或环境里有 --bare（CLAUDE_CODE_SIMPLE），它会跳过订阅登录");
+        if (h.bare === null) warn("无法核实 claude 进程是否带有 --bare 或 CLAUDE_CODE_SIMPLE");
+        else if (h.bare) error("claude 的启动参数或环境里有 --bare（CLAUDE_CODE_SIMPLE），它会跳过订阅登录");
         if (h.login) info.push(`Claude 登录：${h.login}`);
         else
           error(
@@ -469,13 +463,21 @@ async function check(cfg: Config, store: Store, deaf: ReadonlyMap<string, string
   const ref = (conversation: string) => refs.get(conversation) ?? conversation;
 
   // Holders: the store and systemd agree (§5), and which still run an older rh-hold (§4.7).
-  const units = await activeHolders(cfg);
+  const native = detached ? new Map((await nativeHolders(cfg)).map(h => [cfg.unitPrefix + "hold-" + h.conversation, h.exe])) : null;
+  const units = native ? new Set(native.keys()) : await activeHolders(cfg, holders);
   const known = new Set(holders.map((h) => h.unit));
   for (const u of units) if (!known.has(u)) warn(`systemd 里有、库里没有的托管进程：${u}`);
-  const holdBin = cfg.holdBin || join(dirname(process.execPath), "rh-hold");
+  const holdBin = holderExecutable(cfg.holdBin);
+  let currentBin = holdBin;
+  if (native) try { currentBin = realpathSync(holdBin); } catch { /* An absent current binary does not hide older holders. */ }
   for (const h of holders) {
     if (!units.has(h.unit)) {
       error(`库里有、systemd 里没有的托管进程：${ref(h.conversation)}（${h.unit}）`);
+      continue;
+    }
+    if (native) {
+      const path = native.get(h.unit)!;
+      if (!sameDirectory(path, currentBin)) warn(`还在跑旧版的托管进程：${ref(h.conversation)}（${path}）`);
       continue;
     }
     const show = Bun.spawn(["systemctl", "--user", "show", "--property=ExecStart", "--value", `${h.unit}.service`], { stdout: "pipe" });

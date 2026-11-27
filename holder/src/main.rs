@@ -1,19 +1,34 @@
 // rh-hold: the holder, one per headless conversation (docs/architecture.md §4).
 // Standard library only. It never decodes agent output: it splits on byte 0x0A and
 // nothing else, appends to out.log first, and forwards whole lines from there.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use std::collections::VecDeque;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::DirBuilder;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
+#[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{SocketAddr, UnixDatagram};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+mod windows;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio, exit};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use windows::Stream as UnixStream;
 
 const PROTO: f64 = 1.0;
 const KEEP_WRITTEN: usize = 64; // write ids in hello_ok (§4.6)
@@ -23,12 +38,14 @@ const MAX_DEPTH: usize = 32; // JSON nesting; a deeper line is a bad line (§4.4
 // After the agent exits: for its last output, then for rhodium to get it (§4.5).
 const DRAIN: Duration = Duration::from_secs(2);
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
 struct Holder {
     dir: PathBuf,
+    #[cfg(unix)]
     sock: String,
     lock: String,
     out: File, // out.log, read and append
@@ -86,8 +103,28 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[1..] {
+        #[cfg(windows)]
+        ["--version"] => Ok(println!(
+            "{}-windows-preview-{}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("RHODIUM_BUILD_COMMIT").unwrap_or("local")
+        )),
+        #[cfg(target_os = "macos")]
+        ["--version"] => Ok(println!(
+            "{}-macos-preview-{}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("RHODIUM_BUILD_COMMIT").unwrap_or("local")
+        )),
+        #[cfg(not(any(windows, target_os = "macos")))]
         ["--version"] => Ok(println!("{}", env!("CARGO_PKG_VERSION"))),
         ["run", dir, sock, lock, start_ms] => run(dir, sock, lock, start_ms.parse().unwrap_or(10_000)),
+        #[cfg(windows)]
+        ["cli", name] => windows::serve_cli(name),
+        #[cfg(windows)]
+        ["task", "--config", config] => windows::run_task(config),
+        #[cfg(any(windows, target_os = "macos"))]
+        ["probe", lock] => lock_is_held(lock).map(|held| println!("{}", if held { "live" } else { "gone" })),
+        #[cfg(unix)]
         ["stop-post", dir] => stop_post(dir),
         _ => {
             eprintln!("usage: rh-hold --version | run <dir> <sock> <lock> <start-timeout-ms> | stop-post <dir>");
@@ -106,16 +143,32 @@ fn die(e: impl std::fmt::Display) -> ! {
 
 fn run(dir: &str, sock: &str, lock: &str, start_ms: u64) -> io::Result<()> {
     let dir = PathBuf::from(dir);
+    #[cfg(windows)]
+    let (_tree, _instance) = {
+        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(parent(lock))?;
+        (windows::own_tree()?, take_lock(dir.join("live.lock"))?)
+    };
+    #[cfg(unix)]
     for d in [&dir, parent(sock), parent(lock)] {
         DirBuilder::new().recursive(true).mode(0o700).create(d)?;
     }
+    #[cfg(target_os = "macos")]
+    let _instance = {
+        let lock = take_lock(dir.join("live.lock"))?;
+        clear_confirmed_marker(&dir)?;
+        if dir.join("agent.started").exists() && !dir.join("exit").exists() {
+            return Err(io::Error::other("previous agent exit is unconfirmed"));
+        }
+        lock
+    };
     // A fresh holder for this conversation: the last one's exit no longer applies.
     let _ = fs::remove_file(dir.join("exit"));
     let out = open(&dir.join("out.log"), true)?;
     let mut size = out.metadata()?.len();
     let mut last = [b'\n'];
     if size > 0 {
-        out.read_exact_at(&mut last, size - 1)?;
+        read_at(&dir, &out, &mut last, size - 1)?;
     }
     if last[0] != b'\n' {
         // ponytail: a line the previous agent left unfinished is ended here, so it cannot
@@ -124,13 +177,19 @@ fn run(dir: &str, sock: &str, lock: &str, start_ms: u64) -> io::Result<()> {
         size += 1;
     }
     let log = open(&dir.join("in.log"), false)?;
+    #[cfg(windows)]
+    let mut listener = windows::Listener::bind(sock)?;
+    #[cfg(unix)]
     let _ = fs::remove_file(sock);
+    #[cfg(unix)]
     let listener = UnixListener::bind(sock)?;
+    #[cfg(unix)]
     fs::set_permissions(sock, fs::Permissions::from_mode(0o600))?;
 
     let state = State { size, lines_end: size, ..Default::default() };
     let h: &'static Holder = Box::leak(Box::new(Holder {
         dir,
+        #[cfg(unix)]
         sock: sock.into(),
         lock: lock.into(),
         out,
@@ -138,16 +197,22 @@ fn run(dir: &str, sock: &str, lock: &str, start_ms: u64) -> io::Result<()> {
         cv: Condvar::new(),
         input: Mutex::new(Input { stdin: None, log }),
     }));
+    #[cfg(target_os = "linux")]
     notify_ready();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(start_ms));
         let st = h.st();
         if !st.started {
+            #[cfg(unix)]
             let _ = fs::remove_file(&h.sock);
             exit(0);
         }
     });
-    for stream in listener.incoming() {
+    #[cfg(windows)]
+    let incoming = std::iter::from_fn(|| Some(listener.accept()));
+    #[cfg(unix)]
+    let incoming = listener.incoming();
+    for stream in incoming {
         match stream {
             Ok(s) => drop(thread::spawn(move || serve(h, s))),
             Err(e) => eprintln!("rh-hold: accept: {e}"),
@@ -162,10 +227,14 @@ fn parent(p: &str) -> &Path {
 
 /// Opens a file for appending, created 0600; `read` also lets it be read at an offset.
 fn open(path: &Path, read: bool) -> io::Result<File> {
-    OpenOptions::new().read(read).append(true).create(true).mode(0o600).open(path)
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.read(read).append(true).create(true).open(path)
 }
 
 /// Tells systemd (Type=notify) the socket is listening, so systemd-run can return.
+#[cfg(target_os = "linux")]
 fn notify_ready() {
     let Ok(addr) = std::env::var("NOTIFY_SOCKET") else { return };
     let sent = UnixDatagram::unbound().and_then(|s| match addr.strip_prefix('@') {
@@ -179,6 +248,10 @@ fn notify_ready() {
 
 /// One connection: hello first, then requests until it closes or breaks the protocol.
 fn serve(h: &'static Holder, stream: UnixStream) {
+    #[cfg(windows)]
+    if stream.greet().is_err() {
+        return;
+    }
     let Ok(w) = stream.try_clone() else { return };
     let conn = Arc::new(Conn { stream: w, w: Mutex::new(()) });
     let mut lines = BufReader::new(stream).split(b'\n');
@@ -246,7 +319,7 @@ fn handle(h: &'static Holder, conn: &Conn, m: &J) -> Result<(), ()> {
             Ok(input.stdin = None)
         }
         "signal" => {
-            let sig = match m.s("sig") {
+            let _sig = match m.s("sig") {
                 Some("TERM") => 15,
                 Some("KILL") => 9,
                 _ => return Err(()),
@@ -257,7 +330,12 @@ fn handle(h: &'static Holder, conn: &Conn, m: &J) -> Result<(), ()> {
             }
             if let (Some(pid), None) = (st.pid, &st.exit) {
                 // The agent leads its own process group, so this reaches what it started too.
-                unsafe { kill(-(pid as i32), sig) };
+                #[cfg(windows)]
+                windows::terminate(pid).map_err(|_| ())?;
+                #[cfg(unix)]
+                unsafe {
+                    kill(-(pid as i32), _sig)
+                };
             }
             Ok(())
         }
@@ -282,12 +360,19 @@ fn start(h: &'static Holder, conn: &Conn, m: &J) -> Result<(), ()> {
     }
     st.started = true;
     let spawned = take_lock(&h.lock).and_then(|lock| {
-        let child = Command::new(argv[0])
+        let mut command = Command::new(argv[0]);
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(target_os = "macos")]
+        mac_marker::before_exec(&mut command, &h.dir)?;
+        // Give console descendants (e.g. an npm .cmd shim and Node) a windowless console to inherit.
+        #[cfg(windows)]
+        command.creation_flags(windows::CREATE_NO_WINDOW);
+        let child = command
             .args(&argv[1..])
             .env_clear()
             .envs(env)
             .current_dir(cwd)
-            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -336,6 +421,9 @@ fn start(h: &'static Holder, conn: &Conn, m: &J) -> Result<(), ()> {
             let _ = done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         }
         match status {
+            #[cfg(windows)]
+            Ok(s) => finish(h, s.code(), None),
+            #[cfg(unix)]
             Ok(s) => finish(h, s.code(), s.signal().map(sig_name).as_deref()),
             Err(_) => finish(h, None, None),
         }
@@ -343,9 +431,124 @@ fn start(h: &'static Holder, conn: &Conn, m: &J) -> Result<(), ()> {
     Ok(())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn lock_is_held(path: &str) -> io::Result<bool> {
+    let f = File::options().write(true).create(true).truncate(false).open(path)?;
+    match f.try_lock() {
+        Ok(()) => {
+            #[cfg(target_os = "macos")]
+            clear_confirmed_marker(parent(path))?;
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn boot_token() -> Option<String> {
+    let out = Command::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]).output().ok()?;
+    let token = std::str::from_utf8(&out.stdout).ok()?.trim();
+    (out.status.success() && valid_boot_token(token)).then(|| token.to_ascii_lowercase())
+}
+
+#[cfg(target_os = "macos")]
+fn valid_boot_token(token: &str) -> bool {
+    token.len() == 36
+        && token.bytes().enumerate().all(
+            |(i, b)| {
+                if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
+            },
+        )
+}
+
+#[cfg(target_os = "macos")]
+mod mac_marker {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, data: *mut u8, size: i32) -> i32;
+        fn rename(old: *const i8, new: *const i8) -> i32;
+        fn getpid() -> i32;
+    }
+
+    fn identity(pid: i32) -> io::Result<(u64, bool)> {
+        let mut b = [0u8; 136]; // struct proc_bsdinfo; PROC_PIDTBSDINFO
+        if unsafe { proc_pidinfo(pid, 3, 0, b.as_mut_ptr(), b.len() as i32) } != b.len() as i32 {
+            return Err(io::Error::last_os_error());
+        }
+        let sec = u64::from_ne_bytes(b[120..128].try_into().unwrap());
+        let us = u64::from_ne_bytes(b[128..136].try_into().unwrap());
+        Ok((sec * 1_000_000 + us, u32::from_ne_bytes(b[4..8].try_into().unwrap()) == 5))
+    }
+
+    pub(super) fn gone(marker: &[u8]) -> bool {
+        if marker.len() != 16 || &marker[..4] != b"PID1" {
+            return false;
+        }
+        let pid = i32::from_le_bytes(marker[4..8].try_into().unwrap());
+        if pid <= 1 {
+            return false;
+        }
+        let start = u64::from_le_bytes(marker[8..16].try_into().unwrap());
+        match identity(pid) {
+            Ok((now, zombie)) => now != start || zombie,
+            Err(e) => e.raw_os_error() == Some(3), // ESRCH, never permission denied
+        }
+    }
+
+    pub(super) fn before_exec(cmd: &mut Command, dir: &Path) -> io::Result<()> {
+        let tmp = dir.join("agent.starting");
+        let mut file = File::create(&tmp)?;
+        let old = CString::new(tmp.as_os_str().as_bytes())?;
+        let new = CString::new(dir.join("agent.started").as_os_str().as_bytes())?;
+        // Publish from the child before it can write the conversation, even if its holder dies.
+        // Only syscalls and stack data between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let pid = getpid();
+                let (start, _) = identity(pid)?;
+                let mut marker = *b"PID1............";
+                marker[4..8].copy_from_slice(&pid.to_le_bytes());
+                marker[8..16].copy_from_slice(&start.to_le_bytes());
+                file.write_all(&marker)?;
+                if rename(old.as_ptr(), new.as_ptr()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+}
+
+// Called only while owning live.lock. No process from an earlier boot can still use the session.
+#[cfg(target_os = "macos")]
+fn clear_confirmed_marker(dir: &Path) -> io::Result<()> {
+    let marker = dir.join("agent.started");
+    let previous = match fs::read(&marker) {
+        Ok(data) => data,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let legacy = std::str::from_utf8(&previous).unwrap_or("");
+    if dir.join("exit").exists()
+        || mac_marker::gone(&previous)
+        || (valid_boot_token(legacy) && boot_token().is_some_and(|now| !legacy.eq_ignore_ascii_case(&now)))
+    {
+        fs::remove_file(marker)?;
+    }
+    Ok(())
+}
+
 /// The conversation lock (§4.3): held from start until the holder exits.
-fn take_lock(path: &str) -> io::Result<File> {
-    let f = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(path)?;
+fn take_lock(path: impl AsRef<Path>) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let f = opts.write(true).create(true).truncate(false).open(path)?;
     f.try_lock().map_err(|_| io::Error::other("the conversation lock is held by another process"))?;
     Ok(f)
 }
@@ -399,7 +602,7 @@ fn forward(h: &Holder, conn: Arc<Conn>, mut pos: u64) {
             (st.lines_end, st.exit.clone())
         };
         if end > pos {
-            let data = read_lines(&h.out, pos, end).unwrap_or_else(|e| die(format!("cannot read out.log: {e}")));
+            let data = read_lines(h, pos, end).unwrap_or_else(|e| die(format!("cannot read out.log: {e}")));
             let msg = format!("{{\"type\":\"out\",\"pos\":{pos},\"data\":\"{}\"}}\n", b64(&data));
             if conn.send(msg).is_err() {
                 return;
@@ -416,7 +619,7 @@ fn forward(h: &Holder, conn: Arc<Conn>, mut pos: u64) {
 
 /// Bytes from `pos` up to the last newline within CHUNK, or to the end of the first line
 /// if that is longer. `end` must follow a newline.
-fn read_lines(f: &File, pos: u64, end: u64) -> io::Result<Vec<u8>> {
+fn read_lines(h: &Holder, pos: u64, end: u64) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         let have = buf.len();
@@ -425,12 +628,25 @@ fn read_lines(f: &File, pos: u64, end: u64) -> io::Result<Vec<u8>> {
             return Ok(buf);
         }
         buf.resize(have + more, 0);
-        f.read_exact_at(&mut buf[have..], pos + have as u64)?;
+        read_at(&h.dir, &h.out, &mut buf[have..], pos + have as u64)?;
         if let Some(i) = buf[have..].iter().rposition(|&b| b == b'\n') {
             buf.truncate(have + i + 1);
             return Ok(buf);
         }
     }
+}
+
+#[cfg(unix)]
+fn read_at(_: &Path, file: &File, buf: &mut [u8], pos: u64) -> io::Result<()> {
+    file.read_exact_at(buf, pos)
+}
+
+#[cfg(windows)]
+fn read_at(dir: &Path, _: &File, buf: &mut [u8], pos: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut reader = File::open(dir.join("out.log"))?;
+    reader.seek(SeekFrom::Start(pos))?;
+    reader.read_exact(buf)
 }
 
 /// in.log first (§4.5: out.log's size, a space, the line), then the agent's stdin, then ack.
@@ -481,6 +697,10 @@ fn write_line(h: &Holder, conn: &Conn, id: &str, line: &str) -> Result<(), ()> {
 /// The agent is gone: write the exit file, let a connected rhodium get the rest, exit.
 fn finish(h: &Holder, code: Option<i32>, signal: Option<&str>) -> ! {
     let wrote = write_exit(&h.dir, "agent", code, signal);
+    #[cfg(target_os = "macos")]
+    if wrote.is_ok() {
+        let _ = fs::remove_file(h.dir.join("agent.started"));
+    }
     if let Err(e) = &wrote {
         eprintln!("rh-hold: cannot write exit: {e}");
     }
@@ -495,6 +715,7 @@ fn finish(h: &Holder, code: Option<i32>, signal: Option<&str>) -> ! {
         }
         st = h.cv.wait_timeout(st, left).unwrap().0;
     }
+    #[cfg(unix)]
     let _ = fs::remove_file(&h.sock);
     exit(if wrote.is_ok() { 0 } else { 1 })
 }
@@ -508,13 +729,18 @@ fn exit_fields(code: Option<i32>, signal: Option<&str>) -> String {
 /// The exit file (§4.3): one line of JSON, by the holder for its agent or by ExecStopPost.
 fn write_exit(dir: &Path, from: &str, code: Option<i32>, signal: Option<&str>) -> io::Result<()> {
     let tmp = dir.join("exit.tmp");
-    let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.write(true).create(true).truncate(true).open(&tmp)?;
     f.write_all(format!("{{\"from\":\"{from}\",{}}}\n", exit_fields(code, signal)).as_bytes())?;
+    drop(f);
     fs::rename(tmp, dir.join("exit"))
 }
 
 /// ExecStopPost: the unit is over. If the agent's exit was not written, the holder itself
 /// died; record its status, which systemd passes in EXIT_CODE and EXIT_STATUS.
+#[cfg(unix)]
 fn stop_post(dir: &str) -> io::Result<()> {
     let dir = Path::new(dir);
     if dir.join("exit").exists() {
@@ -530,7 +756,15 @@ fn stop_post(dir: &str) -> io::Result<()> {
 }
 
 /// Linux signal names as systemd writes them in EXIT_STATUS, so both exit writers agree.
+#[cfg(unix)]
 fn sig_name(n: i32) -> String {
+    #[cfg(target_os = "macos")]
+    const NAMES: [&str; 31] = [
+        "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "EMT", "FPE", "KILL", "BUS", "SEGV", "SYS", "PIPE", "ALRM",
+        "TERM", "URG", "STOP", "TSTP", "CONT", "CHLD", "TTIN", "TTOU", "IO", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH",
+        "INFO", "USR1", "USR2",
+    ];
+    #[cfg(not(target_os = "macos"))]
     const NAMES: [&str; 31] = [
         "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM",
         "TERM", "STKFLT", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF",

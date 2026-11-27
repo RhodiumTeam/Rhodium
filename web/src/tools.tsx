@@ -3,9 +3,9 @@
 // is on its own at the end. Each call is drawn with its kind's icon (#206), as T3 Code and Orca do.
 import { cjk } from "@streamdown/cjk";
 import { cn } from "cn";
-import { Bot, Brain, Check, ChevronRight, CircleX, FilePen, FileText, Globe, Image, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
+import { Bell, Bot, Brain, Check, ChevronRight, CircleX, FilePen, FileText, Globe, Image, ListChecks, MessageCircleQuestionMark, Plug, Search, Terminal, TextWrap, Wrench, type LucideIcon } from "lucide-react";
 import { createContext, Fragment, useContext, useEffect, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type MouseEvent } from "react";
-import { defaultComponents, Streamdown, type ExtraProps, type StreamdownProps } from "streamdown";
+import { defaultRemarkPlugins, defaultComponents, Streamdown, type ExtraProps, type StreamdownProps } from "streamdown";
 import type { FullData } from "../../src/board";
 import type { AgentKind } from "../../src/contracts";
 import { decoded, elsewhere, inPage, linkWords } from "../../src/local";
@@ -300,14 +300,13 @@ export function folded(blocks: Block[]): Shown[] {
       else shown.push({ kind: "fold", at: b.at, line: shortParts([]), kinds: [], steps: [b] });
     }
   }
-  for (const f of shown) {
-    if (f.kind !== "fold") continue;
-    // Its line and icons name the calls that are tool work; with none, what there is.
-    const work = f.steps.filter((s) => s.kind === "tool" && !NOT_TOOLS.has(s.shown.name));
-    const listed = work.length ? work : f.steps;
-    f.line = shortParts(listed.map((s) => (s.kind === "tool" ? { ...s.shown, failed: failed(s) } : THOUGHT)));
-    f.kinds = [...new Set(listed.map(kindOfStep))];
-  }
+  for (const f of shown)
+    if (f.kind === "fold") {
+      const work = f.steps.filter((s) => s.kind === "tool" && !NOT_TOOLS.has(s.shown.name));
+      const listed = work.length ? work : f.steps;
+      f.line = shortParts(listed.map((s) => (s.kind === "tool" ? { ...s.shown, failed: failed(s) } : THOUGHT)));
+      f.kinds = [...new Set(listed.map(kindOfStep))];
+    }
   return [...shown, ...running.map((tool) => ({ kind: "running" as const, at: tool.at, tool }))];
 }
 
@@ -379,7 +378,9 @@ export function Fold({ f, conversation }: { f: Extract<Shown, { kind: "fold" }>;
               <Icon key={k} kind={k} failed={bad.has(k)} className="ring-2 ring-background" />
             ))}
           </span>
-          <span className="min-w-0 flex-1">
+          <span className="relative min-w-0 flex-1">
+            <span className="absolute inset-x-0 hidden wrap-anywhere group-open/fold:block">{f.steps.length === 1 ? (f.steps[0]!.kind === "thinking" ? THOUGHT.name : f.steps[0]!.shown.name) : `${f.steps.length} 步`}</span>
+            <span className="group-open/fold:invisible">
             {f.line.runs.map((r, i) => (
               <Fragment key={i}>
                 {i > 0 && "、"}
@@ -391,48 +392,66 @@ export function Fold({ f, conversation }: { f: Extract<Shown, { kind: "fold" }>;
                 ，{part(`另外 ${f.line.more.n} 次`, f.line.more.n, f.line.more.failed, true)}
               </>
             )}
+            </span>
           </span>
           <ChevronRight className={cn(CHEVRON, "mt-[3px] group-open/fold:rotate-90")} />
         </summary>
         <ul className="mt-0.5 ml-2.5 border-l pl-3">
           {f.steps.map((s) => (
-              <li key={s.at}>
-                <details className="group/step">
-                  <summary className={ROW}>
-                    <Icon kind={kindOfStep(s)} failed={failed(s)} />
-                    <span className="min-w-0 flex-1 truncate">
-                      <Name s={s} strong />
-                    </span>
-                    {failed(s) && <Failed />}
-                    <ChevronRight className={cn(CHEVRON, "group-open/step:rotate-90")} />
-                  </summary>
-                  <div className="mb-2 ml-7 grid grid-cols-1 gap-1.5">
-                    {s.kind === "thinking" ? (
-                      <Clipped {...s} conversation={conversation} thought />
-                    ) : (
-                      <>
-                        <Clipped text={s.input} length={s.length} at={s.at} conversation={conversation} />
-                        {/* Its text, if it had any: an empty box says nothing (spec web-images); then the pictures it showed the agent (story 563). */}
-                        {!s.result ? <span>没有结果。</span> : !!s.result.text && <Clipped {...s.result} conversation={conversation} />}
-                        {s.result?.media && <Carried media={s.result.media} className="justify-items-start" />}
-                      </>
-                    )}
-                  </div>
-                </details>
-              </li>
+            <li key={s.at}>
+              <details className="group/step">
+                <summary className={ROW}>
+                  <Icon kind={kindOfStep(s)} failed={failed(s)} />
+                  <span className="min-w-0 flex-1 truncate">
+                    <Name s={s} strong />
+                  </span>
+                  {failed(s) && <Failed />}
+                  <ChevronRight className={cn(CHEVRON, "group-open/step:rotate-90")} />
+                </summary>
+                <div className="mb-2 ml-7 grid grid-cols-1 gap-1.5">
+                  {s.kind === "thinking" ? (
+                    <Clipped {...s} conversation={conversation} thought />
+                  ) : (
+                    <>
+                      <Clipped text={s.input} length={s.length} at={s.at} conversation={conversation} />
+                      {/* Its text, if it had any: an empty box says nothing (spec web-images); then the pictures it showed the agent (story 563). */}
+                      {!s.result ? <span>没有结果。</span> : !!s.result.text && <Clipped {...s.result} conversation={conversation} />}
+                      {s.result?.media && <Carried media={s.result.media} className="justify-items-start" />}
+                    </>
+                  )}
+                </div>
+              </details>
+            </li>
           ))}
         </ul>
       </details>
-      {sent.map((s) => (
-        <div key={s.at} className="ml-2.5 grid grid-cols-[minmax(0,1fr)] gap-2 border-l pl-3">
-          {s.text && (
-            <Streamdown mode="static" {...MARKDOWN}>
-              {s.text}
-            </Streamdown>
-          )}
-          {s.media && <Carried media={s.media} className="justify-items-start" />}
-        </div>
-      ))}
+      {sent.map((s) => <Sent key={s.at} send={s} />)}
+    </div>
+  );
+}
+
+// Only prose has text nodes with soft breaks. Code has its own node, including indented code.
+type MarkdownNode = { type: string; value?: string; children?: MarkdownNode[] };
+function sentBreaks(node: MarkdownNode): void {
+  if (!node.children || node.type === "code" || node.type === "inlineCode") return;
+  node.children = node.children.flatMap((child) => {
+    if (child.type === "text" && child.value?.includes("\n")) {
+      return child.value.split("\n").flatMap((value, i) => [...(i ? [{ type: "break" }] : []), { type: "text", value }]);
+    }
+    sentBreaks(child);
+    return [child];
+  });
+}
+const sentPlugins = [...Object.values(defaultRemarkPlugins), () => sentBreaks];
+
+export function Sent({ send }: { send: NonNullable<Tool["send"]> }) {
+  return (
+    <div className="flex min-w-0 items-start gap-2">
+      <Bell role="img" aria-label="发给你的" className="mt-1 size-4 shrink-0 text-muted-foreground" />
+      <div className="grid min-w-0 flex-1 grid-cols-1 gap-2 border-l pl-3">
+        {send.text && <Streamdown mode="static" {...MARKDOWN} remarkPlugins={sentPlugins}>{send.text}</Streamdown>}
+        {send.media && <Carried media={send.media} className="justify-items-start" />}
+      </div>
     </div>
   );
 }
@@ -443,13 +462,13 @@ function Name({ s, strong }: { s: Step; strong?: boolean }) {
   if (s.kind === "thinking")
     return (
       <>
-        思考<span className="ml-1.5">{s.text.replace(/[*_`#>]+/g, "").replace(/\s+/g, " ")}</span>
+        思考<span className="ml-1.5 group-open/step:hidden">{s.text.replace(/[*_`#>]+/g, "").replace(/\s+/g, " ")}</span>
       </>
     );
   return (
     <>
       <span className={cn(strong && "text-foreground/80")}>{s.shown.name}</span>
-      {s.shown.arg && <span className={s.shown.code ? "ml-1.5 font-mono text-xs" : "ml-1.5"}>{s.shown.arg}</span>}
+      {s.shown.arg && <span className={cn("ml-1.5 group-open/step:hidden", s.shown.code && "font-mono text-xs")}>{s.shown.arg}</span>}
     </>
   );
 }

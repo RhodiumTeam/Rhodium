@@ -11,8 +11,8 @@
 import type { Server, ServerWebSocket } from "bun";
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { displayDirectory as tilde, expandHome, parentDirectory, sameDirectory, userHome } from "./paths";
+import { dirname, extname, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { AGENT_KINDS, AGENTS, TYPING } from "./agents";
 import { askCard, askText, type AskCard, type AskPrompt } from "./asks";
@@ -32,13 +32,14 @@ import { AT_BOARD, askGone, contactOf, IN_TUI, resumeWaits, settingsOf, slotStat
 import { namesOf, type Ask, type Bot, type Chat, type Conversation, type Event, type Outbound, type Slot, type Store, type Tx } from "./store";
 import { PLATFORMS } from "./platforms";
 import { splitSource, withoutSource } from "./prompt";
+import { paneSession } from "./tui";
 import { codeRef } from "./local";
 import { checkLocal, localRefs, NEAR, readPicture, rowFor } from "./reply-images";
 import { conversationsIn, describe, findConversations, fullText, importable, lastSaid, listed, messagePage, meterIn, transcriptFile, yoursSaid, type Block as Read, type Hit, type Listed, type Local } from "./transcript";
 
 /** The page and its files as Vite built them: embedded in the built binary, and in web/dist when
  *  run from source. */
-const WEB = Bun.main.startsWith("/$bunfs/") ? join(import.meta.dir, "web") : join(import.meta.dir, "../web/dist");
+const WEB = (/^B:\/~BUN\/root\//i.test(Bun.main.replaceAll("\\", "/")) || Bun.main.startsWith("/$bunfs/")) ? join(import.meta.dir, "web") : join(import.meta.dir, "../web/dist");
 
 export type Group = "needsYou" | "running" | "done" | "idle";
 
@@ -72,6 +73,7 @@ export type BoardData = {
   workspaces: { name: string; dir: string; groups: Record<Group, Card[]>; archived: Card[] }[];
   bots: Pick<TopologyData["bots"][number], "id" | "name" | "platform" | "avatar">[];
   noHerdr?: true;
+  windowsPaths?: true;
 };
 
 /** How long a slot whose turn ended counts as done (product §7). */
@@ -161,6 +163,7 @@ async function board(store: Store, cfg: Config, now: number): Promise<BoardData>
   };
   return {
     ...(!hasHerdr(cfg) && { noHerdr: true }),
+    ...(process.platform === "win32" && { windowsPaths: true as const }),
     bots: await Promise.all(topo.bots.map(async ({ id, name, platform }) => ({ id, name, platform, avatar: await avatarOf(cfg, id) }))),
     workspaces: workspaces.sort(byName).map((w) => {
       const groups: Record<Group, Card[]> = { needsYou: [], running: [], done: [], idle: [] };
@@ -209,9 +212,9 @@ const DIR_ERRORS: Record<string, string> = { ENOENT: "没有这个目录", EACCE
 /** What GET /api/dirs answers for path: ~/…, absolute, or empty for ~, as rhodium's HOME has it. Reads
  *  names alone, anywhere up to /: the terminal and the agents reach all of it anyway (architecture §11). */
 async function dirs(store: Store, path: string): Promise<DirsData> {
-  const home = process.env.HOME || homedir();
-  const tilde = (p: string) => (p === home ? "~" : p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p);
-  const asked = resolve(home, path.replace(/^~(?=\/|$)/, home));
+  const suppliedHome = userHome();
+  const home = process.platform === "win32" ? await realpath(suppliedHome).catch(() => suppliedHome) : suppliedHome;
+  const asked = resolve(home, expandHome(path, home));
   let real = asked;
   let error: string | undefined;
   const folders: string[] = [];
@@ -232,11 +235,12 @@ async function dirs(store: Store, path: string): Promise<DirsData> {
   const { workspaces, slots } = store.tx((tx) => ({ workspaces: tx.find("workspace", {}), slots: tx.find("slot", {}).filter((s) => s.archivedAt === null) }));
   // A workspace's or a slot's dir is where it leads through a link: the page asks again by that.
   const reals = new Map(await Promise.all([...new Set([...workspaces, ...slots].map((x) => x.dir))].map(async (d) => [d, await realpath(d).catch(() => d)] as const)));
-  const here = (dir: string) => reals.get(dir) === real;
+  const here = (dir: string) => sameDirectory(reals.get(dir)!, real);
+  const parent = parentDirectory(real);
   const had = workspaces.find((w) => here(w.dir));
   return {
-    path: tilde(real),
-    up: real === "/" ? null : tilde(dirname(real)),
+    path: tilde(real, home),
+    up: parent === null ? null : tilde(parent, home),
     dirs: folders.slice(0, DIRS),
     more: Math.max(0, folders.length - DIRS),
     files: files.slice(0, 8),
@@ -257,16 +261,11 @@ async function dirs(store: Store, path: string): Promise<DirsData> {
 export type FolderData = { branch?: string; ahead?: number; behind?: number; changed?: number; sessions?: Partial<Record<AgentKind, { count: number; at: number }>> };
 
 /** An absolute path for one the page gives: ~/…, absolute, or empty for ~. */
-const pathOf = (path: string) => {
-  const home = process.env.HOME || homedir();
-  return resolve(home, path.replace(/^~(?=\/|$)/, home));
-};
-
-/** ~/… for a path under HOME, else the path. */
-const tilde = (p: string) => {
-  const home = process.env.HOME || homedir();
-  return p === home ? "~" : p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p;
-};
+async function pathOf(dir: string) {
+  const home = userHome();
+  const absolute = resolve(home, expandHome(dir, home));
+  return process.platform === "win32" ? await realpath(absolute).catch(() => absolute) : absolute;
+}
 
 /** The agents' session ids a slot has used, archived ones too: those are not imported again. */
 const used = (store: Store) => new Set(store.tx((tx) => tx.find("conversation", {})).flatMap((c) => (c.sessionId ? [c.sessionId] : [])));
@@ -274,12 +273,12 @@ const used = (store: Store) => new Set(store.tx((tx) => tx.find("conversation", 
 /** What GET /api/folder answers for path: ~/…, absolute, or empty for ~. Runs git there, taking no lock
  *  (GIT_OPTIONAL_LOCKS=0): the terminal reaches the folder anyway (architecture §11). */
 async function folder(store: Store, path: string): Promise<FolderData> {
-  const cwd = pathOf(path);
+  const cwd = await pathOf(path);
   const taken = used(store);
   const counts = Promise.all(AGENT_KINDS.map(async (a) => [a, await conversationsIn(cwd, a, (id) => taken.has(id)).catch(() => undefined)] as const));
   const git = (async (): Promise<FolderData> => {
     try {
-      const git = Bun.spawn(["git", "status", "--porcelain=v2", "--branch"], { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 2000 });
+      const git = Bun.spawn(["git", "status", "--porcelain=v2", "--branch"], { windowsHide: true, cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 2000 });
       const [out, code] = await Promise.all([new Response(git.stdout).text(), git.exited]);
       if (code !== 0) return {};
       const lines = out.split("\n").filter(Boolean);
@@ -305,43 +304,46 @@ export type ImportRow = { session: string; pane?: string; dir: string; title: st
 export type ImportableData = { list: ImportRow[]; cursor?: string; partial?: true };
 
 /** What GET /api/importable answers (architecture §7.10): agent's conversations started in dir, or in
- *  any with q and no dir; with q, those it finds, in what was said too with full=1. The first page
- *  in a dir has first the agent's panes in Herdr that report one there, not a slot's. */
+ *  any with q and no dir; with q, those it finds, in what was said too with full=1. The first page has
+ *  first the agent's panes in Herdr that report one there, any folder's with no dir, not a slot's. */
 async function importableAt(req: Request, store: Store, cfg: Config, herdrSocket: () => Promise<string>, p: URLSearchParams): Promise<Response> {
   if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
   const agent = p.get("agent") as AgentKind;
   const words = (p.get("q") ?? "").trim();
   if (!AGENT_KINDS.includes(agent) || (!p.get("dir") && !words)) return new Response("要 agent，和 dir 或 q。\n", { status: 400 });
-  const dir = p.get("dir") ? pathOf(p.get("dir")!) : undefined;
+  const dir = p.get("dir") ? await pathOf(p.get("dir")!) : undefined;
   const search = words ? { words, full: p.get("full") === "1" } : undefined;
   const taken = used(store);
-  // Its panes there: a slot's not, nor one with no conversation reported.
+  // Its panes there, anywhere with no dir: a slot's not, nor one with no conversation reported.
   type Pane = { pane_id: string; agent_session?: { agent: string; value: string }; foreground_cwd?: string; cwd?: string };
   const slotsPanes = new Set(store.tx((tx) => tx.find("slot", { mode: "tui" })).map((s) => s.herdrPane));
   const panes =
-    dir && AGENTS[agent].paneImport && hasHerdr(cfg)
+    AGENTS[agent].paneImport && hasHerdr(cfg)
       ? ((await herdrSocket()
           .then((at) => request(at, "session.snapshot"))
-          .then((r) => r.snapshot.panes as Pane[], () => [])) as Pane[]).filter((x) => x.agent_session?.agent === agent && (x.foreground_cwd ?? x.cwd) === dir && !slotsPanes.has(x.pane_id) && !taken.has(x.agent_session.value))
+          .then((r) => r.snapshot.panes as Pane[], () => [])) as Pane[]).filter((x) => {
+          const cwd = x.foreground_cwd ?? x.cwd;
+          return x.agent_session?.agent === agent && (!dir || (cwd && sameDirectory(cwd, dir))) && !slotsPanes.has(x.pane_id) && !taken.has(paneSession(x)!);
+        })
       : [];
-  const open = new Set(panes.map((x) => x.agent_session!.value));
+  const open = new Set(panes.map((x) => paneSession(x)!));
   const row = (c: Listed, pane?: string): ImportRow => {
     const { id, file: _, dir: at, ...rest } = c;
     return { session: id, ...(pane && { pane }), dir: tilde(at ?? dir ?? ""), ...rest };
   };
   try {
     const page = await importable(agent, { dir, search, cursor: p.get("cursor") ?? undefined, skip: (id) => taken.has(id) || open.has(id), signal: req.signal });
-    const first =
-      dir && !p.get("cursor")
-        ? await Promise.all(
-            panes.map(async (x) => {
-              const id = x.agent_session!.value;
-              const file = await transcriptFile(dir, agent, id).catch(() => null);
-              const c = file ? await listed(file, agent, search, undefined, req.signal).catch(() => null) : search ? null : { id, file: "", title: "", at: Date.now(), count: 0 };
-              return c && row(c, x.pane_id);
-            }),
-          )
-        : [];
+    const first = !p.get("cursor")
+      ? await Promise.all(
+          panes.map(async (x) => {
+            const id = paneSession(x)!;
+            // With no dir there is a search, in every folder: pi resumes another folder's session there.
+            const file = dir ? await transcriptFile(dir, agent, id).catch(() => null) : (/^[0-9a-f-]+$/i.test(id) && (await findConversations(id)).find((c) => c.agent === agent && c.id === id)?.file) || null;
+            const c = file ? await listed(file, agent, search, undefined, req.signal).catch(() => null) : search ? null : { id, file: "", title: "", at: Date.now(), count: 0 };
+            return c && row(c, x.pane_id);
+          }),
+        )
+      : [];
     return Response.json({ ...page, list: [...first.filter((r) => r !== null), ...page.list.map((c) => row(c))] } satisfies ImportableData, { headers: { "cache-control": "no-store" } });
   } catch (e) {
     if (!req.signal.aborted) throw e;
@@ -374,14 +376,13 @@ async function importPreview(req: Request, p: URLSearchParams): Promise<Response
 /** The branch the work tree holding dir is on, by its HEAD, as git has it, with no git run: the first
  *  .git up from dir, a folder, or a worktree's file naming its own. None when detached, or in none. */
 async function branchOf(dir: string): Promise<string | undefined> {
-  for (let d = dir; ; d = dirname(d)) {
+  for (let d: string | null = dir; d !== null; d = parentDirectory(d)) {
     const git = join(d, ".git");
     const found = await stat(git).catch(() => null);
     if (found) {
       const at = found.isDirectory() ? git : resolve(d, /^gitdir: (.+)$/m.exec(await readFile(git, "utf8").catch(() => ""))?.[1]?.trim() ?? "");
       return /^ref: refs\/heads\/(.+)$/m.exec(await readFile(join(at, "HEAD"), "utf8").catch(() => ""))?.[1]?.trim();
     }
-    if (d === "/") return undefined;
   }
 }
 
@@ -1022,14 +1023,15 @@ const ERR_TAIL = 16 * 1024; // bytes from the end of err.log
 async function processOf(store: Store, cfg: Config, conversation: string | null) {
   const holder = conversation ? store.tx((tx) => tx.find("holder", { conversation })[0]) : undefined;
   if (!holder) return null;
-  const show = Bun.spawn(["systemctl", "--user", "show", `${holder.unit}.service`, "-p", "ActiveState,SubState,MainPID,ExecMainStatus"], { stdout: "pipe", stderr: "ignore" });
-  const props = Object.fromEntries((await new Response(show.stdout).text()).trim().split("\n").map((l) => l.split("=", 2)));
   // The agent's last words before it crashed often lack their newline. The cut line at the start goes.
   // ponytail: just after err.log rotates this shows little; read err.log.1 too if that hides things.
   const log = Bun.file(join(holderPaths(cfg, conversation!).dir, "err.log"));
-  const lines = stripVTControlCharacters(await log.slice(Math.max(0, log.size - ERR_TAIL)).text()).split("\n");
+  const lines = stripVTControlCharacters(await log.slice(Math.max(0, log.size - ERR_TAIL)).text().catch((err) => { if (err.code === "ENOENT") return ""; throw err; })).split("\n");
   if (log.size > ERR_TAIL) lines.shift();
   if (lines.at(-1) === "") lines.pop();
+  if (process.platform !== "linux") return { stderr: lines };
+  const show = Bun.spawn(["systemctl", "--user", "show", `${holder.unit}.service`, "-p", "ActiveState,SubState,MainPID,ExecMainStatus"], { stdout: "pipe", stderr: "ignore" });
+  const props = Object.fromEntries((await new Response(show.stdout).text()).trim().split("\n").map((l) => l.split("=", 2)));
   return {
     unit: holder.unit,
     activeState: props.ActiveState ?? "unknown",
@@ -1452,6 +1454,23 @@ async function sendWith(req: Request, act: Act, media: string): Promise<Response
   return Response.json(await act(id, { kind: "say", slot, text: text.replaceAll("\r\n", "\n"), attachments }), { headers: { "cache-control": "no-store" } });
 }
 
+/** POST /api/upload (spec web-terminal "贴图片和文件"): the files of multipart field file, kept under
+ *  media as /api/send keeps them, from the board's own page alone, but each with the extension its name
+ *  had, a plain one, so an agent knows a picture by it; their paths answered in paths, in order, and no
+ *  message sent: the page pastes them into the terminal. */
+async function upload(req: Request, media: string): Promise<Response> {
+  if (!ownPage(req)) return new Response("只认看板自己的页面发来的请求。\n", { status: 403 });
+  if (req.method !== "POST") return new Response("只收 POST。\n", { status: 405, headers: { allow: "POST" } });
+  const files = (await req.formData().catch(() => null))?.getAll("file") ?? [];
+  if (!files.length || !files.every((f) => f instanceof File)) return new Response("请求体不对。\n", { status: 400 });
+  try {
+    const paths = await Promise.all((files as File[]).map(async (f) => saveMedia(media, await f.bytes(), /^\.\w{1,16}$/.exec(extname(f.name))?.[0] ?? "")));
+    return Response.json({ ok: true, text: "", paths }, { headers: { "cache-control": "no-store" } });
+  } catch (err) {
+    return Response.json({ ok: false, error: `文件没存下来：${err}` } satisfies RhReply);
+  }
+}
+
 /** A page's web terminal (spec web-terminal): the slot, the size its address gives, the page it is on
  *  and whether it only resumes (resume=1: back in front, or connecting again); once open, the Herdr
  *  terminal session control it talks to, and once that lets go, its going. */
@@ -1524,7 +1543,7 @@ async function openTerminal(store: Store, cfg: Config, ws: ServerWebSocket<Term>
   const close = (code: number, reason: string) => void (ws.readyState === 1 && ws.close(code, reason));
   const argv = [cfg.programs.herdr, "--session", cfg.herdr.session, "terminal", "session", "control", s.herdrPane, "--takeover", "--cols", String(t.cols), "--rows", String(t.rows)];
   try {
-    t.herdr = Bun.spawn(argv, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    t.herdr = Bun.spawn(argv, { windowsHide: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   } catch (err) {
     return close(4002, String(err));
   }
@@ -1750,6 +1769,8 @@ export function serveBoard(
         return askMeter(req, store, meter);
       case "/api/send":
         return sendWith(req, act, join(cfg.stateDir, "media"));
+      case "/api/upload":
+        return upload(req, join(cfg.stateDir, "media"));
       case "/api/media":
         return media(req, join(cfg.stateDir, "media"), url.searchParams);
       case "/api/file":

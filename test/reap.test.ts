@@ -4,7 +4,7 @@ import { afterEach, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Posted } from "../src/fake-im";
-import { installFakeAgent, type Script } from "./fake-agent/fake-agent";
+import { installFakeAgent, type Script, type Step } from "./fake-agent/fake-agent";
 import { background, endTurn, on, rateLimited, startTurn, toolUse } from "./fake-agent/scripts";
 import { newInstance, until, type Instance, type InstanceOptions } from "./instance";
 
@@ -69,18 +69,21 @@ test("story 16: rh set reap= on slots already idle takes effect: longer and off 
 }, 30_000);
 
 test("story 17: an agent with a background task running is not reaped; once the task is done and its turn ends, it is", async () => {
-  // The task runs 1.5 s after the turn that started it, three times the reap time.
-  await slotA("500ms", { claude: { script: background(1500) } });
+  // Capture the state after three reap periods, before the fake announces task completion.
+  const steps = background(1500).steps.flatMap<Step>((step) => "sleep" in step ? [step, { rh: ["read", "w/a"] }] : [step]);
+  await slotA("500ms", { claude: { script: { on, steps } } });
   await rhodium.im.inject("q", { chat: ME, sender: ME, text: "start it" });
   expect((await posts(1)).map((p) => p.text)).toEqual(["started"]);
-  await Bun.sleep(1000);
-  expect(await state()).toBe("空闲");
-  const out = () => readFileSync(join(rhodium.dir, "state/hold", readdirSync(join(rhodium.dir, "state/hold"))[0]!, "out.log"), "utf8");
-  expect(out()).not.toContain("background task done");
 
   await until(async () => (await state()) === "未运行", 15_000);
-  expect(out()).toContain("background task done"); // reaped only after the task's own turn
-  expect(rhodium.claude.runs()).toHaveLength(1);
+  expect(holdFile("out.log")).toContain("background task done");
+  const runs = rhodium.claude.runs();
+  expect(runs).toHaveLength(1);
+  const [snapshot] = runs[0]!.rh;
+  expect(snapshot!.code).toBe(0);
+  expect(snapshot!.out).toMatch(/^状态: 空闲$/m);
+  expect(snapshot!.out).toContain("started");
+  expect(snapshot!.out).not.toContain("background task done");
 }, 30_000);
 
 test("story 17: the reap time counts from the end of the turn the done task wakes the agent for, though Claude says the task is done a moment before that turn starts", async () => {

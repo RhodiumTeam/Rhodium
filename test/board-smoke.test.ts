@@ -568,8 +568,8 @@ smoke("stories 196, 197: a tool call is one line; opened, then its call opened, 
   );
   const page = await open(`/slot/${slot}`, async (page) => void (await page.route("**/api/full?*", (r) => r.fulfill({ status: 502 }), { times: 1 })));
   await page.getByText("counted").waitFor();
-  await page.locator("summary", { hasText: /^Bash$/ }).click();
-  const call = page.locator("summary", { hasText: "seq 0 999" });
+  await page.locator("details > summary").first().click();
+  const call = page.locator("li summary").first();
   await call.click();
   await page.locator("pre", { hasText: /^line 0\n/ }).waitFor();
   expect(await page.getByText("line 999").count()).toBe(0);
@@ -589,6 +589,28 @@ smoke("stories 196, 197: a tool call is one line; opened, then its call opened, 
   expect(await page.getByText("取不到全文。").count()).toBe(0);
 });
 
+for (const device of [devices["Pixel 7"], devices["Desktop Chrome"]]) {
+  smoke(`expanded steps and sent Markdown at ${device.viewport.width}px`, async () => {
+    const tool = (at: string, name: string, arg: string) => ({
+      kind: "tool", at, time: null, id: at, name, input: arg, shown: { name, arg, code: true }, result: { text: "ok", error: false, at, time: null },
+    });
+    const blocks = [tool("1.0", "Read", "notes.md"), { ...tool("2.0", "Bash", "rh send me"), send: { to: "me", text: "**已完成**\n检查通过", files: [], media: [] } },
+      { kind: "assistant", at: "3.0", time: null, text: "继续检查" }, tool("4.0", "mcp__" + "long_tool_name_".repeat(7), "report.md")];
+    const page = await open(`/slot/${talks}`, async (p) => void await p.route("**/api/messages?*", (r) => r.fulfill({ json: { blocks, start: 0, end: 0, conversation: "test" } })), device);
+    await page.getByLabel("发给你的").waitFor();
+    expect(await page.locator("p", { hasText: "检查通过" }).locator("br").count()).toBe(1);
+    const folds = page.locator("details.group\\/fold > summary");
+    await folds.first().click();
+    expect((await folds.first().innerText()).trim()).toBe("2 步");
+    const step = page.locator("details.group\\/step > summary").first();
+    await step.click();
+    expect((await step.innerText()).trim()).toBe("Read");
+    await folds.last().click();
+    const name = folds.last().getByText("mcp__" + "long_tool_name_".repeat(7), { exact: true }).filter({ visible: true });
+    expect(await name.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  });
+}
+
 smoke("#495: a fold with one failed Bash among four marks that run, red, with how many failed, and no 出错 at the line's end", async () => {
   const slot = store.tx((tx) => {
     const id = tx.insert("slot", { workspace: ws, name: "fails", dir: "/w", mode: "headless", state: "idle", lifetime: "longterm" }).id;
@@ -605,7 +627,7 @@ smoke("#495: a fold with one failed Bash among four marks that run, red, with ho
   const mark = page.locator("summary").first().getByRole("img", { name: "出错 1 次" });
   await mark.waitFor();
   // Right after Bash ×4, its count 1 of four.
-  expect(await page.locator("summary").first().textContent()).toBe("Read、Bash ×4 1");
+  expect(await page.locator("summary").first().innerText()).toBe("Read、Bash ×4 1");
   expect(await mark.textContent()).toBe("1");
 });
 
@@ -1030,6 +1052,52 @@ smoke("stories 343, 346: on a computer, the terminal clicked takes what you type
   await mac.context().close();
 });
 
+smoke("stories 687, 688: on a computer, a picture pasted into the terminal, or files dropped on it, are kept (words pasted with a picture of them are words) and their paths go in as one paste, 正在上传… under it meanwhile, nothing attached where you type; one the board did not keep sends nothing and says why", async () => {
+  // The board's answer held till let go, then as it is, or turned down.
+  let refuse = false;
+  let hold: (() => void) | undefined;
+  const page = await open(`/slot/${term}`, async (p) => void (await p.route(/\/api\/upload$/, async (r) => (refuse ? r.fulfill({ status: 403, body: "不让存" }) : (await new Promise<void>((go) => (hold = go)), r.continue())))), wide());
+  const { terminal, texts } = await typing(page);
+  await terminal.click();
+  const give = (how: "paste" | "drop", files: [string, string, string][], words = "") =>
+    page.evaluate(
+      ([how, files, words]) => {
+        const data = new DataTransfer();
+        for (const [body, name, type] of files) data.items.add(new File([body], name, { type }));
+        if (words) data.setData("text/plain", words);
+        const at = how === "paste" ? document.activeElement! : document.querySelector('section[aria-label="终端"] > div')!;
+        if (how === "drop") at.dispatchEvent(new DragEvent("dragover", { dataTransfer: data, bubbles: true, cancelable: true }));
+        at.dispatchEvent(how === "paste" ? new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }) : new DragEvent("drop", { dataTransfer: data, bubbles: true, cancelable: true }));
+      },
+      [how, files, words] as const,
+    );
+  const release = async () => (await until(async () => !!hold), hold!(), (hold = undefined));
+  const media = join(base, "state/media");
+  const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
+  await give("paste", [["png bytes", "image.png", "image/png"]]);
+  await terminal.getByText("正在上传…").waitFor();
+  await release();
+  await until(async () => (await texts()).length === 1);
+  expect(await texts()).toEqual([`\x1b[200~${media}/${sha("png bytes")}.png\x1b[201~`]);
+  await terminal.getByText("正在上传…").waitFor({ state: "detached" });
+  await give("drop", [["a", "a.txt", "text/plain"], ["%PDF", "notes.pdf", "application/pdf"]]);
+  await release();
+  await until(async () => (await texts()).length === 2);
+  expect((await texts())[1]).toBe(`\x1b[200~${media}/${sha("a")}.txt ${media}/${sha("%PDF")}.pdf\x1b[201~`);
+  expect(await page.getByText("notes.pdf").count()).toBe(0);
+  // Cells copied from a spreadsheet carry a picture of themselves: words are words still.
+  await give("paste", [["cells", "image.png", "image/png"]], "A1\tB1");
+  await until(async () => (await texts()).length === 3);
+  expect((await texts())[2]).toBe("\x1b[200~A1\tB1\x1b[201~");
+  expect(hold).toBeUndefined();
+  refuse = true;
+  await give("paste", [["more", "image.png", "image/png"]]);
+  await page.getByText("不让存").waitFor();
+  await Bun.sleep(200);
+  expect((await texts()).length).toBe(3);
+  await page.context().close();
+});
+
 smoke("story 346: on a computer, an input method's words go in as it made them: ， Windows' types after a key of 229 with no composition, 。 a Mac's types with the key of .; the browser's caret never shows, and the words being made show at the pane's cursor, where the input method opens its window", async () => {
   const page = await open(`/slot/${term}`, undefined, wide());
   const { terminal, texts } = await typing(page);
@@ -1154,6 +1222,37 @@ smoke("story 357: the left button let go while the right is still down lets go i
     { action: "down", column: 9, row: 4 },
     { action: "up", column: 9, row: 4 },
   ]);
+  await page.context().close();
+});
+
+smoke("#805: on a computer, a line of Chinese in the terminal dragged over copies with no space after each character; double clicked, the word there", async () => {
+  // The pane's frames are the page's route's: a line of Chinese, then a path.
+  let size = { cols: 0, rows: 0 };
+  const page = await open(
+    `/slot/${term}`,
+    async (page) => (
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"]),
+      await page.routeWebSocket(
+        (u) => u.searchParams.get("slot") === term,
+        (ws) => ((size = { cols: Number(new URL(ws.url()).searchParams.get("cols")), rows: Number(new URL(ws.url()).searchParams.get("rows")) }), ws.send(Buffer.from("\x1b[2J\x1b[H以后改驱动建议只改，走 ssh\r\n"))),
+      )
+    ),
+    wide(),
+  );
+  const terminal = page.getByRole("region", { name: "终端" });
+  await terminal.getByLabel("连接中").waitFor({ state: "detached" });
+  const at = (await terminal.locator("canvas").boundingBox())!;
+  const cell = (c: number, r: number) => [at.x + ((c + 0.5) * at.width) / size.cols, at.y + ((r + 0.5) * at.height) / size.rows] as const;
+  const copied = () => page.evaluate(() => navigator.clipboard.readText());
+  await page.mouse.move(...cell(0, 0));
+  await page.mouse.down();
+  await page.mouse.move(...cell(10, 0));
+  await page.mouse.move(...cell(26, 0));
+  await page.mouse.up();
+  await until(async () => (await copied()) === "以后改驱动建议只改，走 ssh");
+  // 驱动 is cells 6 to 9: on its second half.
+  await page.mouse.dblclick(...cell(9, 0));
+  await until(async () => (await copied()) === "驱动");
   await page.context().close();
 });
 
@@ -1789,6 +1888,99 @@ smoke("story 244: on a wide screen a slot's chat beside the list has 列表 pres
 /** A wide screen width px wide. */
 const wide = (width = 1440) => ({ viewport: { width, height: 900 } }) as (typeof devices)[string];
 /** Drags the line between the split's sides to x px from the page's left. */
+for (const device of [devices["Desktop Chrome"], devices["Pixel 7"]]) {
+  smoke(`tick strip previews, marks the current row and jumps at ${device.viewport.width}px`, async () => {
+    const blocks = Array.from({ length: 18 }, (_, i) => {
+      const exchange = i === 4;
+      const time = Date.UTC(2026, 0, 1, 9, i);
+      return [
+        { kind: "user", at: `${2*i}.0`, time, from: null, source: exchange ? "槽位 w/works，经 rh send" : null, text: exchange ? "核对截图" : `检查第 ${i + 1} 项` },
+        { kind: "assistant", at: `${2*i+1}.0`, time, text: exchange ? "已核对明暗截图" : `第 ${i + 1} 项已通过。\n\n继续验证对话页。` },
+      ];
+    }).flat();
+    const page = await open(`/slot/${talks}?full`, async (p) => void await p.route("**/api/messages?*", (r) => r.fulfill({ json: { blocks, start: 0, end: 100, conversation: "test" } })), device);
+    const name = "刻度条";
+    const finger = device.hasTouch;
+    const rail = page.getByRole(finger ? "button" : "navigation", { name, exact: true });
+    await rail.waitFor();
+    if (finger) await rail.click();
+    const items = finger ? page.getByRole("dialog", { name }) : rail;
+    const tick = items.getByRole("button", { name: "你：检查第 4 项", exact: true });
+    const last = items.getByRole("button", { name: "你：检查第 18 项" });
+    expect(await last.getAttribute("aria-current")).toBe("true");
+    expect(await items.getByRole("button", { name: /核对截图|works/ }).count()).toBe(0);
+    if (!finger) {
+      await tick.hover();
+      const tip = page.getByRole("tooltip");
+      await tip.waitFor();
+      expect(await tip.innerText()).toContain("第 4 项已通过。");
+    }
+    await tick.click();
+    if (finger) await items.waitFor({ state: "hidden" });
+    await page.waitForFunction(() => {
+      const log = document.querySelector('[role="log"]')!;
+      const target = log.querySelector('[data-tick-at="6.0"]')!;
+      return Math.abs(log.getBoundingClientRect().top - target.getBoundingClientRect().top) < 2;
+    });
+    if (finger) await rail.click();
+    expect(await tick.getAttribute("aria-current")).toBe("true");
+    const nearEnd = items.getByRole("button", { name: "你：检查第 17 项" });
+    await nearEnd.click();
+    await page.waitForFunction(() => {
+      const log = document.querySelector('[role="log"]')!;
+      return log.scrollHeight - log.clientHeight - log.scrollTop < 2;
+    }, undefined, { timeout: 2000 });
+    if (finger) await rail.click();
+    expect(await nearEnd.getAttribute("aria-current")).toBe("true");
+    if (!finger) {
+      // Typing a space in the composer is not manual scrolling, even if the transcript then moves.
+      await page.getByRole("textbox", { name: "消息" }).press("Space");
+      await page.getByRole("log", { name: "对话" }).evaluate((el) => { el.scrollTop -= 2; });
+      await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      expect(await nearEnd.getAttribute("aria-current")).toBe("true");
+      await page.getByRole("log", { name: "对话" }).hover();
+      await page.mouse.wheel(0, -500);
+      await page.waitForFunction(() => document.querySelector('nav[aria-label="刻度条"] [aria-current]')?.getAttribute("aria-label") !== "你：检查第 17 项");
+    }
+    if (finger) {
+      blocks.splice(4);
+      await page.reload();
+      await rail.waitFor();
+      expect((await rail.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    }
+    blocks.splice(2);
+    await page.reload();
+    await page.getByText("检查第 1 项", { exact: true }).waitFor();
+    expect(await rail.count()).toBe(0);
+  });
+}
+
+smoke("chat width follows the conversation pane and persists on this device", async () => {
+  const page = await open(`/slot/${talks}?full`, undefined, wide(1760));
+  const menu = page.getByRole("button", { name: "更多", exact: true });
+  const input = page.locator("[data-box]");
+  const size = async () => (await input.boundingBox())!.width;
+  await menu.click();
+  const standard = await size();
+  const pick = (name: string) => page.getByRole("menuitemradio", { name, exact: true });
+  await pick("宽").click();
+  expect(await size()).toBeGreaterThan(standard);
+  const wider = await size();
+  await page.reload();
+  await menu.click();
+  expect(await pick("宽").getAttribute("aria-checked")).toBe("true");
+  expect(await size()).toBe(wider);
+  await pick("铺满").click();
+  expect(await size()).toBeGreaterThan(wider);
+  await pick("标准").click();
+  expect(await page.evaluate(() => localStorage.getItem("chat-width"))).toBeNull();
+  await page.setViewportSize(devices["Pixel 7"].viewport);
+  await pick("标准").waitFor({ state: "hidden" });
+  await page.keyboard.press("Escape");
+  await menu.click();
+  expect(await pick("标准").count()).toBe(0);
+});
+
 async function dragTo(page: Page, x: number) {
   const at = (await page.getByRole("separator").boundingBox())!;
   await page.mouse.move(at.x + at.width / 2, at.y + at.height / 2);
@@ -3467,6 +3659,7 @@ for (const [device, label] of [
       const { path, folders, drop } = picker(dialog);
       await path.fill(`~/drop-${label.length}/`);
       await page.keyboard.press("Escape");
+      await folders.waitFor({ state: "detached" });
       expect([await folders.count(), await dialog.isVisible()]).toEqual([0, true]);
       // includeHidden: while the folders are down, the rest of the dialog is hidden from a screen reader.
       const rows = dialog.getByRole("radiogroup", { name: "导入哪一段", includeHidden: true }).getByRole("radio", { includeHidden: true });
@@ -3502,6 +3695,7 @@ for (const [device, label] of [
       await until(async () => (await path.inputValue()) === `~/drop-${label.length}/a/`);
       // Esc folds them alone; tapped outside, they fold too, and the list is the new folder's.
       await page.keyboard.press("Escape");
+      await folders.waitFor({ state: "detached" });
       expect([await folders.count(), await dialog.isVisible()]).toEqual([0, true]);
       await dialog.getByRole("button", { name: "文件夹" }).click();
       await folders.waitFor();

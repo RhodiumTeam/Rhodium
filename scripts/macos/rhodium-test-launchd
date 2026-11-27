@@ -1,0 +1,77 @@
+#!/bin/sh -p
+# Template for the machine-specific helper. Render @TEST_USER@ before installing the root-owned copy named in sudoers.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 077
+cd /
+[ "$#" -eq 1 ] || exit 64
+case "$1" in install|uninstall|status) ;; *) exit 64 ;; esac
+case '@TEST_USER@' in *@*) echo "unrendered helper template" >&2; exit 64 ;; esac
+[ "$(/usr/bin/id -u)" = 0 ] || { echo "root required" >&2; exit 77; }
+
+label=com.rhodium-test.rhodium
+target=system/$label
+plist=/Library/LaunchDaemons/$label.plist
+
+definition() {
+  /bin/cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.rhodium-test.rhodium</string>
+  <key>UserName</key><string>@TEST_USER@</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>umask 077; cd /Users/@TEST_USER@/rhodium-test || exit 1; exec &gt;&gt;daemon.log 2&gt;&amp;1; ./current/macos-observe boot; exec ./current/rhodium --config ./config.toml</string>
+  </array>
+  <key>WorkingDirectory</key><string>/</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/@TEST_USER@</string>
+    <key>PATH</key><string>/Users/@TEST_USER@/rhodium-test/current:/Users/@TEST_USER@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict></plist>
+PLIST
+}
+
+loaded() { /bin/launchctl print "$target" >/dev/null 2>&1; }
+if [ "$1" = status ]; then
+  loaded || { echo "not loaded"; exit 1; }
+  /bin/launchctl print "$target" | /usr/bin/awk '/^\t(state|pid|runs|last exit code|path) = /'
+  exit 0
+fi
+
+# Only root-owned system paths are accessed by this helper. The service opens
+# its log after launchd has switched to UserName.
+[ ! -L "$plist" ] || { echo "refusing symlink" >&2; exit 1; }
+if [ -e "$plist" ]; then
+  [ -f "$plist" ] && [ "$(/usr/bin/stat -f '%u:%g:%Lp' "$plist")" = 0:0:644 ] && definition | /usr/bin/cmp -s - "$plist" || {
+    echo "refusing a different job definition" >&2; exit 1;
+  }
+elif loaded; then
+  echo "label already loaded without the test plist" >&2; exit 1
+fi
+
+if [ "$1" = uninstall ]; then
+  if loaded; then /bin/launchctl bootout "$target"; fi
+  /bin/rm -f "$plist"
+  exit 0
+fi
+
+uid=$(/usr/bin/id -u @TEST_USER@)
+[ "$uid" -gt 0 ] || exit 77
+if loaded; then echo "already loaded"; exit 0; fi
+if [ ! -e "$plist" ]; then
+  tmp=$(/usr/bin/mktemp /Library/LaunchDaemons/.com.rhodium-test.rhodium.XXXXXX)
+  trap '/bin/rm -f "$tmp"' EXIT
+  definition >"$tmp"
+  /usr/bin/plutil -lint "$tmp" >/dev/null
+  /usr/sbin/chown root:wheel "$tmp"
+  /bin/chmod 644 "$tmp"
+  /bin/ln "$tmp" "$plist"
+fi
+/bin/launchctl bootstrap system "$plist"

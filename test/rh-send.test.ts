@@ -1,6 +1,8 @@
 // Messages between slots (stories 46, 90-92, 95, 96): rh send, rh read and a child's reports to its
 // parent, seen from seam one. The fake claude does what its message says, as in rh-spawn.test.ts:
 // the message is a list of rh calls. Children that must take their time are fake pis.
+import { Database } from "bun:sqlite";
+import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import type { Run, Script } from "./fake-agent/fake-agent";
 import { asking, builtins, compaction, endTurn, joinTurn, on, startTurn } from "./fake-agent/scripts";
@@ -43,6 +45,30 @@ async function texts(n: number, bot = "q"): Promise<string[]> {
   await until(async () => (await rhodium.im.log(bot, ME)).length >= n, 15_000);
   return (await rhodium.im.log(bot, ME)).map((p) => p.text);
 }
+
+test("send reads stdin only for a lone dash and removes one final newline", async () => {
+  await begin();
+  await rhodium.im.inject("q", { chat: ME, sender: ME, text: plan() });
+  await texts(1);
+  const db = new Database(join(rhodium.dir, "state/rh.db"), { readonly: true });
+  const { token } = db.query<{ token: string }, []>("SELECT token FROM slot WHERE name = 'a'").get()!;
+  db.close();
+  const send = (args: string[], input?: string) => {
+    const p = Bun.spawn([process.execPath, join(import.meta.dir, "../src/main.ts"), "rh", "send", "me", ...args], {
+      env: { ...rhodium.env, RHODIUM_TOKEN: token }, stdin: "pipe", stderr: "pipe", stdout: "pipe",
+    });
+    if (input !== undefined) {
+      p.stdin.write(input);
+      p.stdin.end();
+    }
+    return p.exited;
+  };
+  expect(await send(["-"], "one\ntwo\n\n")).toBe(0);
+  expect((await texts(2)).at(-1)).toBe("one\ntwo\n");
+  expect(await send(["without stdin"])).toBe(0);
+  expect(await send(["-"], "")).toBe(1);
+  expect(await send(["--file", import.meta.path, "-"], "")).toBe(0);
+}, 30_000);
 
 test("story 46: a child you never messaged, its parent gone, sends rh send me to its root slot's chat, from any depth, led by its name as that chat goes to another slot", async () => {
   await begin();

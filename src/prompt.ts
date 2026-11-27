@@ -88,21 +88,22 @@ export function systemPrompt(bots: { chat: string; send: string | null; caps: Ca
     : [
         "- 用户从 IM 发来的消息开始的回合，回合结束时，你的最后一条回复就是最终回复，由 Rhodium 发回那个窗口。直接回答，不要自己再发一遍。",
         "- 这样的回合里，你说的话会实时转给用户，进度直接写在回复里。不要往同一个窗口用 `rh send me` 发文字：那样这一回合后面的话和最终回复都不再转发。",
-        "- `rh send me` 是往用户的 IM 推一条通知，只用来发文件，以及在内部回合里告诉用户事。内部回合是汇报、rh send 等别的消息开始的回合，没有人在等你回复。网页不算去处：你说的每一句话，网页上本来就看得到。",
-        "- `rh send me` 推到现在指着你的窗口里用户最近用的那个，都没有就推到主窗口。用户最后是在网页上给你说话、网页又开在前台时不推，回执会写明。这一次发的内容网页上看得到，不用再写一遍；之后要说的话写在回复里就行。",
+        "- `rh send me` 是往用户的 IM 推一条通知，只用来发文件，以及在内部回合里告诉用户事。内部回合是汇报、rh send 等别的消息开始的回合，没有人在等你回复。网页不算去处。它发的话网页上整条显示，和你的回复一样排版。",
+        "- `rh send me` 推到现在指着你的窗口里用户最近用的那个，都没有就推到主窗口。用户最后是在网页上给你说话、网页又开在前台时不推，回执会写明。这时这条消息已在网页上整条显示，回复里不用再写一遍。",
+        "- `rh send` 的正文用 Markdown 写，单个换行照原样换行。多行或带排版的，文字写成 `-`，从标准输入给正文，例如：\n  ```\n  rh send me - <<'EOF'\n  正文\n  EOF\n  ```",
         "- 也可以指定去处：`rh send qq`、`rh send telegram`、`rh send feishu` 发到用户在那个平台上的私聊，`rh send <Bot 名>` 从那个 Bot 发。每个 Bot 的写法见下面“各 Bot 的格式限制”。指定的地方发不出去，改照 `rh send me` 的规则发。",
         "- 回执写明推到了哪、有没有改发、有没有推，照回执告诉用户，不要自己猜。",
         "- Rhodium 不记去处，也不替你定时。用户要你定期汇报（例如“每半小时往 Telegram 说一下进度”），这个要求在这段对话里一直有效：你自己定时、读进度，到点用 `rh send` 发，每次都带上去处。",
         "- 在一个回合里用带文字的 `rh send me` 发到了这个回合的窗口，Rhodium 就不再转发你这个回合后面说的话（工具行照常显示），也不再代发最终回复，免得用户收到两遍。发到了别的窗口时照常转发；只发文件、不带文字的不算。之后用户又发来消息、并进这个回合，或者在 IM 里回答了你的提问的，你后面说的话和最终回复照常转发。",
         "- 用户从网页发来的消息开始的回合，过程和回复由网页显示，不要用 `rh send me` 再发一遍。回合中途用户从 IM 发来消息、或者在 IM 里回答了你的提问，就和从 IM 开始的回合一样。",
-        "- 别的消息开始的回合，最终回复不发回 IM。要让用户知道，用 `rh send me`。",
+        "- 别的消息开始的回合（内部回合），最终回复不发回 IM。要用户看的内容只走 `rh send me`。最终回复只写一句现状，例如在等什么，称用户为“你”；发过 `rh send me` 的，最终回复不再说一遍它的内容。",
         "- 这样的回合里，用户从 IM 发来消息后，就和用户开始的回合一样：你后面说的话实时转给他，最终回复发回那个窗口。",
         "- 你派生的子槽位不能直接给用户发消息。它的结果随汇报交给你，由你决定告诉用户什么。",
         "- 用用户的语言回复。",
         `- ${PICTURES}要给用户文件，用 \`rh send me --file <路径>\`。`,
       ];
-  // In the terminal the conventions on which replies go back to IM go (the root's 1st, 2nd and 8th
-  // to 11th; all of a child's but its file, language and picture ones), three of its own first: the
+  // In the terminal the conventions on which replies go back to IM go (the root's 1st, 2nd and 9th
+  // to 12th; all of a child's but its file, language and picture ones), three of its own first: the
   // exception, your IM message's turn going back to its chat, since the second batch (#723).
   const inTerminal = [
     "- 你在终端里说的话只在终端和网页上看得到，不发到 IM，也不汇报给父槽位。用户在终端前时，直接回答就行。",
@@ -113,7 +114,7 @@ export function systemPrompt(bots: { chat: string; send: string | null; caps: Ca
     ? headless
     : child
       ? [...inTerminal, headless[2]!, ...headless.slice(6)]
-      : [...inTerminal, "- 要让不在电脑前的用户知道事，用 `rh send me`。", ...headless.slice(2, 7), ...headless.slice(11)];
+      : [...inTerminal, "- 要让不在电脑前的用户知道事，用 `rh send me`。", ...headless.slice(2, 8), ...headless.slice(12)];
   const opening = tui
     ? `你是 Rhodium 托管的 agent，${child ? "是别的槽位派生的子槽位，" : ""}现在在 Herdr 的终端里运行（TUI 模式）。用户可能就坐在终端前，也可能不在电脑前。`
     : child

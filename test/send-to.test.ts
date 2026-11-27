@@ -98,7 +98,7 @@ test("story 576: a platform's name wins over a bot of that name; a bot's name se
   expect(sentMe(d).data).toEqual({ files: [{ kind: "image", hash: "shot.png", name: "shot.png" }] });
 });
 
-const UNPUSHED = "用户正在网页上看，没推送到 IM。这次发的内容网页上看得到；之后要说的话写在回复里就行。";
+const UNPUSHED = "用户正在网页上看，没推送到 IM。这条消息已在网页上整条显示，回复里不用再写一遍。";
 
 test("story 593: rh send me is pushed to the contact chat, but while you wrote to the slot on the board last and a page is in front: then no outbound, its files and unread on the board, and the receipt says so", () => {
   const chats = [chat("q", "q", { target: "a", contactedAt: 50 })];
@@ -192,7 +192,7 @@ test("story 591: a child sends you a file alone while you talk to it directly, b
 });
 
 test("story 597: a child's rh send with nothing to send gets the child's usage, with no platform's nor bot's name; another slot's gets the other", () => {
-  expect(send(state(), ["me"], ctx(), "c").reply).toBe("用法：rh send me --file <路径>... | <工作区/槽位> <文字>");
+  expect(send(state(), ["me"], ctx(), "c").reply).toBe("用法：rh send me --file <路径>... | <工作区/槽位> <文字>|-");
   expect(send(state(), ["me"]).reply).toContain("<Bot 名>");
 });
 

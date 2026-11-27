@@ -70,10 +70,10 @@ export function subscribe(socket: string, types: string[]) {
 
 /** The socket of the Herdr session, from `herdr session list --json`; throws unless it runs. */
 export async function sessionSocket(herdr: string, session: string): Promise<string> {
-  const proc = Bun.spawn([herdr, "session", "list", "--json"], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([herdr, "session", "list", "--json"], { windowsHide: true, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) throw new Error(`herdr session list 失败：${err.trim() || `退出码 ${code}`}`);
   const found = (JSON.parse(out).sessions as { name: string; running: boolean; socket_path: string }[]).find((s) => s.name === session);
   if (!found?.running) throw new Error(`Herdr 会话 ${session} 没在运行`);
-  return found.socket_path;
+  return process.platform === "win32" && !found.socket_path.startsWith("\\\\.\\pipe\\") ? "\\\\.\\pipe\\" + found.socket_path : found.socket_path;
 }

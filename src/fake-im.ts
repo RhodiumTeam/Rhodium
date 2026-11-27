@@ -20,8 +20,8 @@ import { feishuCapabilities, PLATFORMS, QQ_CAPABILITIES, TELEGRAM_CAPABILITIES }
 import { withKeyboard } from "./qq";
 
 /** The platforms of architecture §8.1, as far as their capability tables go; Feishu's edits at most
- *  every 3 s, as durations.feishuEdit has it by default. */
-export const fakeLike = { qq: QQ_CAPABILITIES, telegram: TELEGRAM_CAPABILITIES, feishu: feishuCapabilities(3000) } satisfies Record<string, Capabilities>;
+ *  every 400 ms, as durations.feishuEdit has it by default. */
+export const fakeLike = { qq: QQ_CAPABILITIES, telegram: TELEGRAM_CAPABILITIES, feishu: feishuCapabilities(400) } satisfies Record<string, Capabilities>;
 
 /** A fake bot's capability table, as its like and its own keys say (platforms.ts); feishuEdit is
  *  durations.feishuEdit. */
@@ -43,10 +43,14 @@ export type Injection = Omit<InboundMessage, "bot" | "messageId" | "at" | "attac
 };
 
 /** One send or edit as the platform received it, at when (ms) it arrived. unbutton: the message's
- *  buttons taken off (text ""); toast: the answer to a button press, messageId the press's.
- *  buttonsHidden: its buttons are not shown, being on a message that is not Markdown where buttons
- *  show on Markdown only (QQ, 2026-10-22). */
-export type Posted = { kind: "send" | "edit" | "unbutton" | "toast"; messageId: string; at: number; buttonsHidden?: true } & OutboundWire;
+ *  buttons taken off (text ""); toast: the answer to a button press, messageId the press's. draft: a
+ *  turn's message shown as a draft (Capabilities.draftTtl), messageId draft:<seq>, as Telegram's
+ *  adapter has it; ends: the draft a message sent at its final edit stands for. buttonsHidden: its
+ *  buttons are not shown, being on a message that is not Markdown where buttons show on Markdown only
+ *  (QQ, 2026-10-22).
+ *  A QQ stream (#797) is one message, as QQ shows it: its send, its text and final as its last frame
+ *  has them, frames each frame's text, its first included. */
+export type Posted = { kind: "send" | "edit" | "draft" | "unbutton" | "toast"; messageId: string; at: number; ends?: string; buttonsHidden?: true; frames?: string[] } & OutboundWire;
 
 /** An outbound message on the socket: a file goes as its name and its bytes in base64. */
 type OutboundWire = Omit<OutboundMessage, "file"> & { file?: { kind: "image" | "file"; name: string; data: string } };
@@ -159,10 +163,12 @@ class PlatformBot {
 
   /** null: set to hang, so no answer. */
   send(chat: string, message: OutboundWire): SendResult | null {
+    if (message.draft && this.capabilities.draftTtl) return this.deliver(chat, { kind: "draft", messageId: `draft:${message.seq}`, ...message, at: Date.now() }, this.refusal(message));
     const refused = this.refusal(message);
     const quota = refused ? undefined : this.quotaRefusal(chat, message.replyTo);
     const hidden = this.capabilities.buttons === "markdown" && message.buttons?.length && message.markdown === undefined;
-    const r = this.deliver(chat, { kind: "send", messageId: this.newId(), ...message, at: Date.now(), ...(hidden && { buttonsHidden: true as const }) }, refused ?? quota);
+    const frames = this.capabilities.stream && message.stream && message.replyTo !== undefined ? { frames: [message.text] } : {};
+    const r = this.deliver(chat, { kind: "send", messageId: this.newId(), ...message, at: Date.now(), ...(hidden && { buttonsHidden: true as const }), ...frames }, refused ?? quota);
     return quota && r?.status === "failed" ? { ...r, quota: true } : r;
   }
 
@@ -181,14 +187,19 @@ class PlatformBot {
   }
 
   edit(chat: string, messageId: string, message: OutboundWire): SendResult | null {
+    if (messageId.startsWith("draft:") && this.capabilities.draftTtl) {
+      const known = this.log(chat).some((p) => p.kind === "draft" && p.messageId === messageId);
+      const posted: Posted = message.final ? { kind: "send", messageId: this.newId(), ends: messageId, ...message, at: Date.now() } : { kind: "draft", messageId, ...message, at: Date.now() };
+      return this.deliver(chat, posted, known ? this.refusal(message) : "no such draft in this chat");
+    }
     const known = this.log(chat).some((p) => p.kind === "send" && p.messageId === messageId);
-    const refused =
-      this.capabilities.progress === "append"
-        ? "this platform cannot edit messages"
-        : known
-          ? this.refusal(message)
-          : "no such message in this chat";
-    return this.deliver(chat, { kind: "edit", messageId, ...message, at: Date.now() }, refused);
+    if (this.capabilities.progress === "append") {
+      const sent = this.log(chat).find((p) => p.kind === "send" && p.messageId === messageId);
+      const refused = !sent?.frames ? "this platform cannot edit messages" : sent.final ? "the stream is closed" : !(message.markdown ?? message.text).startsWith(sent.markdown ?? sent.text) ? "a stream's frame must begin with the one before it" : undefined;
+      const grow = () => Object.assign(sent!, { text: message.text, markdown: message.markdown, ...(message.final && { final: true }), frames: [...sent!.frames!, message.text] });
+      return this.deliver(chat, { kind: "edit", messageId, ...message, at: Date.now() }, refused, grow);
+    }
+    return this.deliver(chat, { kind: "edit", messageId, ...message, at: Date.now() }, known ? this.refusal(message) : "no such message in this chat");
   }
 
   dropButtons(chat: string, messageId: string): SendResult | null {
@@ -218,22 +229,23 @@ class PlatformBot {
     if (max && Buffer.byteLength(m.file!.data, "base64") > max) return `the ${m.file!.kind} is over ${max} bytes`;
   }
 
-  /** Queue how the next send or edit (or either, when on is left out) turns out; on "row", whether
-   *  the next row push fails. */
+  /** Queue how the next send, edit or draft (or any, when on is left out) turns out; on "row",
+   *  whether the next row push fails. A draft's final edit is a send. */
   next(outcome: unknown, on?: unknown) {
     if (!["ok", "fail", "timeout", "hang", "refuse"].includes(outcome as string)) throw new Error(`unknown outcome ${outcome}`);
-    if (on !== undefined && on !== "send" && on !== "edit" && on !== "row") throw new Error(`on must be "send", "edit" or "row", not ${on}`);
+    if (on !== undefined && on !== "send" && on !== "edit" && on !== "draft" && on !== "row") throw new Error(`on must be "send", "edit", "draft" or "row", not ${on}`);
     this.outcomes.push({ outcome: outcome as Outcome, on });
   }
 
-  /** The platform takes p unless refused; a queued outcome can fail it, or time it out or hang after it lands. */
-  private deliver(chat: string, p: Posted, refused?: string): SendResult | null {
+  /** The platform takes p unless refused; a queued outcome can fail it, or time it out or hang after it
+   *  lands. take: how it takes it, if not as a post of its own (a QQ stream's frame). */
+  private deliver(chat: string, p: Posted, refused?: string, take = () => this.post(chat, p)): SendResult | null {
     if (!this.up) return { status: "failed", error: "fake-im: not connected" };
     const i = this.outcomes.findIndex((o) => !o.on || o.on === p.kind);
     const outcome = i < 0 ? "ok" : this.outcomes.splice(i, 1)[0]!.outcome;
     if (outcome === "fail") return { status: "failed", error: "fake-im: set to fail" };
     if (outcome === "refuse") return { status: "failed", error: "fake-im: set to refuse", refused: true };
-    if (!refused) this.post(chat, p);
+    if (!refused) take();
     if (outcome === "hang") return null;
     if (outcome === "timeout") return { status: "unknown", error: "fake-im: timed out" };
     return refused ? { status: "failed", error: `fake-im: ${refused}` } : { status: "sent", messageId: p.messageId };
@@ -480,12 +492,15 @@ export class FakeImClient {
   }
 
   /** What each message the bot sent in chat shows now, after its edits, oldest first: an edit shows
-   *  only the buttons it carries, as on Telegram. */
+   *  only the buttons it carries, as on Telegram; a draft shows till the message it ends in. */
   async shown(bot: string, chat: string): Promise<Posted[]> {
     const now = new Map<string, Posted>();
     for (const p of await this.log(bot, chat)) {
-      if (p.kind === "send") now.set(p.messageId, p);
-      else if (p.kind === "edit" && now.has(p.messageId)) now.set(p.messageId, { ...p, kind: "send", at: now.get(p.messageId)!.at });
+      if (p.kind === "draft") now.set(p.messageId, now.has(p.messageId) ? { ...p, at: now.get(p.messageId)!.at } : p);
+      else if (p.kind === "send") {
+        if (p.ends) now.delete(p.ends);
+        now.set(p.messageId, p);
+      } else if (p.kind === "edit" && now.has(p.messageId)) now.set(p.messageId, { ...p, kind: "send", at: now.get(p.messageId)!.at });
       else if (p.kind === "unbutton" && now.has(p.messageId)) now.set(p.messageId, { ...now.get(p.messageId)!, buttons: undefined });
     }
     return [...now.values()];

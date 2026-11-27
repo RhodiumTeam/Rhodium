@@ -45,7 +45,7 @@ export const AGENTS: Record<AgentKind, AgentDef> = {
     ultracode: false,
     apiPrice: false,
     modelNames: false,
-    paneImport: false,
+    paneImport: true,
     claudeKeys: false,
   },
   codex: {
@@ -90,13 +90,14 @@ const PARENT_SESSION =
 const CLAUDE_KEYS = /^(ANTHROPIC_|CLAUDE)/;
 // Those pi reads (its bundled Anthropic SDK takes the last two), which its terminal goes without even
 // where rhodium's own environment has none: the pane's comes from the Herdr server's (architecture §10.3).
-const READ_BY_PI = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+// rh import refuses a pane whose pi has any (§10.1).
+export const READ_BY_PI = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
 
 /** The environment a headless agent of the kind is launched with: env without what a parent session
  *  hands down, nor Claude's keys unless it may have them. */
 export function headlessEnv(agent: AgentKind, env: Record<string, string>): Record<string, string> {
   const keys = AGENTS[agent].claudeKeys;
-  return Object.fromEntries(Object.entries(env).filter(([k]) => !PARENT_SESSION.test(k) && (keys || !CLAUDE_KEYS.test(k))));
+  return Object.fromEntries(Object.entries(env).filter(([k]) => !PARENT_SESSION.test(process.platform === "win32" ? k.toUpperCase() : k) && (keys || !CLAUDE_KEYS.test(process.platform === "win32" ? k.toUpperCase() : k))));
 }
 
 /** What the agent's terminal goes without, by name for env -u, as the pane's environment is the Herdr
@@ -105,5 +106,5 @@ export function headlessEnv(agent: AgentKind, env: Record<string, string>): Reco
  *  the pane's session with them. */
 export function terminalUnset(agent: AgentKind, env: Record<string, string | undefined>): string[] {
   if (AGENTS[agent].claudeKeys) return [];
-  return [...new Set([...READ_BY_PI, ...Object.keys(env).filter((k) => CLAUDE_KEYS.test(k))])];
+  return [...new Set([...READ_BY_PI, ...Object.keys(env).filter((k) => CLAUDE_KEYS.test(process.platform === "win32" ? k.toUpperCase() : k))])];
 }

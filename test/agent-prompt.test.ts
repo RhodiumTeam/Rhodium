@@ -66,7 +66,7 @@ test("story 7: the agent is launched with an appended system prompt: rh's usage,
   expect(prompt).toContain("`rh send me` 推到现在指着你的窗口里用户最近用的那个，都没有就推到主窗口。");
   expect(prompt).not.toContain("你选不了");
   // A turn something else began sends its reply to no chat.
-  expect(prompt).toContain("别的消息开始的回合，最终回复不发回 IM。要让用户知道，用 `rh send me`。");
+  expect(prompt).toContain("别的消息开始的回合（内部回合），最终回复不发回 IM。要用户看的内容只走 `rh send me`。最终回复只写一句现状，例如在等什么，称用户为“你”；发过 `rh send me` 的，最终回复不再说一遍它的内容。");
   // A message of yours that reaches it late says when you sent it (2026-10-23).
   expect(prompt).toContain("用户的消息发出后超过 5 分钟才交给你的（例如排队等额度），这一行还写发送时间，例如 [来自 QQ 私聊，发送于 21:05]；不是当天的写成 [来自 QQ 私聊，发送于 10-22 21:05]。");
   // The format limits of each bot, from its capability table, under the name its private chat goes
@@ -159,15 +159,18 @@ test("story 597: a slot that is no child is told rh send me is a push to IM, whe
   expect(prompt).toContain("指定的地方发不出去，改照 `rh send me` 的规则发。");
   expect(prompt).toContain("- 回执写明推到了哪、有没有改发、有没有推，照回执告诉用户，不要自己猜。");
   expect(prompt).toContain("这个要求在这段对话里一直有效：你自己定时、读进度，到点用 `rh send` 发，每次都带上去处。");
-  expect(prompt).toContain("- 别的消息开始的回合，最终回复不发回 IM。要让用户知道，用 `rh send me`。\n");
+  expect(prompt).toContain("- 别的消息开始的回合（内部回合），最终回复不发回 IM。要用户看的内容只走 `rh send me`。最终回复只写一句现状，例如在等什么，称用户为“你”；发过 `rh send me` 的，最终回复不再说一遍它的内容。\n");
   expect(prompt).toContain("- 你派生的子槽位不能直接给用户发消息。它的结果随汇报交给你，由你决定告诉用户什么。\n- 用用户的语言回复。");
   expect(prompt).toContain("进度直接写在回复里。不要往同一个窗口用 `rh send me` 发文字");
   expect(prompt).toContain("用户发起或插过话的回合，子槽位跑完也不汇报。");
+  for (const text of [skillText(), helpText(), skillText(undefined, true), helpText(true)]) expect(text).toContain("文字写成 - 时从标准输入读正文，例如 heredoc，多行和排版不受命令行引号限制。");
   for (const text of [prompt, skillText(), helpText()]) {
     expect(text).not.toContain("rh send web");
     expect(text).not.toContain("me|web");
     expect(text).not.toContain("你有父槽位");
   }
+  expect(prompt).toContain("网页不算去处。它发的话网页上整条显示，和你的回复一样排版。");
+  expect(prompt).toContain("- `rh send` 的正文用 Markdown 写，单个换行照原样换行。多行或带排版的，文字写成 `-`，从标准输入给正文，例如：\n  ```\n  rh send me - <<'EOF'\n  正文\n  EOF\n  ```");
   expect(skillText()).toContain("rh send me|<平台>|<Bot 名> [--file <路径>]...");
   expect(skillText()).toContain("不要往同一个窗口用 rh send me 发文字。");
 });
@@ -181,7 +184,7 @@ test("story 597: a child slot's prompt, skill and help say nothing of sending yo
   expect(prompt).toContain("和消息第一行的写法一样：");
   expect(prompt).toContain("用户发起或插过话的回合，子槽位跑完也不汇报。");
   for (const text of [prompt, skillText(undefined, true), helpText(true)]) {
-    expect(text).toContain("rh send me --file <路径>... | <工作区/槽位> <文字>");
+    expect(text).toContain("rh send me --file <路径>... | <工作区/槽位> <文字>|-");
     for (const word of ["rh send echo", "rh send qq", "rh send telegram", "<Bot 名>", "rh send web", "推一条通知"]) expect(text).not.toContain(word);
   }
 });
@@ -259,7 +262,7 @@ test("stories 616, 630: the terminal's prompt says it runs in Herdr's terminal, 
     "## 回复约定\n\n- 你在终端里说的话只在终端和网页上看得到，不发到 IM，也不汇报给父槽位。用户在终端前时，直接回答就行。\n- 例外：用户从 IM 发来的消息（第一行是 [来自 QQ 私聊] 这类 IM 窗口名）开始或并进的回合，你说的话 Rhodium 会实时转回那个窗口，最终回复也会发过去，和无头时一样。进度和结果直接写在回复里，不要再用 rh send 往同一个窗口发文字：那样会停掉这一回合后面的转发和最终回复。\n- 别的槽位发来的消息要回，用 `rh send <工作区/槽位>`。\n- 要让不在电脑前的用户知道事，用 `rh send me`。\n- `rh send me` 是往用户的 IM 推一条通知，",
   );
   expect(prompt).toContain("- 你派生的子槽位不能直接给用户发消息。");
-  expect(prompt).toContain("- QQ Bot echo 的私聊（`rh send echo`）：");
+  expect(prompt).toContain("- `rh send` 的正文用 Markdown 写，单个换行照原样换行。多行或带排版的，文字写成 `-`，从标准输入给正文，例如：\n  ```\n  rh send me - <<'EOF'\n  正文\n  EOF\n  ```");
   for (const gone of ["托管的无头 agent", "用户从 IM 发来的消息开始的回合", "用户从网页发来的消息开始的回合", "- 别的消息开始的回合", "- 这样的回合里", "在一个回合里用带文字的", "没有这一行的消息不是用户从 IM 发的"]) expect(prompt).not.toContain(gone);
 });
 

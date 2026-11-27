@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { claudeProjectDir, type Script } from "./fake-agent/fake-agent";
 import { endTurn, on, startTurn } from "./fake-agent/scripts";
 import { call } from "./fake-herdr/fake-herdr";
-import { newInstance, until, type Instance, type InstanceOptions } from "./instance";
+import { newInstance, recorded, until, type Instance, type InstanceOptions } from "./instance";
 
 const ME = "you-openid";
 const FIXTURES = join(import.meta.dir, "fixtures/transcripts");
@@ -438,4 +438,79 @@ test.each([
   const listed = (await rhodium.im.log("t", ME)).find((p) => p.buttons?.length)!;
   expect(listed.text).toBe(`导入哪一个？${where(rhodium.herdr.session)}正在用的排在前面。`);
   expect(listed.buttons!.map((b) => b.label)).toEqual([expect.stringMatching(/^Herdr 里 ~\/proj \d\d:\d\d Use the …$/), "取消"]);
+}, 30_000);
+
+// pi's Anthropic variables (src/agents.ts READ_BY_PI): your shell may have them, the tests' too.
+const PI_UNSET = "unset ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL";
+
+/** A tab of your own in dir where you start pi as you would; env: what its shell line sets for it.
+ *  Resolves once pi's Herdr extension reports its session's file. */
+async function yourPi(dir: string, label: string, env = "") {
+  const pane: string = (await herdr("workspace.create", { cwd: dir, label })).root_pane.pane_id;
+  const session = crypto.randomUUID();
+  await herdr("pane.send_input", { pane_id: pane, text: `${PI_UNSET}; ${env} pi --session-id ${session}`, keys: ["enter"] });
+  await until(async () => (await herdr("pane.get", { pane_id: pane })).pane.agent_session?.value?.endsWith(`_${session}.jsonl`), 15_000);
+  const pi = async () => (await herdr("pane.process_info", { pane_id: pane })).process_info.foreground_processes.find((f: any) => f.argv[0] === "pi")?.pid as number | undefined;
+  await until(async () => (await pi()) !== undefined, 15_000);
+  return { pane, session, pid: (await pi())! };
+}
+
+test("#811: rh import of a Herdr pane running pi makes it a pi slot in TUI mode; once you quit it there, the slot is headless and goes on with that conversation", async () => {
+  await begin();
+  const dir = project("pi-proj");
+  const mine = await yourPi(dir, "pi-proj");
+  const ref = `pi-proj/${mine.session.slice(0, 8)}`;
+  expect(await rhodium.ok("import", mine.pane)).toContain(`已导入成 ${ref}`);
+  expect(await rhodium.state(ref)).toBe("TUI 模式");
+  await recorded(rhodium, `SELECT 1 FROM slot WHERE herdrPane = '${mine.pane}' AND tuiPid = ${mine.pid} AND tuiStart > 0`);
+
+  await quit(mine.pane);
+  await until(async () => (await rhodium.state(ref)) === "未运行", 15_000);
+  await rhodium.ok("send", ref, "hi");
+  await until(() => rhodium.pi.runs().some((r) => r.argv.includes("--mode")), 15_000);
+  const headless = rhodium.pi.runs().find((r) => r.argv.includes("--mode"))!;
+  expect(headless.argv).toEqual(expect.arrayContaining(["--session-id", mine.session]));
+  expect(headless.cwd).toBe(dir);
+}, 45_000);
+
+test("#811: a pi pane whose pi has an Anthropic variable is not imported, and the answer does not show its value", async () => {
+  await begin();
+  const dir = project("pi-proj");
+  const mine = await yourPi(dir, "pi-proj", "ANTHROPIC_API_KEY=sk-ant-secret-811");
+  const slots = await rhodium.ok("ls");
+  const r = await rhodium.rh(["import", mine.pane]);
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("带着 Anthropic 的凭据");
+  expect(r.err + r.out).not.toContain("sk-ant-secret-811");
+  expect(await rhodium.ok("ls")).toBe(slots);
+}, 30_000);
+
+test("#811: a pi pane is refused as a Claude one is: while another pane reports its conversation, or once a slot has the pane", async () => {
+  await begin();
+  const dir = project("pi-proj");
+  const mine = await yourPi(dir, "pi-proj");
+  const refused = async (why: string) => {
+    const slots = await rhodium.ok("ls");
+    const r = await rhodium.rh(["import", mine.pane]);
+    expect([r.code, r.err]).toEqual([1, expect.stringContaining(why)]);
+    expect(await rhodium.ok("ls")).toBe(slots);
+  };
+  const ws = await herdr("workspace.create", { cwd: dir, label: "other" });
+  const reported = (await herdr("pane.get", { pane_id: mine.pane })).pane.agent_session.value;
+  await herdr("pane.report_agent_session", { pane_id: ws.root_pane.pane_id, source: "herdr:pi", agent: "pi", agent_session_path: reported });
+  await refused("Herdr 里另一个 pane 正在用这段对话");
+  await herdr("tab.close", { tab_id: ws.tab.tab_id });
+
+  await rhodium.ok("import", mine.pane);
+  await refused(`这个 pane 已经是 pi-proj/${mine.session.slice(0, 8)} 的了`);
+}, 30_000);
+
+test("#811: rh import alone lists a pi pane by its conversation's id", async () => {
+  await begin();
+  const dir = project("pi-proj");
+  const mine = await yourPi(dir, "pi-proj");
+  const shown = (await rhodium.rh(["import"], { cwd: dir, tty: false })).out;
+  expect(shown).toContain(`rh import ${mine.pane}  pi  ${dir}`);
+  // Not again as the conversation on disk it writes.
+  expect(shown).not.toContain(`rh import ${mine.session.slice(0, 8)}`);
 }, 30_000);

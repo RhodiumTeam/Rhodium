@@ -44,10 +44,11 @@ const pushes = async (bot: string) => ({ rows: (await rhodium.im.rowLog(bot)).le
 
 const say = (bot: string, text: string, chat = ME) => rhodium.im.inject(bot, { chat, sender: ME, text });
 
-/** The texts the bot has posted in the chat, once there are n. */
+/** The texts the bot has posted in the chat, once there are n; a turn's draft not (#784), the message it ends in does. */
 async function posts(bot: string, n: number, chat = ME): Promise<string[]> {
-  await until(async () => (await rhodium.im.log(bot, chat)).length >= n, 15_000);
-  return (await rhodium.im.log(bot, chat)).map((p) => p.text);
+  const sent = async () => (await rhodium.im.log(bot, chat)).filter((p) => p.kind !== "draft");
+  await until(async () => (await sent()).length >= n, 15_000);
+  return (await sent()).map((p) => p.text);
 }
 
 /** Each fake claude run as [the slot directory it ran in, the messages it was given]. */

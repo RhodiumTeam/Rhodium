@@ -429,6 +429,28 @@ test("story 23, §9.8 on Telegram: /rh_archive alone offers the slots not archiv
 
 const HOME = [["槽位", "切换", "切到 TUI", "换 agent"], ["改名…", "归档", "导入", "默认槽位"], ["工具行详略"], ["取消"]];
 
+test("a buttonless /rh_help offers numbered commands and accepts a choice", async () => {
+  await start(["a", "b"], { bots: { q: { like: "qq", owner: ME, target: "w/a", buttons: "false", markdown: "false" } } });
+  await say("q", "/rh_help");
+  const [help] = await shown("q", 1);
+  expect(help!.text).toContain("这里的消息交给 w/a");
+  expect(help!.text).toContain("2. 切换");
+  expect(help!.text).toContain("回编号选一个。");
+  expect(help!.buttons).toBeUndefined();
+  await say("q", "2");
+  await reads("q", 1, /这里的消息交给谁？[\s\S]*2\. w\/b/);
+  await say("q", "2");
+  await reads("q", 2, "这里的消息改交给 w/b。");
+}, 30_000);
+
+test("a buttonless /rh_help: picking 改名… sends /rh_rename, which answers with its example", async () => {
+  await start(["a"], { bots: { q: { like: "qq", owner: ME, target: "w/a", buttons: "false", markdown: "false" } } });
+  await say("q", "/rh_help");
+  expect((await shown("q", 1))[0]!.text).toContain("5. 改名…");
+  await say("q", "5");
+  await reads("q", 1, "/rh_rename 后面写新名字，例如 /rh_rename new-name；改别的槽位，先写槽位，例如 /rh_rename w/a new-name。");
+}, 30_000);
+
 test("stories 328, 329 on QQ: /rh_help is Rhodium's home: who this chat goes to, then a button for each function on one page, unnumbered; 改名… fills the input box", async () => {
   await start(["a"]);
   await say("q", "/rh_help");

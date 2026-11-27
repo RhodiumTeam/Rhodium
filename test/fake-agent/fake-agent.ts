@@ -1,9 +1,9 @@
 // Fake agent and replayer: stands in for `claude`, `pi` and `codex` in tests.
 // It only handles lines; it knows nothing about Claude's, pi's or Codex's types.
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { call } from "../../src/herdr.ts";
 import { builtins } from "./scripts.ts";
 
@@ -349,14 +349,33 @@ export function realHome(): string | undefined {
   return passwd.find((f) => f[2] === uid)?.[5];
 }
 
+/** The destination may not exist yet. Resolve its existing parent, including junctions. */
+export function temporaryTranscriptDir(dir: string, roots: string[]): boolean {
+  let existing = resolve(dir);
+  while (!lstatSync(existing, { throwIfNoEntry: false })) {
+    const parent = dirname(existing);
+    if (parent === existing) return false;
+    existing = parent;
+  }
+  const at = realpathSync(existing);
+  return roots.some(root => existsSync(root) && relative(realpathSync(root), at).split(sep)[0]!.startsWith("rhodium-test-"));
+}
+
 /** A test that forgot to point HOME at a temp dir must not touch the user's own transcripts. */
 function refuseRealHome(dir: string, own: string) {
-  const home = realHome();
-  const [at, mine] = [resolve(dir), home && join(home, own)];
-  if (mine && (at === mine || at.startsWith(`${mine}/`))) {
-    console.error(`fake-agent: refusing to write a transcript under ${dir}; set HOME or ${own === ".claude" ? "CLAUDE_CONFIG_DIR" : own === ".codex" ? "CODEX_HOME" : "--session-dir"}`);
-    process.exit(2);
+  if (process.platform === "win32" || process.platform === "darwin") {
+    // USERPROFILE/HOME are overridden by these fixtures; Darwin's directory users are absent from /etc/passwd.
+    const roots = [tmpdir()];
+    if (process.platform === "win32" && process.env.RUNNER_TEMP) roots.push(process.env.RUNNER_TEMP);
+    if (process.platform === "darwin") roots.push("/private/tmp");
+    if (temporaryTranscriptDir(dir, roots)) return;
+  } else {
+    const home = realHome();
+    const [at, mine] = [resolve(dir), home && join(home, own)];
+    if (!mine || (at !== mine && !at.startsWith(`${mine}/`))) return;
   }
+  console.error(`fake-agent: refusing to write a transcript under ${dir}; set HOME or ${own === ".claude" ? "CLAUDE_CONFIG_DIR" : own === ".codex" ? "CODEX_HOME" : "--session-dir"}`);
+  process.exit(2);
 }
 
 function transcriptFile(sessionId: string): string {

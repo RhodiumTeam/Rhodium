@@ -1,12 +1,25 @@
 // Process-level self-tests for the fake agent: start it, feed stdin, compare stdout.
 import { afterAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeProjectDir, installFakeAgent, type Config } from "./fake-agent/fake-agent.ts";
+import { claudeProjectDir, installFakeAgent, temporaryTranscriptDir, type Config } from "./fake-agent/fake-agent.ts";
 
 const base = mkdtempSync(join(tmpdir(), "rhodium-test-fake-agent-"));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+test("native fake transcripts stay inside an existing rhodium-test directory, including through links", () => {
+  const temp = join(base, "temporary");
+  const fixture = join(temp, "rhodium-test-guard");
+  const outside = join(base, "outside");
+  mkdirSync(fixture, { recursive: true });
+  mkdirSync(outside);
+  symlinkSync(outside, join(fixture, "redirect"), process.platform === "win32" ? "junction" : "dir");
+  expect(temporaryTranscriptDir(join(fixture, "codex-home", "sessions"), [temp])).toBe(true);
+  expect(temporaryTranscriptDir(join(fixture, "redirect", "sessions"), [temp])).toBe(false);
+  expect(temporaryTranscriptDir(join(outside, ".codex"), [temp])).toBe(false);
+  expect(temporaryTranscriptDir(join(temp, "rhodium-test-nonexistent", ".codex"), [temp])).toBe(false);
+});
 
 let count = 0;
 function setup(config: Config) {

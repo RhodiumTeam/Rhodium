@@ -182,6 +182,22 @@ test("story 85: a confirm request waiting for the turn's end goes to you, once, 
   expect((await texts(1)).filter((t) => t === asks("rh archive w/b"))).toHaveLength(1);
 }, 30_000);
 
+test("a confirm request stays answerable after you /stop its slot's turn: Rhodium's own, the agent never withdraws it", async () => {
+  // After a first turn, w/a makes the rh call and its turn goes on: the interrupt leaves it stopped but not ended.
+  const script: Script = { on, steps: [...startTurn, ...endTurn("done"), ...startTurn, { rhFrom: "in.message.content.0.text" }, { wait: { type: "user" } }] };
+  rhodium = newInstance({ bots: { q: { like: "qq", owner: ME, target: "w/a" } }, claude: { script } });
+  await rhodium.start();
+  await rhodium.slots("a", "b");
+  await say("hello");
+  await texts(1);
+  await rhodium.ok("send", "w/a", plan(["archive", "w/b"]));
+  expect(await texts(2)).toEqual(["done", asks("rh archive w/b")]);
+  await say("/stop");
+  await texts(3);
+  await say("1");
+  expect((await texts(4))[3]).toBe("已回答：同意。");
+}, 30_000);
+
 test("story 86: a confirm request nobody answers in time is a refusal: nothing runs, the agent hears so, and your next message is a message again", async () => {
   await begin({ toml: '[durations]\naskTimeout = "500ms"' });
   await say(plan(["stop", "w/b"]));

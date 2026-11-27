@@ -1,7 +1,7 @@
 // Routing and rules (architecture §2): (current state, input) -> (writes, events, effects).
 // A pure function: no network, database or clock. Time and ids come in through ctx, and so does
 // the one side effect, rh send --file's copy of its file (architecture §8.3).
-import { homedir } from "node:os";
+import { expandHome, sameDirectory } from "./paths";
 import { basename, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { AGENT_KINDS, AGENTS, DEFAULT_AGENT, TYPING } from "./agents";
@@ -16,8 +16,8 @@ import type { FlowView } from "./bot-flow";
 import { amid, MADE, PLATFORMS, series, type BotDef, type Made } from "./platforms";
 import { DECISION_LINE, REPORT_LINE, RESUME_PROMPT, sendLine, sourceLine, withoutSource } from "./prompt";
 import { forIm, localRefs, type Checked } from "./reply-images";
-import { append, chunkText, clip, edit, finish, finishEdit, freeze, hide, hush, markdown, md, moveOn, plain, queryMarkdown, runningText, start, type Msg, type Progress, type View } from "./render";
-import { madeAt, type AgentInput, type Ask, type Bot, type Chat, type Conversation, type Holder, type Insert, type ModelInfo, type NewEvent, type Outbound, type Patch, type Quota, type Slot, type Tables, type Where, type Workspace } from "./store";
+import { append, chunkText, clip, edit, finish, finishEdit, flow, freeze, hide, hush, markdown, md, moveOn, pause, plain, queryMarkdown, runningText, settle, start, unpanel, type Flow, type Msg, type Progress, type View } from "./render";
+import { importedSessionKey, madeAt, type AgentInput, type Ask, type Bot, type Chat, type Conversation, type Holder, type Insert, type ModelInfo, type NewEvent, type Outbound, type Patch, type Quota, type Slot, type Tables, type Where, type Workspace } from "./store";
 
 /** What the router sees: whole tables, read in the same transaction its writes commit in. */
 // ponytail: loads every row per input; narrow to what each input needs once tables grow.
@@ -87,6 +87,7 @@ export type Ctx = {
   keepFile: (path: string, max: number) => { size: number; path?: string } | null;
   diskFree: () => number;
   herdr: () => boolean;
+  tuiUnavailable?: (agent: AgentKind) => string | undefined;
   front: () => boolean;
   retarget: (from: string, to: string) => { bots: string[]; backup: string } | null;
   dropBot: (name: string) => void;
@@ -399,7 +400,7 @@ function board(state: State, { id, act }: Extract<Input, { kind: "board" }>, ctx
       if (!BOARD_RH.includes(name!) || off) refuse(`看板不做 rh ${act.argv.join(" ")}。`);
       // A directory as you write it on a phone, under ~, which no shell expands here: a new workspace's,
       // or the one to look in for what to import.
-      const argv = act.argv.map((a, i) => ((name === "ws" && i === 2) || (name === "import" && act.argv[i - 1] === "--dir") ? a.replace(/^~(?=\/|$)/, homedir()) : a));
+      const argv = act.argv.map((a, i) => ((name === "ws" && i === 2) || (name === "import" && act.argv[i - 1] === "--dir") ? expandHome(a) : a));
       const out = rh(state, { kind: "rh", id, caller: AT_BOARD, argv }, { kind: "you", board: true }, ctx, d);
       // What there is to import comes back as IM's panel, every candidate at once (imported()).
       d.effects = d.effects.map((e) => (e.kind === "import" ? { ...e, chat: BOARD } : e));
@@ -840,9 +841,9 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   // An ask pushed here that this chat does not go to, say a child's in its root slot's chat or one
   // another bot forwarded (tell()), takes your answer here, before the slot this chat goes to (product §5.3).
   // With asks of another slot too, this chat's or another one pushed here, you pick from one list of them all.
-  const away = !bang && !cmd && !sender ? state.asks.filter((a) => a.status === "open" && a.forwardedTo === chat.id && a.slot !== slot?.id) : [];
+  const away = !bang && !cmd && !sender ? state.asks.filter((a) => a.status === "open" && a.forwardedTo === chat.id && a.slot !== slot?.id && answerable(state, a)) : [];
   if (away.length) {
-    const asks = state.asks.filter((a) => away.includes(a) || (a.status === "open" && a.slot === slot?.id));
+    const asks = state.asks.filter((a) => away.includes(a) || (a.status === "open" && a.slot === slot?.id && answerable(state, a)));
     const one = asks.every((a) => a.slot === away[0]!.slot);
     return record(one ? away[0]!.slot : null, answerFromIm(state, ctx, d, asks, text, attachments.length > 0, chat, id));
   }
@@ -859,7 +860,7 @@ function im(state: State, m: InboundMessage, ctx: Ctx): Decision {
   if (cmd?.kind === "common" && (!tui || cmd.name === "status")) return done(common(state, slot, cmd, patch, d, ctx, chat.id, id, ui));
   // With asks open, your message is for them (product §5.3); a ! message interrupts instead. So it
   // is while the slot waits for its turn to end to switch to the terminal: the turn needs the answers.
-  const open = openAsks(state, slot);
+  const open = openAsks(state, slot).filter((a) => answerable(state, a));
   if (open.length && !bang && !cmd) {
     // Your quote brought another slot's asks here: what you type here next, a number too, is for them (away above).
     // As with an ask pushed here (pushAsk()), the picks and lists of the others you answer here are void.
@@ -1089,12 +1090,18 @@ function rhCommand(state: State, cmd: { word: string; args: string }, here: Slot
   if (!def) return fail(`没有 ${cmd.word} 这个命令，${im ? "发 /rh_help" : "打 /"} 看有哪些。`);
   const args = cmd.args.split(/\s+/).filter(Boolean);
   if (name === "help") {
+    const caps = ctx.capabilities(im!.bot.id);
+    const candidates = homeButtons(here?.mode);
+    const text = here ? `这里的消息交给 ${slotView(state, here).ref}，用 ${AGENTS[agentOf(state, here)].name}。` : "这里还没指定槽位。";
+    if (!caps?.buttons) {
+      showIn(state, ctx, d, at, { command: cmd.word, head: [text], candidates });
+      return null;
+    }
     // Rhodium's home (docs/im-style.md §10.1): not paged, so its 9 are past a page's 8. A press shows,
     // on Telegram, in place of it, with 返回 to it, as /status's buttons do (§7).
-    const buttons = layout(homeButtons(here?.mode).map((c) => ({ label: c.label, data: c.command, ...(c.fill !== undefined && { fill: c.fill }) })), true);
+    const buttons = layout(candidates.map((c) => ({ label: c.label, data: c.command, ...(c.fill !== undefined && { fill: c.fill }) })), true);
     buttons.push({ label: "取消", data: CANCEL, row: buttons.at(-1)!.row! + 1, muted: true });
-    const text = here ? `这里的消息交给 ${slotView(state, here).ref}，用 ${AGENTS[agentOf(state, here)].name}。` : "这里还没指定槽位。";
-    answer(d, ctx, at, text, fitting(ctx.capabilities(im!.bot.id), buttons));
+    answer(d, ctx, at, text, fitting(caps, buttons));
     return null;
   }
   if (name === "verbose") return verbose(ctx, d, im!.chat, ctx.capabilities(im!.bot.id), at, args);
@@ -1778,8 +1785,10 @@ function finalReply(state: State, ctx: Ctx, d: Decision, slot: Slot, progress: T
     send(state, q, ctx, d, to, slot.turnInbound, pics.files, slotView(state, slot).ref);
   } else {
     // On QQ, what the agent said before its last went out already, or waits for now. A reply
-    // that went out mid-turn, tools after it, leaves nothing to send, and was still given.
-    last = finish(progress, reply, v, pics.tail).map((text) => ({ text }));
+    // that went out mid-turn, tools after it, leaves nothing to send, and was still given. Its
+    // stream, if one is open, closes with all it has to show first.
+    const p = v.caps.stream ? showFlow(state, d, ctx, to, slot, progress, settle(progress, v)) : progress;
+    last = finish(p, reply, v, pics.tail).map((text) => ({ text }));
     send(state, q, ctx, d, to, slot.turnInbound, [...last, ...pics.files], slotView(state, slot).ref);
   }
   if (!slot.turnSentMe && (reply || last.length)) d.events.push({ source: "agent", type: "final_reply", slot: slot.id, ...(slot.turnInbound && { trace: slot.turnInbound }) });
@@ -1842,13 +1851,15 @@ function step(state: State, ctx: Ctx, d: Decision, slot: Slot, progress: TurnPro
     const says = e.type === "text_delta" || (e.type === "item" && e.item.kind === "message");
     if (memo?.commands && says && !v.toolsOnly) d.writes.push({ op: "update", table: "chat", where: { id: to.chat.id }, patch: { panel: unnumbered(memo) } });
     const p = showEdit(d, ctx, to, slot, progress, edit(progress, e, v));
-    // Its line says for how long it runs, from a minute on (im-style §3.1).
-    if (e.type === "tool_start") d.effects.push({ kind: "timer", timer: "tool_running", key: e.conv, at: ctx.now + MINUTE });
+    // Its line says for how long it runs, from a minute on (im-style §3.1); a draft's clock does that too (showEdit).
+    if (e.type === "tool_start" && !to.caps.draftTtl) d.effects.push({ kind: "timer", timer: "tool_running", key: e.conv, at: ctx.now + MINUTE });
     return p;
   }
   const q = quotas(state, ctx, d);
   // Room for what it says: one passive reply stays for the final message, one for the hint.
-  const r = append(progress, e, v, q.passive(slot.turnInbound!) - 2);
+  const room = q.passive(slot.turnInbound!) - 2;
+  if (to.caps.stream) return showFlow(state, d, ctx, to, slot, progress, flow(progress, e, v, room, !streaming(state, to.chat.id, slot)));
+  const r = append(progress, e, v, room);
   for (const text of r.sends) {
     q.take("qq_passive", slot.turnInbound!);
     outbound(d, ctx, { chat: to.chat.id, replyTo: slot.turnInbound, trace: slot.turnInbound, text, markdown: markdown(text, to.caps) });
@@ -2418,14 +2429,28 @@ function clock(state: State, input: Extract<Input, { kind: "clock" }>, ctx: Ctx)
   }
   if (input.timer === "tool_running") {
     // A minute more of the step the turn's message shows running: its line says so (im-style §3.1).
+    // A draft's message goes again, changed or not, before it is dropped: showEdit sets the next time.
     const p = progressOf(state.conversations.find((c) => c.id === input.key)?.progress);
     const s = state.slots.find((s) => s.conversation === input.key);
     const to = s && shown(state, ctx, s);
-    if (!p?.running || !s || to?.caps.progress !== "edit") return d;
-    const next = showEdit(d, ctx, to, s, p, edit(p, null, viewOf(to, s, ctx)));
+    const draft = !!to?.caps.draftTtl;
+    if (!(draft ? p?.live : p?.running) || !s || to?.caps.progress !== "edit") return d;
+    const next = showEdit(d, ctx, to, s, p!, edit(p!, null, viewOf(to, s, ctx), draft));
     d.writes.push({ op: "update", table: "conversation", where: { id: input.key }, patch: { progress: JSON.stringify(next) } });
-    const minutes = Math.floor((ctx.now - p.running.since) / MINUTE) + 1;
-    d.effects.push({ kind: "timer", timer: "tool_running", key: input.key, at: p.running.since + minutes * MINUTE });
+    if (draft) return d;
+    const minutes = Math.floor((ctx.now - p!.running!.since) / MINUTE) + 1;
+    d.effects.push({ kind: "timer", timer: "tool_running", key: input.key, at: p!.running!.since + minutes * MINUTE });
+    return d;
+  }
+  if (input.timer === "stream_cap") {
+    // A stream has run as long as one may (Capabilities.stream): it closes, the rest goes on in another.
+    // Set again at startup, the last rhodium's clock gone with it.
+    const p = progressOf(state.conversations.find((c) => c.id === input.key)?.progress);
+    const s = state.slots.find((s) => s.conversation === input.key);
+    const to = s && shown(state, ctx, s);
+    if (!p?.stream?.open || !s || !to?.caps.stream) return d;
+    if (ctx.now < p.stream.since + to.caps.stream) d.effects.push({ kind: "timer", timer: "stream_cap", key: input.key, at: p.stream.since + to.caps.stream });
+    else d.writes.push({ op: "update", table: "conversation", where: { id: input.key }, patch: { progress: JSON.stringify(showFlow(state, d, ctx, to, s, p, flow(p, null, viewOf(to, s, ctx), quotas(state, ctx, d).passive(s.turnInbound!) - 2, false))) } });
     return d;
   }
   if (input.timer === "tui_held") {
@@ -3409,7 +3434,7 @@ function imported(state: State, input: Extract<Input, { kind: "import" }>, ctx: 
     return say(false, `没能导入，这段对话是 ${ref} 用过的。要接着用，${how}。`);
   }
   const name = input.name ?? f.session.slice(0, 8);
-  const had = state.workspaces.find((w) => w.dir === f.dir);
+  const had = state.workspaces.find((w) => sameDirectory(w.dir, f.dir));
   if (had && state.slots.some((s) => s.workspace === had.id && s.name === name)) return say(false, `没能导入，工作区 ${had.name} 里已经有槽位 ${name}，用 --name 另起一个名字。`);
   const ws = workspaceFor(state, ctx, d, f.dir, "import");
   const slot = addSlot(state, ctx, d, { workspace: ws, name, dir: f.dir, agent: f.agent, state: "off", lifetime: "longterm", session: f.session });
@@ -3440,6 +3465,10 @@ const prompt = (a: Ask) => JSON.parse(a.prompt!) as AskPrompt;
 const agentAsks = (state: State, slot: Slot) => state.asks.filter((a) => a.slot === slot.id && a.kind !== "confirm");
 /** The slot's asks waiting on you, oldest first, confirm requests too. */
 const openAsks = (state: State, slot: Slot) => state.asks.filter((a) => a.slot === slot.id && a.status === "open");
+/** Whether your words can answer the ask: an agent's ask not once its slot's turn was stopped, as the
+ *  agent then withdraws it, maybe a moment later; what you send meanwhile is a message, held for the
+ *  next turn (#31). A confirm request is Rhodium's own, which no agent withdraws. */
+const answerable = (state: State, a: Ask) => a.kind === "confirm" || state.slots.find((s) => s.id === a.slot)?.interruptedAt == null;
 /** Those the agent's turn waits on: all but confirm requests (product §5.8). */
 const blocking = (state: State, slot: Slot) => agentAsks(state, slot).filter((a) => a.status === "open");
 
@@ -3477,14 +3506,22 @@ function underIt(state: State, ctx: Ctx, d: Decision, slot: Slot, p = progressOf
   const to = toChat(state, slot.turnChat, ctx);
   if (!p?.live || !to?.caps) return;
   const v = viewOf({ ...to, caps: to.caps }, slot, ctx);
-  d.writes.push({ op: "update", table: "conversation", where: { id: conversation }, patch: { progress: JSON.stringify({ ...moveOn(p, v), live: undefined, left: [...(p.left ?? []), p.live] }) } });
+  // A stream closes as it is; what is said after goes on in another, under it.
+  const next = v.caps.stream ? pause(p, v).progress : moveOn(p, v);
+  d.writes.push({ op: "update", table: "conversation", where: { id: conversation }, patch: { progress: JSON.stringify({ ...next, live: undefined, left: [...(p.left ?? []), p.live] }) } });
+  const n = d.effects.length;
   lastEdit(d, p.live, p, v);
+  // Before what went under it: a draft's last edit sends it as a message, which then stays above (#784).
+  const first = d.effects.findIndex((x) => x.kind === "send");
+  if (d.effects.length > n && first >= 0) d.effects.splice(first, 0, d.effects.pop()!);
 }
 
 /** The last edit of the turn's message live, nothing more going to it: as p shows it, without the
  *  step still running, which may still be to make. Turned down, its text goes all the same (editFailed). */
 function lastEdit(d: Decision, live: string, p: TurnProgress, v: View): void {
-  const m = freeze(p, v);
+  // A stream, whose frames only grow, closes with what it showed.
+  const m = v.caps.stream ? (pause(p, v).out[0] as { edit: Msg } | undefined)?.edit : freeze(p, v);
+  if (!m) return;
   editLive(d, p, live, m, { final: true, unchanged: m.text === p.shown });
 }
 
@@ -3497,7 +3534,8 @@ function editLive(d: Decision, p: TurnProgress, live: string, m: Msg, o: { final
   if (lead?.once !== undefined && (!o.final || m.text === lead.once)) return;
   const on = (s: string) => (lead ? `${lead.text}\n\n${s}` : s);
   const unchanged = o.unchanged && lead?.once === undefined;
-  d.effects.push({ kind: "edit", outbound: live, text: on(m.text), markdown: m.markdown && on(m.markdown), ...(o.final && { final: true as const }), ...(unchanged && { unchanged: true as const }) });
+  // Panels are Feishu's own: elsewhere, quoted tool lines.
+  d.effects.push({ kind: "edit", outbound: live, text: on(m.text), markdown: m.markdown && on(lead ? unpanel(m.markdown) : m.markdown), ...(o.final && { final: true as const }), ...(unchanged && { unchanged: true as const }) });
 }
 
 const MINUTE = 60_000;
@@ -3532,13 +3570,43 @@ function shown(state: State, ctx: Ctx, slot: Slot): (To & { caps: Capabilities }
  *  should it be turned down, its text goes all the same, even once the turn is over (editFailed). */
 function showEdit(d: Decision, ctx: Ctx, to: To, slot: Slot, p: TurnProgress, r: { progress: Progress; out: Msg[] }): TurnProgress {
   let live = p.live;
+  const ttl = to.caps?.draftTtl;
   r.out.forEach((m, i) => {
     if (i === 0 && live) editLive(d, p, live, m, { final: r.out.length > 1 });
-    else live = outbound(d, ctx, { chat: to.chat.id, replyTo: slot.turnInbound, trace: slot.turnInbound, text: m.text, markdown: m.markdown });
+    // Only the last is the turn's message from now on: one between, done already, goes as a message.
+    else live = outbound(d, ctx, { chat: to.chat.id, replyTo: slot.turnInbound, trace: slot.turnInbound, text: m.text, markdown: m.markdown, ...(ttl && i === r.out.length - 1 && { draft: true as const }) });
   });
+  // A draft goes again before it is dropped (architecture §8.2): a sixth of its time left for the request.
+  if (ttl && r.out.length) d.effects.push({ kind: "timer", timer: "tool_running", key: slot.conversation!, at: ctx.now + (ttl * 5) / 6 });
   const left = r.out.length > 1 && p.live ? [...(p.left ?? []), p.live] : p.left;
   return { ...r.progress, live, chat: to.chat.id, left, ...(slot.turnSentMe === 1 && { toolsOnly: true as const }) };
 }
+
+/** What flow() made of the turn, in its chat (Capabilities.stream): messages and streams, each a
+ *  passive reply to your message, as the room flow() was given allowed; frames of the turn's stream,
+ *  live while it is open. */
+function showFlow(state: State, d: Decision, ctx: Ctx, to: To, slot: Slot, p: TurnProgress, r: { progress: Progress; out: Flow[] }): TurnProgress {
+  const q = quotas(state, ctx, d);
+  let live = p.live;
+  for (const o of r.out) {
+    if ("edit" in o) {
+      editLive(d, p, live!, o.edit, { final: o.final, unchanged: o.unchanged });
+      if (o.final) live = undefined;
+      continue;
+    }
+    q.take("qq_passive", slot.turnInbound!);
+    const m = "send" in o ? { text: o.send, markdown: markdown(o.send, to.caps) } : o.open;
+    const id = outbound(d, ctx, { chat: to.chat.id, replyTo: slot.turnInbound, trace: slot.turnInbound, ...m, ...("open" in o && { stream: true as const }) });
+    if (!("open" in o)) continue;
+    live = id;
+    d.effects.push({ kind: "timer", timer: "stream_cap", key: slot.conversation!, at: ctx.now + to.caps!.stream! });
+  }
+  return { ...r.progress, live, chat: to.chat.id };
+}
+
+/** Whether another turn's stream is open in the chat: QQ has one at a time, a new one ending the old. */
+const streaming = (state: State, chat: string, slot: Slot) =>
+  state.conversations.some((c) => c.id !== slot.conversation && progressOf(c.progress)?.stream?.open && progressOf(c.progress)?.chat === chat);
 
 /** An ask from the slot's agent, or a confirm request about the slot's rh call: on record, then sent
  *  to the slot's contact chat, or at, which it returns. deferred: it waits for the slot's turn to end
@@ -3779,9 +3847,11 @@ export type Payload = {
   ask?: string; // it asks you this ask: once it is sent, the ask has reached you (pushedAt)
   buttons?: Button[]; // to press: an ask's, gone once it is settled, or ones that copy what a notice quotes
   secret?: true; // a pairing code (product §5.11): once sent, no text of it is kept for a quote
+  stream?: true; // a turn's stream (Capabilities.stream): edits make it grow, the last closes it
   // rh send's from a slot (sendYou()): what it marked the slot's turn, begun at at, with; taken back
   // should it fail in that turn (unsaid()).
   said?: { slot: string; at?: number | null; sentMe?: true };
+  draft?: true; // a turn's message, shown as a draft (OutboundMessage.draft)
 };
 const payload = (o: Outbound) => JSON.parse(o.payload!) as Payload;
 
@@ -3880,6 +3950,20 @@ function unsaid(state: State, ctx: Ctx, d: Decision, p: Payload): Decision {
  *  does the last of a message the turn moved on from; an older edit of one it replaced goes nowhere. */
 function editFailed(state: State, e: Extract<Input, { kind: "edit_failed" }>, ctx: Ctx): Decision {
   const d = nothing();
+  const to = toChat(state, e.chat, ctx);
+  if (to?.caps?.stream) {
+    // A turn's stream that did not take: the rest of what it shows goes as a message once said, none
+    // of it in a stream. One closed already: what it was to show goes as a message, on the quota.
+    const conv = state.conversations.find((c) => progressOf(c.progress)?.live === e.outbound && progressOf(c.progress)?.stream?.open);
+    const p = conv && progressOf(conv.progress)!;
+    if (p) d.writes.push({ op: "update", table: "conversation", where: { id: conv.id }, patch: { progress: JSON.stringify({ ...p, live: undefined, shown: "", stream: { ...p.stream!, open: undefined, broken: true } }) } });
+    else if (e.final) {
+      const placed = place(quotas(state, ctx, d), to, e.trace);
+      const hintedBy = placed.hint ? hint(d, ctx, to.chat.id, e.trace!, e.trace) : undefined;
+      outbound(d, ctx, { chat: to.chat.id, replyTo: placed.replyTo, trace: e.trace, status: placed.status, ...(hintedBy && { hintedBy }), text: e.text, markdown: e.markdown });
+    }
+    return d;
+  }
   // A chat that can't edit, which a turn's message went to through another bot (refused()): only the
   // turn's last text goes there, not a new message each time the turn moves on.
   if (!e.final && toChat(state, e.chat, ctx)?.caps?.progress !== "edit") return d;
@@ -3981,7 +4065,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
     const child = who.kind === "slot" && isChild(state, who.slot);
     throw new Usage(`用法：rh ${def.name} ${(child && def.child?.usage) || def.usage}`);
   };
-  const dir = (p: string) => resolve(input.caller.cwd, p);
+  const dir = (p: string) => resolve(input.caller.cwd, process.platform === "win32" ? expandHome(p) : p);
 
   // Product §6.2. These guard against mistakes, not malice (architecture §11).
   if (who.kind !== "you") {
@@ -4206,6 +4290,8 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       if (!ctx.herdr()) refuse(`没装 Herdr，${ref} 切不到 TUI。`);
       if (s.nextAgent !== null) refuse(`${ref} 在等这一回合结束换成 ${s.nextAgent}，换完再切到 TUI。`);
       const conv = state.conversations.find((c) => c.id === s.conversation)!;
+      const unavailable = ctx.tuiUnavailable?.(conv.agent);
+      if (unavailable) refuse(unavailable);
       // A turn under way gets the session written before it ends; a slot with none yet starts one in
       // the terminal (stories 544, 545).
       const turn = (s.state === "starting" || s.state === "running" || s.state === "waiting") && !stopping(state, conv.id);
@@ -4582,6 +4668,7 @@ function rh(state: State, input: RhInput, who: Caller, ctx: Ctx, d: Decision): s
       d.writes.push({ op: "delete", table: "ask", where: { slot: s.id } });
       for (const c of state.conversations.filter((c) => c.slot === s.id))
         d.writes.push({ op: "delete", table: "agentInput", where: { conversation: c.id } }, { op: "delete", table: "holder", where: { conversation: c.id } }, { op: "delete", table: "replyImage", where: { conversation: c.id } });
+      if (process.platform === "win32") d.writes.push({ op: "delete", table: "meta", where: { id: importedSessionKey(s.id) } });
       d.writes.push({ op: "delete", table: "conversation", where: { slot: s.id } }, { op: "delete", table: "slot", where: { id: s.id } });
       d.events.push({ source: "rh", type: "slot_deleted", slot: s.id, data: { ref } });
       return `已删除 ${ref}。`;
@@ -4697,7 +4784,7 @@ function sendYou(state: State, ctx: Ctx, d: Decision, trace: string, from: Slot 
   // Pushed to the slot's contact chat, but while you watch the board, where you wrote to it last
   // (product §5.9). From you at a terminal: the main chat.
   const byDefault = (): string => {
-    if (from && watching(ctx, from)) return board("用户正在网页上看，没推送到 IM。这次发的内容网页上看得到；之后要说的话写在回复里就行。");
+    if (from && watching(ctx, from)) return board("用户正在网页上看，没推送到 IM。这条消息已在网页上整条显示，回复里不用再写一遍。");
     const chat = contactChat(state, ctx, d, from) ?? refuse("找不到发给用户的窗口：没有聊天窗口指着这个槽位，配置里也没写主窗口（mainChat）。");
     return post(chat)!;
   };
@@ -4973,7 +5060,7 @@ function addSlot(
 
 /** The workspace whose default dir is dir, made if there is none (product §6.1). */
 function workspaceFor(state: State, ctx: Ctx, d: Decision, dir: string, source: NewEvent["source"]): Workspace {
-  const had = state.workspaces.find((w) => w.dir === dir);
+  const had = state.workspaces.find((w) => sameDirectory(w.dir, dir));
   if (had) return had;
   const ws = { id: ctx.newId(), machine: "", name: workspaceName(state.workspaces, dir), dir, herdrWorkspace: null };
   d.writes.push({ op: "insert", table: "workspace", row: { id: ws.id, name: ws.name, dir: ws.dir } });

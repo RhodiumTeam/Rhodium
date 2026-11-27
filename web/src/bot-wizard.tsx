@@ -101,7 +101,8 @@ export function BotWizard({ open, close }: { open: boolean; close: () => void })
     setBusy(true);
     setError(null);
     setHadMain(!!topology?.bots.some((b) => b.main));
-    const r = await call("POST", "api/bots/flow", { name, platform, ...(target && { target }), paste });
+    // --paste is Feishu's choice of pasting over scanning; Telegram pastes its token without it.
+    const r = await call("POST", "api/bots/flow", { name, platform, ...(target && { target }), paste: paste && platform !== "telegram" });
     setBusy(false);
     if (!r.ok || !r.flow) return setError(r.ok ? "没建成。" : r.error);
     queryClient.setQueryData(["bot-flow", r.flow.id], r);

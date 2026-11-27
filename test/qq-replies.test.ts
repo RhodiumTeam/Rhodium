@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Posted } from "../src/fake-im";
 import type { Step } from "./fake-agent/fake-agent";
-import { askingCall, askOnce, askWithdrawn, endTurn, joinBetweenTools, on, saying, startTurn, toolCall, toolResult, toolUse, type FakeAsk } from "./fake-agent/scripts";
+import { askingCall, askOnce, askWithdrawn, endTurn, joinBetweenTools, on, saying, startTurn, textDelta, toolCall, toolResult, toolUse, type FakeAsk } from "./fake-agent/scripts";
 import { newInstance, until, withoutSource, type Daemon, type Instance, type InstanceOptions } from "./instance";
 
 const ME = "you-openid";
@@ -57,6 +57,101 @@ test("story 70: a message each time the agent finishes saying something, the too
   expect(posts.map((p) => p.text)).toEqual([...TALKED]);
   // All of them replies to your message: passive replies, with the last one still left over (story 71).
   expect(posts.map((p) => p.replyTo)).toEqual([messageId, messageId, messageId]);
+}, 30_000);
+
+/** What the agent says as it goes, a piece at a time, wait ms apart. */
+const streams = (pieces: string[], wait = 0): Step[] => pieces.flatMap((t): Step[] => [...(wait ? [{ sleep: wait }] : []), { emit: [textDelta(t)] }]);
+
+test("#797: what the agent says as it goes streams in, a passive reply each thing said, the tool line on top; each stream closes, the last as the final reply", async () => {
+  const steps = [...startTurn, ...streams(["Look", "ing."]), toolCall("toolu_read", "Read", { file_path: "notes.txt" }), ...streams(["Fo", "und ", "it."], 600), ...endTurn("Found it."), { goto: 0 }];
+  await qq({ claude: { script: { on, steps } } });
+  const { messageId } = await say("look around");
+  await until(async () => (await rhodium.im.log("q", ME)).filter((p) => p.final).length === 2, 15_000);
+  const log = await rhodium.im.log("q", ME);
+  // Each stream as it shows in the end, its last frame closing it.
+  expect(log.map((p) => [p.kind, p.stream, p.replyTo, p.text, p.final])).toEqual([
+    ["send", true, messageId, "Looking.", true],
+    ["send", true, messageId, "[🔧 Read]\n\nFound it.", true],
+  ]);
+  // The second grew as it was said: more than its first frame and its last.
+  expect(log[1]!.frames![0]).toBe("[🔧 Read]\n\nFo");
+  expect(log[1]!.frames!.length).toBeGreaterThan(2);
+}, 30_000);
+
+test("#797: rhodium killed mid-stream and started again: the stream goes on where it was and closes once, no message twice", async () => {
+  const steps = [...startTurn, ...streams(["one "]), { sleep: 3000 }, ...streams(["two"]), ...endTurn("one two"), { goto: 0 }];
+  await qq({ claude: { script: { on, steps } } });
+  await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 1, 15_000);
+  await rhodium.kill9();
+  await rhodium.start();
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.final), 15_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => [p.frames?.[0], p.text, p.final])).toEqual([["one", "one two", true]]);
+}, 30_000);
+
+test("#797: a frame that does not take ends the streaming of that thing said: once it is said, it goes as a message, whole", async () => {
+  const steps = [...startTurn, ...streams(["one "]), ...streams(["two "], 700), ...streams(["three"], 700), ...endTurn("one two three"), { goto: 0 }];
+  await qq({ claude: { script: { on, steps } } });
+  await rhodium.im.next("q", "fail", "edit");
+  const { messageId } = await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 2, 15_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => [p.text, p.stream, p.replyTo])).toEqual([
+    ["one", true, messageId],
+    ["one two three", undefined, messageId],
+  ]);
+}, 30_000);
+
+/** A QQ bot whose streams run ms at most, not QQ's 9 minutes. */
+const capped = (ms: number, opts: InstanceOptions = {}) => qq({ bots: { q: { like: "qq", owner: ME, target: "w/a", stream: String(ms) } }, ...opts });
+
+test("#797: a stream with nothing new said closes once it has run its time, before the agent goes on", async () => {
+  // Claude writing a long tool input says nothing until the tool starts.
+  const steps = [...startTurn, ...streams(["one "]), { sleep: 6000 }, ...endTurn("one two"), { goto: 0 }];
+  await capped(1500, { claude: { script: { on, steps } } });
+  await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.final), 4_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => [p.text, p.final])).toEqual([["one", true]]);
+}, 30_000);
+
+test("#797: rhodium killed mid-stream and started again: the stream's clock is set again and closes it in time", async () => {
+  const steps = [...startTurn, ...streams(["one "]), { sleep: 10_000 }, ...endTurn("one two"), { goto: 0 }];
+  await capped(4000, { claude: { script: { on, steps } } });
+  await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 1, 15_000);
+  await rhodium.kill9();
+  await rhodium.start();
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.final), 8_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => [p.text, p.final])).toEqual([["one", true]]);
+}, 30_000);
+
+test("#797: a stream's closing frame that does not take: what it was to show goes as a message", async () => {
+  const steps = [...startTurn, ...streams(["one "]), { sleep: 1500 }, ...endTurn("one two"), { goto: 0 }];
+  await qq({ claude: { script: { on, steps } } });
+  await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 1, 15_000);
+  await rhodium.im.next("q", "fail", "edit");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 2, 15_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => [p.text, p.stream, p.final])).toEqual([
+    ["one", true, undefined],
+    ["one two", undefined, undefined],
+  ]);
+}, 30_000);
+
+test("#797: one stream open in a chat at a time: what another turn's agent says there meanwhile goes as a message once said", async () => {
+  // Two slots, each's turn in your chat: w/a's stream is open when w/b's agent starts saying something.
+  const steps = [...startTurn, ...streams(["one "]), { sleep: 2500 }, ...streams(["two"]), { sleep: 2500 }, ...endTurn("one two"), { goto: 0 }];
+  await qq({ claude: { script: { on, steps } } });
+  expect((await rhodium.rh(["new", "w/b"])).code).toBe(0);
+  await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 1, 15_000);
+  await say("/rh_use w/b");
+  await say("count");
+  await until(async () => (await rhodium.im.log("q", ME)).length >= 3, 15_000);
+  expect((await rhodium.im.log("q", ME)).map((p) => [p.text, p.stream, p.final])).toEqual([
+    ["one two", true, true],
+    ["这里的消息改交给 w/b。", undefined, undefined],
+    ["one two", undefined, undefined],
+  ]);
 }, 30_000);
 
 test("by default your message brings 20 passive replies (probe 12): a long turn shows 18 things it said as it goes, the rest with its end, and one reply is left over", async () => {

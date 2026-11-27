@@ -33,7 +33,7 @@ If `AGENTS.local.md` exists at the repo root, read it before anything else. For 
 ## Build and test
 
 - Build: `scripts/build.sh [out-dir]` writes `rhodium` (Bun) and `rh-hold` (Rust) to `dist/`; the large Rust build cache goes in a temp dir it deletes. `rh` is `rhodium` invoked under the name `rh`, e.g. via a symlink.
-- Test: `bun install && bun run check` runs the Rust format check, strict `tsc` and all of `test/`; run it on the merged code before merging a PR, except for Markdown-only changes (see `docs/agents/testing.md`). `bun run test` runs only the tests, on a third of the cores; `bun test <file>` runs one file. See `docs/agents/testing.md`. Bump the version in both `package.json` and `holder/Cargo.toml`.
+- Test: `bun install && bun run check` runs the Rust format check, strict `tsc` and all of `test/`; run it on the merged code before merging a PR, except for Markdown-only changes (see `docs/agents/testing.md`). `bun run test` runs only the tests, on a third of the cores; `bun test <file>` runs one file. See `docs/agents/testing.md`. The version in `package.json` and `holder/Cargo.toml` changes only when cutting a release; ordinary PRs leave it alone.
 
 ## Agent guides
 

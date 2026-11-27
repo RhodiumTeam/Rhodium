@@ -166,19 +166,18 @@ export class TelegramAdapter implements ImAdapter {
    *  as a document; the text as its caption. A photo Telegram turns down, say one too tall or too
    *  long (PHOTO_INVALID_DIMENSIONS), goes as a document: it took nothing, so it never comes twice. */
   // ponytail: an upload over TIMEOUT_SECONDS comes back unknown; give sends with files longer if large ones time out.
-  send(chat: string, message: OutboundMessage): Promise<SendResult> {
+  async send(chat: string, message: OutboundMessage): Promise<SendResult> {
     const f = message.file;
     const caption = message.text ? { caption: message.text } : {};
     const markup = message.buttons?.length ? keyboard(message.buttons) : {};
+    if (message.draft) {
+      // One that did not take is sent all the same: the next edit, within draftTtl, brings it.
+      const r = await this.draft(chat, message.seq ?? 1, message);
+      if (r.status !== "sent") this.log(`draft not shown: ${r.error}`);
+      return { status: "sent", messageId: `draft:${message.seq ?? 1}` };
+    }
     return this.result(async () => {
-      if (!f) {
-        const sent = await this.markdownOr<{ message_id: number }>(
-          message.markdown,
-          (markdown) => this.api.sendRichMessage(chat, { markdown }, markup),
-          () => this.api.sendMessage(chat, message.text, markup),
-        );
-        return String(sent.message_id);
-      }
+      if (!f) return this.sendText(chat, message, markup);
       const file = () => new InputFile(f.path, f.name);
       const photo = () =>
         this.api.sendPhoto(chat, file(), caption).catch((e) => {
@@ -196,9 +195,35 @@ export class TelegramAdapter implements ImAdapter {
     });
   }
 
+  /** Rich Markdown where there is any, else plain text; its message id. */
+  private async sendText(chat: string, message: OutboundMessage, markup = {}): Promise<string> {
+    const sent = await this.markdownOr<{ message_id: number }>(
+      message.markdown,
+      (markdown) => this.api.sendRichMessage(chat, { markdown }, markup),
+      () => this.api.sendMessage(chat, message.text, markup),
+    );
+    return String(sent.message_id);
+  }
+
+  /** A turn's message as a draft (architecture §8.2), draft:<id> its id here, as the router has it.
+   *  The id is the outbound record's seq, so the draft is the same one after a restart. */
+  private draft(chat: string, id: number, message: OutboundMessage): Promise<SendResult> {
+    return this.result(async () => {
+      await this.markdownOr(
+        message.markdown,
+        (markdown) => this.api.sendRichMessageDraft(Number(chat), id, { markdown }),
+        () => this.api.sendMessageDraft(Number(chat), id, message.text),
+      );
+      return `draft:${id}`;
+    });
+  }
+
   /** A plain message edits into a rich one and back (scripts/probes/telegram/rich.ts). Buttons, even
-   *  none, replace the message's; left out, an edit shows none (Telegram's way). */
+   *  none, replace the message's; left out, an edit shows none (Telegram's way). A draft's edit shows
+   *  in the draft; its final one sends the message, and gives back its id. */
   edit(chat: string, messageId: string, message: OutboundMessage): Promise<SendResult> {
+    const draft = /^draft:(\d+)$/.exec(messageId);
+    if (draft) return message.final ? this.result(() => this.sendText(chat, message)) : this.draft(chat, Number(draft[1]), message);
     const id = Number(messageId);
     const markup = message.buttons ? keyboard(message.buttons) : {};
     return this.edited(messageId, () =>

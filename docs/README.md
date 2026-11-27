@@ -32,6 +32,7 @@ flowchart TD
   TU["docs/spec/tui-user-input.md<br/>TUI 槽位的输入第二批规格"]:::doc
   WI["docs/spec/web-import-composer.md<br/>网页新建导入和输入框规格"]:::doc
   WB["docs/spec/web-bots.md<br/>网页管 Bot 规格"]:::doc
+  WX["docs/spec/web-exchanges.md<br/>对话页的宽度、刻度条和 rh send 规格"]:::doc
   I["docs/im-style.md<br/>IM 文字与交互规范"]:::doc
   G --> P
   G --> R
@@ -60,6 +61,8 @@ flowchart TD
   WI --> WB
   ST --> WB
   SR --> WB
+  SG --> WX
+  SM --> WX
 ```
 
 | 文档 | 回答什么问题 |
@@ -85,6 +88,7 @@ flowchart TD
 | [docs/spec/tui-input.md](spec/tui-input.md) | TUI 槽位的输入第一批（等着时的提示、“被弹框挡住”、内部消息打进终端、终端带系统提示）开工前实测什么、怎么测试、怎么验收、怎么拆工单，以后的几步和还没定的事 |
 | [docs/spec/tui-user-input.md](spec/tui-user-input.md) | TUI 槽位的输入第二批（你从 IM、网页发的消息打进终端，回复转回发消息的窗口）开工前实测什么、怎么测试、怎么验收、怎么拆工单，还没定的事 |
 | [docs/spec/web-bots.md](spec/web-bots.md) | 2026-11-17 的网页管 Bot：新建 Bot 的向导、Bot 的菜单、建 Bot 流程挪进 `rhodium`、主窗口自动设、首页的引导，怎么测试、怎么验收、怎么拆工单 |
+| [docs/spec/web-exchanges.md](spec/web-exchanges.md) | 2026-11-20 的对话页改版（三档宽度、刻度条、`rh send` 发给你的显示和从标准输入读、系统提示和回执的措辞；往来行和折叠行改版另见 `web-exchanges` 分支），怎么测试、怎么验收、怎么拆工单 |
 | [docs/spec/web-import-composer.md](spec/web-import-composer.md) | 2026-11-16 的网页改版：新建和导入的弹窗、导入列表和搜索、列表行的菜单、终端槽位的列表行、输入框的历史消息、上下文和额度的显示，`/usage`、`/context`、`/model` 的小弹窗，怎么测试、怎么验收、怎么拆工单 |
 
 [AGENTS.md](../AGENTS.md) 和 [docs/agents/](agents/) 是给 AI agent 看的工作约定，不在阅读路径上。`CLAUDE.md` 只引用 `AGENTS.md`。

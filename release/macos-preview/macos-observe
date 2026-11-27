@@ -1,0 +1,50 @@
+#!/bin/sh
+# User-mode evidence only. Do not dump account names, CLI JSON, tokens or file contents.
+set -u
+umask 077
+case "${1-}" in boot|sample) ;; *) exit 64 ;; esac
+base=$(pwd -P)
+[ -f "$base/config.toml" ] || exit 1
+log="$base/observations.log"
+[ "$(/usr/bin/id -u)" -ne 0 ] || exit 77
+console_state() {
+  name=$(/usr/bin/stat -f %Su /dev/console 2>/dev/null) || name=
+  case "$name" in '') printf unknown ;; root|loginwindow|_mbsetupuser) printf loginwindow ;; *) printf logged-in ;; esac
+}
+record() {
+  after=$(console_state)
+  [ "$before" = "$after" ] || after=transition
+  printf '%s phase=%s nonroot=yes console=%s %s\n' "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$after" "$2" >>"$log"
+}
+before=$(console_state)
+phase=$1
+record "$phase" "boot=$(/usr/sbin/sysctl -n kern.boottime | /usr/bin/awk '{print $4}' | /usr/bin/tr -cd '0-9')"
+before=$(console_state)
+if http=$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 6 https://api.anthropic.com/); then
+  record "$phase" "anthropic_https=$http"
+else record "$phase" "anthropic_https_error=$?"; fi
+# The tester creates this opt-in only after an interactive baseline in this same profile.
+if [ -f "$base/probe-auth" ]; then
+  before=$(console_state)
+  raw=$(/usr/bin/perl -e 'alarm 12; exec @ARGV' claude auth status 2>/dev/null)
+  rc=$?
+  # The only value retained is the login bit. Never forward the JSON or its other fields.
+  result=$(printf '%s' "$raw" | /usr/bin/plutil -extract loggedIn raw -o - - 2>/dev/null) || result=unknown
+  case "$result" in true|false|1|0) ;; *) result=unknown ;; esac
+  method=$(printf '%s' "$raw" | /usr/bin/plutil -extract authMethod raw -o - - 2>/dev/null) || method=unknown
+  case "$method" in none|claude.ai|oauth_token|api_key|api_key_helper|third_party) ;; *) method=unknown ;; esac
+  unset raw
+  record "$phase" "claude_logged_in=$result method=$method cli_exit=$rc"
+fi
+# An explicit canary path is supplied by the tester. Log only the ability to read one byte.
+if [ -f "$base/probe-tcc-path" ]; then
+  IFS= read -r canary < "$base/probe-tcc-path"
+  before=$(console_state)
+  /usr/bin/perl -e 'alarm 5; open my $f,"<",$ARGV[0] or exit 1; -f $f or exit 1; defined sysread($f,my $byte,1) or exit 1' "$canary" 2>/dev/null
+  case $? in 0) result=readable ;; 142) result=timeout ;; *) result=unavailable ;; esac
+  record "$phase" "tcc_canary=$result"
+fi
+if [ "$phase" = boot ]; then
+  # The SSH tunnel may only return after GUI login; leave another pre-login sample on disk.
+  (sleep 60; "$base/current/macos-observe" sample) </dev/null >/dev/null 2>&1 &
+fi

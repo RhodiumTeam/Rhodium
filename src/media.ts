@@ -4,10 +4,11 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, utimesSync, 
 import { basename, dirname, extname, join } from "node:path";
 import type { InboundMessage } from "./contracts";
 
-/** Writes data to <dir>/<sha256 hex> unless it is there already, and returns that path. One there
- *  already is stored again: it is kept as long again from now (architecture §7.8). */
-export function saveMedia(dir: string, data: Uint8Array): string {
-  const path = join(dir, new Bun.CryptoHasher("sha256").update(data).digest("hex"));
+/** Writes data to <dir>/<sha256 hex><ext> unless it is there already, and returns that path. One there
+ *  already is stored again: it is kept as long again from now (architecture §7.8). ext: none but for
+ *  what the web terminal pastes, whose agent knows a picture by it. */
+export function saveMedia(dir: string, data: Uint8Array, ext = ""): string {
+  const path = join(dir, new Bun.CryptoHasher("sha256").update(data).digest("hex") + ext);
   if (existsSync(path)) {
     const now = new Date();
     utimesSync(path, now, now);

@@ -243,6 +243,18 @@ export type Capabilities = {
   progress: "append" | "edit"; // QQ can only add messages; Telegram edits one message in place
   // The least time (ms) between two edits of a turn's message, from its send or its last edit (Feishu's).
   editEvery?: number;
+  // A message's last edit (OutboundMessage.final) goes to the adapter even when its text is what the
+  // message shows already, so the adapter can close it, say a streaming card or a draft (#781).
+  finalEdit?: true;
+  // The platform shows a turn's message as a draft (OutboundMessage.draft), which it drops once this
+  // many ms pass without an update: the router sends it again before then (Telegram's, 30 s).
+  draftTtl?: number;
+  // A tool part with detailed tool lines shows as a folding panel (render.ts PANEL): Feishu's cards.
+  panels?: true;
+  // What the agent says streams in as it says it (render.ts flow): a message sent with stream, which
+  // edits then only make grow, the final one closing it (QQ's stream messages). The most ms one runs
+  // for: it closes then, and what is said after goes on in another.
+  stream?: number;
   // "markdown": shown on a Markdown message only (QQ), so the adapter sends a message with buttons as one.
   buttons: boolean | "markdown";
   maxButtons?: number; // the most buttons one message shows
@@ -258,8 +270,10 @@ export type Capabilities = {
   // renderer escapes outside code (emoji: :name:; heading: a line's # opens a heading with no space
   // after it). null: plain text only. links "http": the platform turns down a message with a link to
   // anything else, so such a link keeps only its text. literal: a query reply's values show as
-  // written only with a backslash before each mark and no code (render.ts's literal, QQ's).
-  markdown: { extensions: ("html" | "math" | "spoiler" | "mark" | "emoji" | "heading")[]; links?: "http"; literal?: true } | null;
+  // written only with a backslash before each mark and no code (render.ts's literal, QQ's). details:
+  // it folds a <details> block, which a turn's detailed tool part becomes where the platform has no
+  // panels (Telegram's rich messages).
+  markdown: { extensions: ("html" | "math" | "spoiler" | "mark" | "emoji" | "heading")[]; links?: "http"; literal?: true; details?: true } | null;
 };
 
 /** About how many characters of a whole message a quote brings the agent (product §5.4). */
@@ -338,6 +352,14 @@ export type OutboundMessage = {
   seq?: number; // QQ msg_seq, fixed per outbound record (architecture §7.4)
   // Sent as a picture or a file, text as its caption; name is what it goes out called.
   file?: { kind: "image" | "file"; path: string; name: string };
+  // On an edit: the message's last one, it changes no more (the turn's end, or a newer message under it).
+  final?: true;
+  // A stream (Capabilities.stream): its edits only add to it, the final one closing it.
+  stream?: true;
+  // A turn's message where the platform shows one as a draft (Capabilities.draftTtl): it sends a draft
+  // and gives back an id of its own for it; edits change the draft, the final one sends the message
+  // and gives back its id.
+  draft?: true;
 };
 
 /** Mirrors the outbound record's states: unknown means it may or may not have arrived.
@@ -401,7 +423,8 @@ export type Profile = { bot?: Uint8Array; you?: Uint8Array; name?: string };
 
 // herdr_wait: how long a slot in the terminal waits for Herdr to come back (architecture §10.2).
 // tool_running: a minute more of the tool call a turn's message shows running (key: the conversation).
-export type TimerKind = "ask_timeout" | "idle_reap" | "quota_reset" | "quota_notice" | "oneoff_archive" | "herdr_wait" | "tool_running" | "tui_held" | "tui_unconfirmed";
+// stream_cap: a turn's stream has run as long as one may (Capabilities.stream; key: the conversation).
+export type TimerKind = "ask_timeout" | "idle_reap" | "quota_reset" | "quota_notice" | "oneoff_archive" | "herdr_wait" | "tool_running" | "stream_cap" | "tui_held" | "tui_unconfirmed";
 
 /** What rhodium knows about an rh caller (docs/spec/v1.md "rh 怎么认出调用者"). rh reports its own
  *  pid; unit is the systemd unit rhodium finds that pid in, and ancestors that pid and the ones up its

@@ -2,10 +2,11 @@
 // "回复里的本机图片和文件链接"): what a message refers to, the one path check, and the reply picture table,
 // where each picture is checked once, its copy kept, by the main loop as the message is whole or by
 // the board as it reads a block with no row.
-import { openSync, readSync, closeSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import fs, { openSync, readSync, closeSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { codeRef, decoded, elsewhere, inPage, linkWords } from "./local";
+import { driveRoot, insideDirectory, localCandidate, localDrivePath } from "./paths";
 import { keepFile, pictureType } from "./media";
 import { fenced } from "./render";
 import type { ReplyImage, Tx } from "./store";
@@ -64,28 +65,41 @@ export type Why = "不在槽位目录或 /tmp 里" | "找不到文件" | "不是
 
 /** The path check, the one for pictures and links, the page and IM: the path, as decoded, a file://
  *  off it, ~/ the home of rhodium's user, a relative one from the slot's directory dir, is a regular
- *  file of at most MAX_LOCAL whose real path, symlinks resolved, is inside dir's or /tmp's; as a
+ *  file of at most MAX_LOCAL whose real path, symlinks resolved, is inside dir's or /tmp's (the local temp directory on Windows); as a
  *  picture, one of the four kinds by its first bytes. real: that real path, to read. */
 export function checkLocal(dir: string, path: string, image: boolean): { real: string } | { why: Why } {
+  const windows = process.platform === "win32";
+  let target = path.replace(/^file:\/\//i, "");
+  if (windows && /^file:\/\//i.test(path)) {
+    // A local file URL has an empty authority and a drive, e.g. file:///C:/work.
+    if (/^\/[a-z]:[\\/]/i.test(target)) target = target.slice(1);
+    if (!driveRoot.test(target)) return { why: "不在槽位目录或 /tmp 里" };
+  }
+  target = target.replace(windows ? /^~(?=[\\/])/ : /^~(?=\/)/, () => homedir());
+  const candidate = localCandidate(dir, target);
+  if (!candidate) return { why: "不在槽位目录或 /tmp 里" };
   let real: string;
   let size: number;
   const head = Buffer.alloc(12);
   try {
-    real = realpathSync(resolve(dir, path.replace(/^file:\/\//i, "").replace(/^~(?=\/)/, homedir())));
-    const s = statSync(real);
+    real = fs.realpathSync(candidate);
+    if (windows && !driveRoot.test(localDrivePath(real))) return { why: "不在槽位目录或 /tmp 里" };
+    const s = fs.statSync(real);
     if (!s.isFile()) return { why: "找不到文件" };
     size = s.size;
   } catch {
     return { why: "找不到文件" };
   }
-  const roots = [dir, "/tmp"].flatMap((d) => {
+  const inside = [dir, windows ? tmpdir() : "/tmp"].some((root) => {
+    if (windows && !driveRoot.test(root)) return false;
     try {
-      return [join(realpathSync(d), "/")];
+      const base = fs.realpathSync(root);
+      return insideDirectory(base, real);
     } catch {
-      return [];
+      return false;
     }
   });
-  if (!roots.some((r) => real.startsWith(r))) return { why: "不在槽位目录或 /tmp 里" };
+  if (!inside) return { why: "不在槽位目录或 /tmp 里" };
   if (size > MAX_LOCAL) return { why: "超过 50MB" };
   if (!image) return { real };
   try {

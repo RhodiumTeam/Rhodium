@@ -49,6 +49,13 @@ import { literal } from "./render";
 const SEQ_MAX = 2 ** 31 - 1;
 // QQ's answer to a msg_id + msg_seq it has taken already: "消息被去重，请检查请求msgseq" (probe 13).
 const DEDUPED = 40054005;
+// A stream's frame that changes what it showed: "流式消息已下发内容前缀不可修改" (2026-11-17).
+const PREFIX = 40111001;
+// A frame of a stream that is over: closed (40034018), ended by a newer one (40034019), past its
+// time (40034020) (2026-11-17).
+const ENDED = [40034018, 40034019, 40034020];
+// How long a new stream waits for the one open in its chat to close: QQ shows one at a time.
+const STREAM_WAIT = 10_000;
 
 /** The fixed msg_seq for an outbound record (architecture §7.4). QQ drops a resend with the same
  *  msg_id + msg_seq; the SDK's default is random, so a retry would get through twice. */
@@ -79,8 +86,12 @@ export type QQClient = {
   start(signal: AbortSignal): Promise<void>;
   send(opts: SendMessageOptions): Promise<MessageResponse>;
   uploadMedia(opts: Parameters<QQBot["uploadMedia"]>[0]): Promise<UploadMediaResponse>;
-  api: { getToken(): Promise<string>; get<T>(path: string): Promise<T> };
+  api: { getToken(): Promise<string>; get<T>(path: string): Promise<T>; post<T>(path: string, body: unknown): Promise<T> };
 };
+
+/** A stream as the adapter keeps it in the store, by its stream_msg_id, so a new rhodium carries it on:
+ *  the message it replies to, its msg_seq, its last frame's index and what QQ last took of it. */
+type Stream = { msg: string; seq: number; index: number; shown: string };
 
 /** Marks an event's id (a button press's) among message ids: QQ takes a reply to it as event_id, not msg_id. */
 const EVENT = "event:";
@@ -113,7 +124,7 @@ type Log = (msg: string) => void;
 type Download = (url: string) => Promise<Uint8Array>;
 type MenuApi = Pick<ApiClient, "request">;
 // cdn: QQ's avatar CDN, a test's stand-in in tests.
-type Options = { client?: QQClient; delays?: readonly number[]; log?: Log; download?: Download; menuApi?: MenuApi; cdn?: string };
+type Options = { client?: QQClient; delays?: readonly number[]; log?: Log; download?: Download; menuApi?: MenuApi; cdn?: string; kept?: Kept };
 
 /** Fetches an attachment the message links to, as qq-cli does. */
 async function httpDownload(url: string): Promise<Uint8Array> {
@@ -167,7 +178,7 @@ export function qqSession(kept: Kept, appId: string, bot: string): SessionPersis
 
 /** The daemon's QQ bot (id: its row id), resuming its gateway session. */
 export const makeQQ = (id: string, name: string, bot: BotConfig, deps: AdapterDeps): QQAdapter =>
-  new QQAdapter(id, name, bot, { client: qqClient(name, bot, undefined, { sessionPersistence: qqSession(deps.kept, bot.appId!, name) }) });
+  new QQAdapter(id, name, bot, { client: qqClient(name, bot, undefined, { sessionPersistence: qqSession(deps.kept, bot.appId!, name) }), kept: deps.kept });
 
 export { QQ_CAPABILITIES }; // the platform table's (platforms.ts), as tests know it
 
@@ -176,6 +187,11 @@ export { QQ_CAPABILITIES }; // the platform table's (platforms.ts), as tests kno
  *  IM's QQ-like bots send it so too. */
 export const withKeyboard = (m: OutboundMessage): OutboundMessage =>
   m.buttons?.length && m.markdown === undefined ? { ...m, markdown: literal(m.text) } : m;
+
+/** Where the store keeps a stream, by its stream_msg_id. */
+const STREAM = "qqStream:";
+/** What a stream frame shows: its Markdown, else its text as written. */
+const content = (m: OutboundMessage) => m.markdown ?? literal(m.text);
 
 /** A message's plain text, sent once QQ turned its Markdown down: QQ shows no keyboard on it, so its
  *  buttons are written under it. Only an ask's (ask:) and one of the asks to pick from (pick:) get a
@@ -198,6 +214,9 @@ export class QQAdapter implements ImAdapter {
   private readonly menuApi: MenuApi;
   private readonly appId: string | undefined;
   private readonly cdn: string;
+  private readonly kept: Pick<Kept, "get" | "set">;
+  // The stream open in each chat, by the chat: closed, it lets the next one open (stream()).
+  private readonly opened = new Map<string, { id: string; closed: PromiseWithResolvers<void> }>();
 
   constructor(
     readonly botId: string,
@@ -212,6 +231,8 @@ export class QQAdapter implements ImAdapter {
     this.menuApi = opts.menuApi ?? MENU_API;
     this.appId = config.appId;
     this.cdn = opts.cdn ?? "https://q.qlogo.cn";
+    const mine = new Map<string, string>();
+    this.kept = opts.kept ?? { get: (k) => mine.get(k), set: (k, v) => void (v === undefined ? mine.delete(k) : mine.set(k, v)) };
   }
 
   /** The bot's avatar by /users/@me on the SDK's own token; yours from the public avatar CDN, by
@@ -321,6 +342,8 @@ export class QQAdapter implements ImAdapter {
     if (message.seq === undefined) return { status: "failed", error: "qq: outbound message has no seq" };
     // A reply to a button press names the press's event, by event_id; one to a message, by msg_id.
     const event = message.replyTo?.startsWith(EVENT) ? { event_id: message.replyTo.slice(EVENT.length) } : undefined;
+    // A stream is a passive reply to a message only; else it goes as a message, which no edit grows.
+    if (message.stream && message.replyTo && !event) return this.stream(chat, message.replyTo, message.seq, content(message));
     const target = { scope: "c2c" as const, targetId: chat, ...(message.replyTo && !event ? { msgId: message.replyTo } : {}) };
     let media: { file_info: string } | undefined;
     if (message.file) {
@@ -390,8 +413,69 @@ export class QQAdapter implements ImAdapter {
     return post({ content: unbuttoned(message) }, (message.seq % SEQ_MAX) + 1);
   }
 
-  async edit(_chat: string, _messageId: string, _message: OutboundMessage): Promise<SendResult> {
-    return { status: "failed", error: "qq: messages cannot be edited" };
+  /** Only a stream's, which an edit grows by a frame, the final one closing it. */
+  async edit(chat: string, messageId: string, message: OutboundMessage): Promise<SendResult> {
+    const s = this.kept.get(STREAM + messageId);
+    if (!s) return { status: "failed", error: "qq: messages cannot be edited" };
+    return this.frame(chat, messageId, JSON.parse(s) as Stream, content(message), !!message.final);
+  }
+
+  /** Opens a stream (stream_messages) replying to the message msg, once the one open in the chat, if
+   *  any, has closed. */
+  private async stream(chat: string, msg: string, seq: number, text: string): Promise<SendResult> {
+    // ponytail: waits at most STREAM_WAIT, holding up every chat's sends; the router closes the old
+    // one first, so its last frame is on its way.
+    const open = this.opened.get(chat);
+    if (open) await Promise.race([open.closed.promise, sleep(STREAM_WAIT)]);
+    return this.frame(chat, undefined, { msg, seq, index: -1, shown: "" }, text, false);
+  }
+
+  /** One frame of a stream, its first when id is undefined; final closes it. The index is kept before
+   *  the frame goes, so a frame whose fate a restart lost is skipped, as the SDK skips one it retries. */
+  private async frame(chat: string, id: string | undefined, s: Stream, text: string, final: boolean): Promise<SendResult> {
+    const index = s.index + 1;
+    if (id) this.kept.set(STREAM + id, JSON.stringify({ ...s, index }));
+    const body = (raw: string, i: number, done: boolean) => ({
+      input_mode: "replace",
+      input_state: done ? 10 : 1,
+      content_type: "markdown",
+      content_raw: raw,
+      event_id: s.msg,
+      msg_id: s.msg,
+      msg_seq: s.seq,
+      index: i,
+      ...(id && { stream_msg_id: id }),
+    });
+    const path = `/v2/users/${chat}/stream_messages`;
+    const over = (sid: string) => {
+      this.kept.set(STREAM + sid, undefined);
+      const open = this.opened.get(chat);
+      if (open?.id === sid) (this.opened.delete(chat), open.closed.resolve());
+    };
+    try {
+      const r = await this.client.api.post<{ id?: string }>(path, body(text, index, final));
+      const sid = id ?? r.id;
+      if (!sid) return { status: "unknown", error: "qq: no stream_msg_id for a new stream" };
+      if (final) over(sid);
+      else {
+        this.kept.set(STREAM + sid, JSON.stringify({ ...s, index, shown: text }));
+        if (!id) this.opened.set(chat, { id: sid, closed: Promise.withResolvers() });
+      }
+      return { status: "sent", messageId: sid };
+    } catch (e) {
+      const code = e instanceof ApiError ? e.bizCode : undefined;
+      const r = sendError(e, chat);
+      const ended = code !== undefined && ENDED.includes(code);
+      if (id && !ended && r.status === "failed") {
+        // Turned down (40111001, or a closing frame's new text by moderation, say): closed with what it
+        // last took, it shows that, and the router sends the rest some other way (router.ts editFailed).
+        await this.client.api.post(path, body(s.shown, index + 1, true)).catch((err) => this.log(`cannot close a stream: ${hidden(err, chat)}`));
+      }
+      if (id && (final || ended || r.status === "failed")) over(id);
+      // ponytail: a frame QQ dropped at a business code is failed, not quota: a stream is never moved
+      // to an active message, which can't grow (router.ts editFailed sends its text instead).
+      return { status: r.status, error: r.error };
+    }
   }
 
   // A sent message cannot change, so its buttons stay; a press on one for a settled ask gets 已失效.

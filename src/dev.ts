@@ -70,7 +70,7 @@ export async function dev(args: string[]): Promise<number> {
         if (p.kind === "toast" || p.kind === "unbutton") continue; // buttons can't be pressed here: answer with words
         const file = p.file ? `[${p.file.kind === "image" ? "图片" : "文件"}] ${p.file.name}` : "";
         const buttons = p.buttons?.length ? `[${p.buttons.map((b) => b.label).join(" | ")}]` : "";
-        process.stdout.write(`${p.kind === "edit" ? "~" : "<"} ${[file, p.text, buttons].filter(Boolean).join(" ")}\n`);
+        process.stdout.write(`${p.kind === "edit" || p.kind === "draft" ? "~" : "<"} ${[file, p.text, buttons].filter(Boolean).join(" ")}\n`);
       }
       shown = Math.max(shown, posts.length);
       await Bun.sleep(100);

@@ -2,6 +2,8 @@
 // its queued agent inputs, and feeds the agent's output to the driver, whose events go to the
 // main loop. After a restart it takes over the agents the last rhodium left running (§5).
 // The runner never reads the agent's protocol; the driver does.
+import { nativeHolders, stopUnreachableHolder } from "./native-holders";
+import { detached, holderExecutable, holderLive, unconfirmedMacExit } from "./detached";
 import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -64,7 +66,14 @@ function readExit(dir: string): ExitFile | null {
 }
 
 /** Holder units under this rhodium's prefix that are up. A stopping one counts as gone. */
-export async function activeHolders(cfg: Config): Promise<Set<string>> {
+export async function activeHolders(cfg: Config, records: { conversation: string; unit: string }[] = []): Promise<Set<string>> {
+  if (detached) {
+    const live = new Set<string>();
+    for (const h of records) {
+      if (await holderLive(holderExecutable(cfg.holdBin), holderPaths(cfg, h.conversation).dir)) live.add(h.unit);
+    }
+    return live;
+  }
   const argv = ["systemctl", "--user", "list-units", "--state=active", "--plain", "--no-legend", "--full", `${cfg.unitPrefix}hold-*`];
   const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
@@ -328,7 +337,17 @@ export function createRunner(o: {
       // Gone without its exit message, lost say as a write failed just as the holder closed: the exit
       // file it wrote first says how the agent ended (architecture §4.3). None: the holder itself broke.
       close: () => {
+        if (done || me.proc !== proc) return;
         const e = readExit(holderPaths(cfg, conversation).dir);
+        if (detached && !e) {
+          const slot = store.tx((tx) => tx.get("slot", conv.slot));
+          const record = store.tx((tx) => tx.find("holder", { conversation, exited: 0 })[0]);
+          if (record && slot?.conversation === conversation) {
+            me.link = null;
+            void reattach(slot, conv, record);
+            return;
+          }
+        }
         exit(e?.code ?? null, e?.signal ?? null, e?.from ?? "holder");
       },
     };
@@ -368,7 +387,8 @@ export function createRunner(o: {
       const slot = tx.get("slot", slotId)!;
       // The last rh stop is over; a start that fails before its holder launches is a crash.
       tx.update("holder", { conversation: slot.conversation! }, { stopRequested: 0 });
-      return { slot, conv: tx.get("conversation", slot.conversation!)! };
+      const conv = tx.get("conversation", slot.conversation!)!;
+      return { slot, conv };
     });
     await attach(conv, 0, async (me, on) => {
       // Never two processes on one transcript (architecture §10.1): not while, say, you have the
@@ -570,7 +590,7 @@ export function createRunner(o: {
    *  no rhodium was there. Only holder units under this rhodium's prefix count. A slot switching to
    *  the terminal has its headless agent until its pane opens; one in the terminal is off. */
   async function recover(): Promise<void> {
-    const units = await activeHolders(cfg);
+    const units = await activeHolders(cfg, detached ? store.tx((tx) => tx.find("holder", { exited: 0 })) : []);
     const alive = store.tx((tx) =>
       tx
         .find("slot", {})
@@ -589,12 +609,13 @@ export function createRunner(o: {
       }
     });
     await Promise.all(
-      alive.map(({ slot, conv, holder }) => {
+      alive.map(async ({ slot, conv, holder }) => {
         const p = holderPaths(cfg, conv.id);
         // The restart cut the start short, and that is no crash: before its holder was on record
         // (whatever unit and exit file the last one left), or before its agent ran.
         if (slot.state === "starting" && holder?.exited) return start(slot.id);
         if (holder && units.has(p.unit)) return reattach(slot, conv, holder);
+        if (await unconfirmedMacExit(p.dir, holderExecutable(cfg.holdBin))) { log("macOS holder lost; agent exit is unconfirmed", { conversation: conv.id }); return; }
         const exit = readExit(p.dir);
         if (slot.state === "starting" && (!exit || (exit.from === "holder" && exit.code === 0))) return start(slot.id);
         return ended(conv, holder, exit);
@@ -608,10 +629,42 @@ export function createRunner(o: {
     const p = holderPaths(cfg, conv.id);
     const offset = Math.min(holder.outStart, holder.outOffset);
     return attach(conv, holder.outOffset, async (me, on) => {
-      const link = await connectHolder(p.sock, { boot, offset }, on).catch(async (err) => {
-        // It ended after the unit check and took its socket with it: settled from its files. One
-        // still up with no socket is stopped first, so no agent runs on that nothing can reach.
-        if (!(await unitGone(p.unit, cfg.durations.holderGone))) {
+      const generation = me.proc;
+      const deadline = Date.now() + cfg.durations.holderGone;
+      const dial = () => connectHolder(p.sock, { boot, offset }, on, detached ? deadline : undefined);
+      const link = await dial().catch(async (err) => {
+        if (detached) {
+          try {
+            const bin = holderExecutable(cfg.holdBin);
+            if (await holderLive(bin, p.dir)) {
+              const target = (await nativeHolders(cfg)).find(h => h.conversation === conv.id);
+              while (Date.now() < deadline) {
+                if (generation !== me.proc) return null;
+                await Bun.sleep(Math.min(100, deadline - Date.now()));
+                const restored = await dial().catch(() => null);
+                if (restored) return restored;
+              }
+              if (generation !== me.proc) return null;
+              if (await holderLive(bin, p.dir)) {
+                if (!target) throw new Error("无法核实失联托管进程的身份");
+                await stopUnreachableHolder(cfg, conv.id, target);
+                const until = Date.now() + cfg.durations.holderGone;
+                while (await holderLive(bin, p.dir)) {
+                  if (Date.now() >= until) throw err;
+                  await Bun.sleep(50);
+                }
+              }
+            }
+            if (await unconfirmedMacExit(p.dir, bin)) throw new Error("macOS agent exit is unconfirmed");
+          } catch (error) {
+            log("cannot confirm holder exit", { conversation: conv.id, error: String(error) });
+            setTimeout(() => {
+              const current = store.tx(tx => ({ slot: tx.get("slot", slot.id), holder: tx.find("holder", { conversation: conv.id, exited: 0 })[0] }));
+              if (me.proc === generation && current.slot?.conversation === conv.id && current.holder) void reattach(current.slot, conv, current.holder);
+            }, cfg.durations.holderGone);
+            return null;
+          }
+        } else if (!(await unitGone(p.unit, cfg.durations.holderGone))) {
           log("cannot reach the holder, stopping it", { conversation: conv.id, error: String(err) });
           await Bun.spawn(["systemctl", "--user", "stop", `${p.unit}.service`]).exited;
           if (!(await unitGone(p.unit, cfg.durations.holderGone))) throw err;
@@ -621,7 +674,7 @@ export function createRunner(o: {
       });
       if (!link) return null;
       // A stop on record before the restart, say the reap clock's at startup, is carried out now.
-      me.stopping = holder.stopRequested;
+      me.stopping = detached ? store.tx((tx) => tx.find("holder", { conversation: conv.id })[0]?.stopRequested ?? 0) : holder.stopRequested;
       if (link.hello.pid === null) {
         await link.start(await spawnSpec(me, slot, conv)); // the restart came between launch and start
       } else {

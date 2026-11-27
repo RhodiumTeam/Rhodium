@@ -26,8 +26,9 @@ async function onRhodium(script: Script | string, body: (rhodium: Instance) => P
   }
 }
 
-/** Every text the bot sent, or edited a message to, in your chat, in order. */
-const texts = async (rhodium: Instance) => (await rhodium.im.log("t", ME)).map((p) => p.text);
+/** Every text the bot sent, or edited a message or draft to, in your chat, in order; a draft sent
+ *  again unchanged, before Telegram drops it, once (#784). */
+const texts = async (rhodium: Instance) => (await rhodium.im.log("t", ME)).map((p) => p.text).filter((t, i, all) => t !== all[i - 1]);
 
 /** Says go, waits until the turn's message shows its step running, and kill -9s rhodium; starts it
  *  again after down ms. Resolves to when the step started, near enough. */

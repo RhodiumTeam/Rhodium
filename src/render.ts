@@ -9,6 +9,17 @@ import type { AgentEvent, Capabilities } from "./contracts";
 import { forIm } from "./reply-images";
 import { named, NOT_TOOLS, runs, shortLine, type Call } from "./tool-line";
 
+/** Where a tool part folds into a panel (Capabilities.panels, Feishu's cards): its Markdown is PANEL,
+ *  + open or - folded, the panel's title, a line break, its tool lines, PANEL_END; the adapter makes
+ *  that a folding panel (docs/im-style.md §3.1). Agent text never has these private-use characters. */
+export const PANEL = "\uE010";
+export const PANEL_END = "\uE011";
+/** A panel in a message's Markdown: its + or -, its title, its tool lines. */
+export const PANELS = new RegExp(String.raw`${PANEL}([+-])([^\n]*)\n([\s\S]*?)${PANEL_END}`, "g");
+/** Markdown with its panels as tool lines quoted, as a platform without panels shows them: for a turn
+ *  that went on through another bot (router.ts editLive). */
+export const unpanel = (md: string) => md.replace(PANELS, (_, _open, _title, lines: string) => lines.replace(/^/gm, "> ").replaceAll("\n", "  \n"));
+
 /** A part of a turn: something the agent said, as it goes to IM (forIm), done once it is whole; or the
  *  tool calls between two. */
 type Part = { text: string; done?: true } | { tools: Call[] };
@@ -26,6 +37,8 @@ export type Progress = {
   sent: number;
   // Append platforms: messages that wait for the turn's end, the quota's room used up.
   kept: string[];
+  // Platforms that stream (QQ): the stream of what is being said, if one opened for it.
+  stream?: Stream;
   // The tool calls in no tool line (their ids), as they showed some other way: those that asked you
   // first, as asks; a step a message that stopped showed, as all it had (moveOn). An older Rhodium
   // saved it as asked (router.ts progressOf).
@@ -221,31 +234,42 @@ export const runningText = (r: NonNullable<Progress["running"]>, now: number): s
 /** Agent text as a part of a message shows it: without the blank lines around it. */
 const clean = (text: string) => text.replace(/^\n+/, "").trimEnd();
 
-// ---- Platforms that edit a message (Telegram): one message, in the order things happened (im-style §3.3). ----
+// ---- Platforms that edit a message (Telegram's drafts, Feishu): one message, in the order things happened (im-style §3.3). ----
 
 /** One part of the turn's message: plain, in Markdown, and which part of the turn it is. */
 type Block = { text: string; md: string; part: number };
 
-/** The turn's parts from the position from on, and, if live, the step still running. A tool part is
- *  a quote in Markdown; text from partway into a code block opens it again. */
+/** The turn's parts from the position from on, and, if live, the step still running. A detailed tool
+ *  part folds where the platform can (a panel, else <details>), else it is a quote; text from partway
+ *  into a code block opens it again. */
 function blocks(p: Progress, from: [number, number], v: View, live: boolean): Block[] {
   const out: Block[] = [];
-  const tools = (calls: Call[], running: Progress["running"], part: number) => {
+  // open: the turn's last part, while the turn runs. A fold shows open then, titled how many calls;
+  // else closed, titled with the short tool line. A panel shows its step running a line like the rest.
+  const tools = (calls: Call[], running: Progress["running"], part: number, open: boolean) => {
     const lines = toolLines(calls, v);
     if (running) lines.push(runningLine(running, v));
-    if (lines.length) out.push({ text: lines.map((l) => l[0]).join("\n"), md: lines.map((l) => `> ${l[1]}`).join("  \n"), part });
+    if (!lines.length) return;
+    const text = lines.map((l) => l[0]).join("\n");
+    if (!v.verbose || !(v.caps.panels || v.caps.markdown?.details)) return void out.push({ text, md: lines.map((l) => `> ${l[1]}`).join("  \n"), part });
+    const all = running ? [...calls, running.call] : calls;
+    const title = open ? `🔧 工具 ×${all.length}（运行中）` : `🔧 ${shortLine(all)}`;
+    const md = v.caps.panels
+      ? `${PANEL}${open ? "+" : "-"}${title}\n${toolLines(all, v).map((l) => l[1]).join("\n")}${PANEL_END}`
+      : `<details${open ? " open" : ""}><summary>${title}</summary>\n\n${lines.map((l) => l[1]).join("\n\n")}\n\n</details>`;
+    out.push({ text, md, part });
   };
   const running = live ? p.running : null;
   p.parts.forEach((part, i) => {
     if (i < from[0]) return;
     const at = i === from[0] ? from[1] : 0;
-    if ("tools" in part) return tools(part.tools.slice(at), i === p.parts.length - 1 ? running : null, i);
+    if ("tools" in part) return tools(part.tools.slice(at), i === p.parts.length - 1 ? running : null, i, live && i === p.parts.length - 1);
     if (v.toolsOnly) return;
     const text = clean(resume(part.text, at, v.caps.maxTextLength));
     if (text) out.push({ text, md: markdown(text, v.caps) ?? text, part: i });
   });
   // A step that started after the agent said something is a tool part of its own.
-  if (running && !(p.parts.at(-1) && "tools" in p.parts.at(-1)!)) tools([], running, p.parts.length);
+  if (running && !(p.parts.at(-1) && "tools" in p.parts.at(-1)!)) tools([], running, p.parts.length, true);
   return out;
 }
 
@@ -280,15 +304,16 @@ function layout(p: Progress, v: View, live: boolean): { msgs: Msg[]; from: [numb
 
 /**
  * One event on a platform that edits one message in place (e null: the clock moved on): what the
- * turn's message should show now, nothing when it shows that already. Text that outgrows the
- * platform's limit goes on in new messages: out[0] is for the turn's message, which keeps the part
- * that fits; the rest are new messages, the last of them the turn's message from then on.
+ * turn's message should show now, nothing when it shows that already, unless again (a draft's, sent
+ * again before it is dropped). Text that outgrows the platform's limit goes on in new messages: out[0]
+ * is for the turn's message, which keeps the part that fits; the rest are new messages, the last of
+ * them the turn's message from then on.
  */
-export function edit(p: Progress, e: AgentEvent | null, v: View): { progress: Progress; out: Msg[] } {
+export function edit(p: Progress, e: AgentEvent | null, v: View, again = false): { progress: Progress; out: Msg[] } {
   const next = e ? track(p, e, v) : p;
   const { msgs, from } = layout(next, v, true);
   const last = msgs.at(-1)!;
-  if (msgs.length === 1 && (!last.text || last.text === p.shown)) return { progress: next, out: [] };
+  if (msgs.length === 1 && (!last.text || (last.text === p.shown && !again))) return { progress: next, out: [] };
   return { progress: { ...next, from, shown: last.text }, out: msgs };
 }
 
@@ -331,6 +356,12 @@ export function finishEdit(p: Progress, reply: string | undefined, v: View, tail
 
 // ---- Platforms that only add messages (QQ): a message each thing said (im-style §3.2). ----
 
+/** A stream (Capabilities.stream) of one thing said, part: from offset at on of its segment (the
+ *  message said() makes of it, the tool line before it on top), shown up to upto, running since since.
+ *  open: a stream shows it now; closed, what follows at goes on in another stream, or as a message once
+ *  it is over. broken: a stream of it failed (router.ts editFailed), so the rest goes as a message. */
+type Stream = { part: number; at: number; upto: number; since: number; open?: true; broken?: true };
+
 /** What the agent said, with the tool calls before it in a line on top. */
 function said(calls: Call[], text: string, v: View): string {
   const lines = toolLines(calls, v).map((l) => l[0]).join("\n");
@@ -338,14 +369,18 @@ function said(calls: Call[], text: string, v: View): string {
 }
 
 /** The parts from p.sent through end as messages: one each thing said; only its tool line once rh
- *  send me took the turn over (View). Tool calls after the last of it are left out. */
+ *  send me took the turn over (View). Tool calls after the last of it are left out. Of a thing said a
+ *  stream showed some of, the rest, its tool line shown with that. */
 function spoken(p: Progress, end: number, v: View): string[] {
   const out: string[] = [];
   let calls: Call[] = [];
-  for (const part of p.parts.slice(p.sent, end + 1)) {
+  const s = p.stream;
+  for (let i = s?.part ?? p.sent; i <= end; i++) {
+    const part = p.parts[i]!;
+    const text = "tools" in part ? "" : s?.part === i ? rest(p, s, v) : clean(part.text);
     if ("tools" in part) calls = [...calls, ...part.tools];
-    else if (clean(part.text)) {
-      const m = said(calls, v.toolsOnly ? "" : clean(part.text), v);
+    else if (text) {
+      const m = s?.part === i ? (v.toolsOnly ? "" : text) : said(calls, v.toolsOnly ? "" : text, v);
       if (m) out.push(m);
       calls = [];
     }
@@ -360,9 +395,13 @@ function spoken(p: Progress, end: number, v: View): string[] {
  * room is used up, what it says waits too, for finish.
  */
 export function append(p: Progress, e: AgentEvent, v: View, room: number): { progress: Progress; sends: string[] } {
-  const next = track(p, e, v);
+  return over(track(p, e, v), e, v, room);
+}
+
+/** What was said and is over goes out, as append's; next has the event e in it already. */
+function over(next: Progress, e: AgentEvent | null, v: View, room: number): { progress: Progress; sends: string[] } {
   // A tool call started, even one that asks you (no tool line), comes after what was said.
-  let end = next.parts.length - (next.running || e.type === "tool_start" ? 1 : 2);
+  let end = next.parts.length - (next.running || e?.type === "tool_start" ? 1 : 2);
   const spoke = (x: Part) => "text" in x && clean(x.text);
   while (end >= next.sent && !spoke(next.parts[end]!)) end--;
   if (end < next.sent) return { progress: next, sends: [] };
@@ -373,7 +412,7 @@ export function append(p: Progress, e: AgentEvent, v: View, room: number): { pro
     if (!kept.length && pieces.length <= room - sends.length) sends.push(...pieces);
     else kept.push(m);
   }
-  return { progress: { ...next, sent: end + 1, kept }, sends };
+  return { progress: { ...next, sent: end + 1, kept, stream: next.stream && next.stream.part > end ? next.stream : undefined }, sends };
 }
 
 /** The turn's last messages on a platform that only adds them: what it said and has not sent, the
@@ -382,7 +421,8 @@ export function append(p: Progress, e: AgentEvent, v: View, room: number): { pro
  *  over (View) says none of it: the tools not sent yet, those after the final reply too, go in one line. */
 export function finish(p: Progress, reply: string | undefined, v: View, tail = ""): string[] {
   const max = v.caps.maxTextLength;
-  const calls = p.parts.slice(p.sent).flatMap((x) => ("tools" in x ? x.tools : []));
+  // A stream showed the tools before the thing it showed.
+  const calls = p.parts.slice(p.stream?.part ?? p.sent).flatMap((x) => ("tools" in x ? x.tools : []));
   const all = [...p.kept];
   if (v.toolsOnly) {
     if (calls.length) all.push(said(calls, "", v));
@@ -394,6 +434,129 @@ export function finish(p: Progress, reply: string | undefined, v: View, tail = "
   const joined = all.join("\n\n");
   if (joined.length <= max) return [joined];
   return chunkText(`中间还有 ${all.length - 1} 段话没发出来，看板上能看到。\n\n${all.at(-1)}`, max);
+}
+
+// ---- Platforms that stream what is said (QQ's stream messages, Capabilities.stream): a thing said
+// grows in its message as it is said, the tool line before it on top (im-style §3.2). A stream only
+// ever grows: QQ turns down a frame that changes what it showed (40111001). ----
+
+/** A stream's step: a message (append's), a stream opened, or a frame of the one open, final its last. */
+export type Flow = { send: string } | { open: Msg } | { edit: Msg; final?: true; unchanged?: true };
+
+/** How far text still being said may show: all but the end of its last line that may yet be written
+ *  another way, a local picture or link from its [ on (forIm), a # that may open a heading (markdown()). */
+function steady(text: string): number {
+  const line = text.lastIndexOf("\n") + 1;
+  const tail = text.slice(line);
+  if (/^\s*(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)?#+$/.test(tail)) return line;
+  const link = tail.search(/!?\[/);
+  return link < 0 ? text.length : line + link;
+}
+
+/** The segment the stream s shows (said()), and how far of it may show while it is still being said. */
+function segment(p: Progress, s: Stream, v: View): { all: string; steady: number } {
+  const calls = p.parts.slice(p.sent, s.part).flatMap((x) => ("tools" in x ? x.tools : []));
+  const part = p.parts[s.part];
+  const text = part && "text" in part ? clean(part.text) : "";
+  const all = said(calls, text, v);
+  return { all, steady: all.length - text.length + steady(text) };
+}
+
+/** A frame: the segment from at to end, a code block it starts inside opened again on top. head: how
+ *  much of its text that line is; from: where in all its own text starts. */
+function frame(all: string, at: number, end: number, v: View): Msg & { head: number; from: number } {
+  const open = at ? fits(fenceAt(all, at), v.caps.maxTextLength) : null;
+  const head = open === null ? "" : `${open}\n`;
+  const body = all.slice(at, Math.max(at, end));
+  // Blank lines go; a line's indent stays (code), but the space a cut inside a line left goes.
+  const nl = body.match(/^\n*/)![0].length;
+  const lead = at + nl && all[at + nl - 1] !== "\n" ? body.length - body.trimStart().length : nl;
+  const text = (head + body.slice(lead)).trimEnd();
+  const md = markdown(text, v.caps);
+  return { text, ...(md !== undefined && { markdown: md }), head: head.length, from: at + lead };
+}
+
+/** What a stream that showed some of a thing said leaves of it. */
+function rest(p: Progress, s: Stream, v: View): string {
+  return frame(segment(p, s, v).all, s.at, Infinity, v).text;
+}
+
+const msg = (text: string, v: View): Msg => {
+  const md = markdown(text, v.caps);
+  return md === undefined ? { text } : { text, markdown: md };
+};
+/** Whether m shows all that shown did, and maybe more. */
+const grows = (m: Msg, shown: Msg) => m.text.startsWith(shown.text) && (m.markdown ?? "").startsWith(shown.markdown ?? "");
+
+/** The open stream as the parts now say: it grows, or closes, done (or all) once what it shows is
+ *  over, else once it would change what it showed, outgrow the limit or outlast its time
+ *  (Capabilities.stream). */
+function grow(p: Progress, e: AgentEvent | null, v: View, all = false): { progress: Progress; out: Flow[] } {
+  const s = p.stream;
+  if (!s?.open) return { progress: p, out: [] };
+  const seg = segment(p, s, v);
+  const part = p.parts[s.part];
+  const done = all || p.parts.length - 1 > s.part || (!!part && "text" in part && !!part.done) || !!p.running || e?.type === "tool_start";
+  const m = frame(seg.all, s.at, done ? seg.all.length : seg.steady, v);
+  const shown = msg(p.shown, v);
+  const close = (last: Msg, at: number): { progress: Progress; out: Flow[] } => ({
+    progress: { ...p, stream: { part: s.part, at, upto: at, since: s.since }, shown: "" },
+    out: [{ edit: last, final: true, ...(last.text === p.shown && { unchanged: true as const }) }],
+  });
+  if (!grows(m, shown)) {
+    // ponytail: what a stream showed never changes but for what steady() misses; such a thing said
+    // goes again from the line it changed in, a little of it twice.
+    let i = 0;
+    while (i < shown.text.length && m.text[i] === shown.text[i]) i++;
+    const changed = m.from + Math.max(0, i - m.head);
+    return close(shown, Math.max(s.at, seg.all.lastIndexOf("\n", changed - 1) + 1));
+  }
+  if (m.text.length > v.caps.maxTextLength) {
+    // Cut at a line break, as pieces() cuts a message, where that keeps all it showed; else where it got to.
+    const [first, next] = pieces(seg.all.slice(0, done ? seg.all.length : seg.steady), v.caps.maxTextLength, m.from);
+    const piece = msg(first!.text.trimEnd(), v);
+    if (next && grows(piece, shown)) return close(piece, next.at);
+    const fence = fits(fenceAt(seg.all, s.upto), v.caps.maxTextLength);
+    const closed = fence !== null && `${p.shown}\n${run(fence)}`;
+    return close(closed && closed.length <= v.caps.maxTextLength ? msg(closed, v) : shown, s.upto);
+  }
+  if (done) return { progress: { ...p, sent: s.part + 1, stream: undefined, shown: "" }, out: [{ edit: m, final: true, ...(m.text === p.shown && { unchanged: true as const }) }] };
+  if (v.now - s.since >= v.caps.stream!) return close(m, Math.max(s.upto, m.from + m.text.length - m.head));
+  if (m.text === p.shown) return { progress: p, out: [] };
+  return { progress: { ...p, shown: m.text, stream: { ...s, upto: m.from + m.text.length - m.head } }, out: [{ edit: m }] };
+}
+
+/**
+ * One event (e null: the clock moved on) on a platform that streams what is said. room: as append's,
+ * how many messages the turn may still send before its end; a stream opens while one is left besides
+ * the hint's, and streams says no other stream is open in the chat. What the agent says as it goes,
+ * a text_delta, opens a stream; what comes whole goes as append sends it.
+ */
+export function flow(p: Progress, e: AgentEvent | null, v: View, room: number, streams: boolean): { progress: Progress; out: Flow[] } {
+  const g = grow(e ? track(p, e, v) : p, e, v);
+  if (g.progress.stream?.open) return g;
+  const r = over(g.progress, e, v, room);
+  const out: Flow[] = [...g.out, ...r.sends.map((send) => ({ send }))];
+  const next = r.progress;
+  const part = next.parts.length - 1;
+  const was = next.stream;
+  if (e?.type !== "text_delta" || !streams || v.toolsOnly || next.kept.length || room - r.sends.length < 0 || was?.broken) return { progress: next, out };
+  const s: Stream = { ...(was?.part === part ? was : { part, at: 0, upto: 0 }), since: v.now, open: true };
+  const m = frame(segment(next, s, v).all, s.at, segment(next, s, v).steady, v);
+  if (!m.text || m.text.length > v.caps.maxTextLength) return { progress: next, out };
+  const { head: _h, from: _f, ...open } = m;
+  return { progress: { ...next, stream: { ...s, upto: m.from + m.text.length - m.head }, shown: m.text }, out: [...out, { open }] };
+}
+
+/** The turn is over: the open stream closes with all it has to show; finish() sends the rest. */
+export const settle = (p: Progress, v: View) => grow(p, null, v, true);
+
+/** Something else went to the chat: the open stream closes as it is, and what is said after it goes on
+ *  under that, in another (im-style §3.2). */
+export function pause(p: Progress, v: View): { progress: Progress; out: Flow[] } {
+  const s = p.stream;
+  if (!s?.open) return { progress: p, out: [] };
+  return { progress: { ...p, stream: { part: s.part, at: s.upto, upto: s.upto, since: s.since }, shown: "" }, out: [{ edit: msg(p.shown, v), final: true, unchanged: true }] };
 }
 
 // ---- Text over a platform's limit, in pieces (story 74). Adapted from qq-cli's chunkText (MIT,

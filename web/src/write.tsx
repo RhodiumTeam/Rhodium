@@ -651,7 +651,7 @@ export function StopKey({ slot, className }: { slot: string; className?: string 
 type Shown = Extract<RhReply, { ok: true }> & { said: string };
 
 /** The most a message may carry attached, as POST /api/send takes, and Telegram's bots. */
-const MAX_FILES = 20 << 20;
+export const MAX_FILES = 20 << 20;
 
 /** Where you type to the slot, at the bottom of its chat (spec web-write "页面"): words over many lines,
  *  sent with the key, or Ctrl+Enter, or Enter as picked from the key's menu (story 511); pictures and
@@ -846,7 +846,7 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
     changed();
   };
   return (
-    <div className="px-3 pt-1 pb-[calc(0.5rem+env(safe-area-inset-bottom))]">
+    <div className="chat-inset px-3 pt-1 pb-[calc(0.5rem+env(safe-area-inset-bottom))]">
       {reply?.card && <InfoCard card={reply.card} anchor={box} close={() => setShown(null)} run={(c) => run(c, reply)} />}
       {reply?.panel && <Answer r={reply} name={/^\/(\S+)/.exec(reply.said)?.[1] ?? ""} close={() => setShown(null)} pick={(c) => choose(c, reply)} />}
       {agent && <AgentSheet open={shown === "agent"} anchor={agentKey} close={() => setShown((s) => (s === "agent" ? null : s))} agent={agent} turn={turn} send={send} />}
@@ -863,7 +863,7 @@ export function Composer({ slot, turn, archived, switchable, log, changed, comma
         // A slot in the terminal has no 压缩 here (spec web-import-composer "上下文和额度").
         compact={terminal ? undefined : async () => (setShown(null), show(await send("/compact"), "/compact"))}
       />
-      <div data-box className="relative mx-auto max-w-3xl rounded-3xl border bg-card shadow-xs">
+      <div data-box className="chat-column relative mx-auto rounded-3xl border bg-card shadow-xs">
         {list.length > 0 && <Palette list={list} at={Math.min(at, list.length - 1)} pick={pick} point={setAt} />}
         {quoted !== null && (
           <div className="flex items-center gap-1.5 pt-1.5 pl-4 text-sm text-muted-foreground">
@@ -1023,8 +1023,8 @@ export function Queue({ slot, queue, spaced = false }: { slot: string; queue: Sl
   );
   return (
     // spaced: clear of the terminal's black, and of the screen's edge under the chat, with no box there on a computer.
-    <section aria-label="待发队列" className={cn("px-3 pt-1", spaced && "py-2")}>
-      <div className="mx-auto max-w-3xl rounded-2xl border bg-card text-sm shadow-xs">
+    <section aria-label="待发队列" className={cn("chat-inset px-3 pt-1", spaced && "py-2")}>
+      <div className="chat-column mx-auto rounded-2xl border bg-card text-sm shadow-xs">
         <div className="flex h-9 items-center gap-1.5 border-b pl-3 text-muted-foreground">
           <span role="img" aria-label={paused ? "暂停了" : "排着"}>
             {paused ? <Pause className="size-4" /> : <List className="size-4" />}

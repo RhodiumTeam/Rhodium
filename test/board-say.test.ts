@@ -307,7 +307,7 @@ test("story 575: after your message on the board, rh send me stays there while a
   const receipts = () => rhodium.claude.runs().flatMap((r) => r.rh.map((c) => c.out));
   await say(JSON.stringify([["send", "me", "on the board"]]));
   await until(() => receipts().length === 1, 15_000);
-  expect(receipts()).toEqual(["用户正在网页上看，没推送到 IM。这次发的内容网页上看得到；之后要说的话写在回复里就行。\n"]);
+  expect(receipts()).toEqual(["用户正在网页上看，没推送到 IM。这条消息已在网页上整条显示，回复里不用再写一遍。\n"]);
   // The page goes.
   ac.abort();
   await becomes("空闲");

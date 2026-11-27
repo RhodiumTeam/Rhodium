@@ -92,7 +92,7 @@ export function Details({ d }: { d: SlotData }) {
   const timeline = useEdges<HTMLDetailsElement>(); // its cut ends fading (#638)
   return (
     <>
-      {d.process && <ProcessLine p={d.process} slot={d.id} memory={d.memory} />}
+      {d.process && (d.process.activeState || d.process.stderr.length > 0) && <ProcessLine p={d.process} slot={d.id} memory={d.memory} />}
       <Settings d={d} />
       {/* Folded: the events are what 详情 is read for. */}
       {d.timeline.length > 0 && (
@@ -173,12 +173,12 @@ function Sent({ s }: { s: NonNullable<SlotEvent["sends"]>[number] }) {
  *  runs has a key at the right that stops it, its conversation kept (story 270). Held up over its memory
  *  limit, what its unit uses and the limit under it (#692). */
 function ProcessLine({ p, slot, memory }: { p: NonNullable<SlotData["process"]>; slot: string; memory?: string }) {
-  const [dot, state] = RUNS[p.activeState] ?? ["bg-idle", "已退出"];
+  const [dot, state] = RUNS[p.activeState ?? ""] ?? ["bg-idle", "已退出"];
   const says = [state, p.activeState === "active" && p.pid && `PID ${p.pid}`, state === "已退出" && p.exitStatus != null && `退出码 ${p.exitStatus}`];
   const [busy, run] = useAct();
   return (
     <div className="grid gap-2 px-4 pb-3">
-      <div className="flex min-h-11 items-center gap-2 text-sm">
+      {p.activeState && <div className="flex min-h-11 items-center gap-2 text-sm">
         <span className={cn("size-2 shrink-0 rounded-full", dot)} />
         {says.filter(Boolean).join("，")}
         {(p.activeState === "active" || p.activeState === "activating") && (
@@ -186,7 +186,7 @@ function ProcessLine({ p, slot, memory }: { p: NonNullable<SlotData["process"]>;
             {busy ? <Spin /> : <Power className="size-4.5" />}
           </button>
         )}
-      </div>
+      </div>}
       {memory && (
         <div className="flex items-center gap-2 text-sm">
           <span className="text-muted-foreground">内存</span>

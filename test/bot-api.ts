@@ -27,7 +27,7 @@ export function botApi(opts: { token?: string; refuseFirstPoll?: boolean } = {})
   // How the next calls of a method go, first first; then they go through. rich: only calls with
   // (true) or without (false) a rich message.
   const next: { method: string; how: keyof typeof FAILURES; rich?: boolean }[] = [];
-  // Each call but getUpdates and the row's messages, as it came: edits, buttons, presses answered.
+  // Each call but getUpdates and the row's messages, as it came: edits, drafts, buttons, presses answered.
   const calls: { method: string; body: Record<string, any> }[] = [];
   // Each message with a reply keyboard, the row (architecture §8.4), as it came: apart, as no reply.
   const rows: Record<string, any>[] = [];
@@ -100,7 +100,7 @@ export function botApi(opts: { token?: string; refuseFirstPoll?: boolean } = {})
         return Response.json({ ok: true, result: true });
       }
       if (method === "getChat" && String(body.chat_id) === String(ME)) return Response.json({ ok: true, result: { ...YOU, type: "private" } });
-      if (["editMessageText", "editMessageReplyMarkup", "answerCallbackQuery"].includes(method!)) return Response.json({ ok: true, result: true });
+      if (["editMessageText", "editMessageReplyMarkup", "answerCallbackQuery", "sendMessageDraft", "sendRichMessageDraft"].includes(method!)) return Response.json({ ok: true, result: true });
       return Response.json({ ok: false, error_code: 400, description: `Bad Request: no ${method} here` });
     },
   });

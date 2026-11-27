@@ -1,5 +1,6 @@
 # Make the install packages for a release (#385): scripts/package.sh on an x86_64 and an arm64
-# runner, then a draft GitHub Release v<version> with both and their SHA256SUMS, for a maintainer to
+# runner, the Windows x64 and Apple Silicon previews on their own runners, then a draft GitHub
+# Release v<version> with all four and their SHA256SUMS, for a maintainer to
 # read and publish. Run by hand only, and only in the public repository: the private one carries this
 # file too. How to run it: deploy/README.md, 打安装包.
 name: Release packages
@@ -45,8 +46,78 @@ jobs:
           path: dist/*.tar.xz
           if-no-files-found: error
 
+  # The Windows x64 preview (release/windows-preview): its own build and package scripts.
+  windows:
+    if: github.repository == 'RhodiumTeam/Rhodium'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same Bun and Rust as the Linux packages and their notices.
+      - id: versions
+        shell: bash
+        run: |
+          bun=$(basename release/licenses/bun-*.md .md)
+          echo "bun=${bun#bun-}" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.versions.outputs.bun }}
+      - run: bun install --frozen-lockfile
+      - shell: pwsh
+        run: |
+          $version = (Get-Item release/licenses/rust-*.md).BaseName.Substring(5)
+          $toolchain = "$version-x86_64-pc-windows-msvc"
+          rustup toolchain install $toolchain --profile minimal --no-self-update
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+      - shell: pwsh
+        run: ./scripts/windows-build.ps1
+      - shell: pwsh
+        run: ./scripts/windows-package.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          path: dist/rhodium-*-win-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  # The Apple Silicon preview (release/macos-preview), built natively on an arm64 Mac runner.
+  macos:
+    if: github.repository == 'RhodiumTeam/Rhodium'
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: versions
+        run: |
+          bun=$(basename release/licenses/bun-*.md .md)
+          echo "bun=${bun#bun-}" >>"$GITHUB_OUTPUT"
+          rust=$(basename release/licenses/rust-*.md .md)
+          echo "rust=${rust#rust-}" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.versions.outputs.bun }}
+      - run: bun install --frozen-lockfile
+      # macos-package.sh picks this toolchain by the notices' version.
+      - run: rustup toolchain install ${{ steps.versions.outputs.rust }} --profile minimal --target aarch64-apple-darwin --no-self-update
+      - run: scripts/macos-package.sh dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-arm64
+          path: dist/rhodium-*-arm64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
   release:
-    needs: package
+    needs: [package, windows, macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -60,7 +131,32 @@ jobs:
           path: dist
           merge-multiple: true
       - working-directory: dist
-        run: sha256sum -- *.tar.xz | tee SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patterns=(
+            "rhodium-${VERSION}-*-linux-x86_64.tar.xz"
+            "rhodium-${VERSION}-*-linux-arm64.tar.xz"
+            "rhodium-${VERSION}-windows-preview-*-win-x64.zip"
+            "rhodium-${VERSION}-macos-preview-*-arm64.tar.gz"
+          )
+          files=()
+          for pattern in "${patterns[@]}"; do
+            matched=( $pattern )
+            if (( ${#matched[@]} != 1 )) || [[ ! -f ${matched[0]} ]]; then
+              echo "expected exactly 1 package matching $pattern, found ${#matched[@]}" >&2
+              exit 1
+            fi
+            files+=( "${matched[0]}" )
+          done
+          all=( * )
+          if (( ${#all[@]} != ${#files[@]} )); then
+            echo "expected ${#files[@]} files in dist, found ${#all[@]}: ${all[*]}" >&2
+            exit 1
+          fi
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
       # A draft of this version already there gets this run's files in place of its own, its notes
       # kept; a published one is never touched.
       - run: |
@@ -71,6 +167,6 @@ jobs:
             gh release edit "$tag" --target "$GITHUB_SHA"
           else
             gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Rhodium $VERSION" \
-              --notes "Linux 的安装包，x86_64 和 arm64 各一个。装法见包里的 INSTALLATION.md。下载后可以用 sha256sum -c --ignore-missing SHA256SUMS 校验。"
+              --notes "Linux 的安装包，x86_64 和 arm64 各一个，装法见包里的 INSTALLATION.md，下载后可在 Linux 用 sha256sum -c --ignore-missing SHA256SUMS 校验。另有 Windows x64 和 Apple Silicon 的预览包，装法见包里的 TESTING 文档，下载后对照本页 SHA256SUMS 用各平台自带命令校验（Windows PowerShell 用 Get-FileHash -Algorithm SHA256，macOS 用 shasum -a 256）。"
           fi
           gh release upload "$tag" dist/*

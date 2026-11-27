@@ -31,6 +31,12 @@ const QQ_FILE_BYTES = { image: 30 * 2 ** 20, file: 100 * 2 ** 20 };
 
 export const QQ_CAPABILITIES: Capabilities = {
   progress: "append",
+  // What the agent says streams in (stream_messages, #797): a frame at most every 500 ms, the SDK's
+  // default; the last one closes the stream, even with nothing new. QQ turns down every frame of one,
+  // its closing one too, about 10 minutes after its first (40034020, 2026-11-17): it runs 9 at most.
+  stream: 9 * 60_000,
+  editEvery: 500,
+  finalEdit: true,
   // Callback buttons, in private chats too (probe 15); since 2026-10-22, on a phone, shown on a
   // Markdown message only (withKeyboard).
   buttons: "markdown",
@@ -52,6 +58,9 @@ export const QQ_CAPABILITIES: Capabilities = {
 
 export const TELEGRAM_CAPABILITIES: Capabilities = {
   progress: "edit",
+  // A turn's message is a draft (sendMessageDraft), sent as a message at its final edit (#784).
+  finalEdit: true,
+  draftTtl: 30_000, // "a temporary 30-second preview", Bot API 9.3
   buttons: true, // inline buttons
   copy: 256, // copy_text buttons
   sendLimit: { kind: "rate", perChatPerSecond: 1 },
@@ -61,14 +70,17 @@ export const TELEGRAM_CAPABILITIES: Capabilities = {
   maxTextLength: 4096,
   maxFileBytes: { image: 10 * 2 ** 20, file: 50 * 2 ** 20 }, // sendPhoto and sendDocument, uploaded
   // Rich messages (Bot API 10.1) read $formula$, ||spoiler||, ==mark== and HTML tags, and swallow
-  // Vec<T> without a word (scripts/probes/telegram/rich.ts).
-  markdown: { extensions: ["html", "math", "spoiler", "mark"] },
+  // Vec<T> without a word (scripts/probes/telegram/rich.ts). They fold <details> blocks
+  // (scripts/probes/telegram/drafts.ts).
+  markdown: { extensions: ["html", "math", "spoiler", "mark"], details: true },
 };
 
 /** Feishu's capability table; editEvery is durations.feishuEdit. */
 export const feishuCapabilities = (editEvery: number): Capabilities => ({
   progress: "edit",
   editEvery,
+  finalEdit: true, // the last edit closes the card's streaming mode (feishu.ts)
+  panels: true,
   buttons: true, // a card's callback buttons; no copy button
   sendLimit: { kind: "rate", perChatPerSecond: 5 },
   menu: { scope: "global", maxItems: 100 },
@@ -111,7 +123,9 @@ export const MADE = Object.fromEntries(Object.entries(PLATFORMS).flatMap(([p, de
  *  need not wait out Telegram's one request a second. buttons = "false", its own too, takes the
  *  buttons away, so lists and asks go numbered as they do when there are too many choices for buttons.
  *  copy, its own too, is the longest text its copy buttons take. markdown = "false", its own too, has
- *  it send plain text only. */
+ *  it send plain text only. finalEdit = "true", its own too, sets finalEdit. draftTtl, its own too,
+ *  sets draftTtl, so a test need not wait out Telegram's 30 s; stream, its own too, sets stream, so
+ *  one need not wait out QQ's 9 minutes. */
 function fakeCapabilities(bot: BotConfig, durations: Durations): Capabilities {
   const like = bot.like as Platform | undefined;
   if (!like || like === "fake" || !Object.hasOwn(PLATFORMS, like)) {
@@ -122,6 +136,9 @@ function fakeCapabilities(bot: BotConfig, durations: Durations): Capabilities {
   if (bot.buttons === "false") caps = { ...caps, buttons: false };
   if (bot.copy) caps = { ...caps, copy: Number(bot.copy) };
   if (bot.markdown === "false") caps = { ...caps, markdown: null };
+  if (bot.finalEdit === "true") caps = { ...caps, finalEdit: true };
+  if (bot.draftTtl) caps = { ...caps, draftTtl: Number(bot.draftTtl) };
+  if (bot.stream) caps = { ...caps, stream: Number(bot.stream) };
   return bot.perChatPerSecond ? { ...caps, sendLimit: { kind: "rate", perChatPerSecond: Number(bot.perChatPerSecond) } } : caps;
 }
 

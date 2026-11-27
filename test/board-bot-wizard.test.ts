@@ -52,6 +52,8 @@ const fake = {
   async start(argv: string[]) {
     started.push(argv);
     const [name, platform] = argv as [string, Made];
+    // As the router: --paste is Feishu's own choice; Telegram always takes a pasted token.
+    if (argv.includes("--paste") && platform !== "feishu") return { ok: false, error: "--paste 只用于飞书。" };
     const paste = platform === "telegram" || argv.includes("--paste");
     const f: FlowView = { id: crypto.randomUUID(), name, platform, state: paste ? "paste" : "scan", log: [], ...(!paste && { url: URL_, svg: qrSvg(URL_) }) };
     flows.set(f.id, f);
@@ -237,6 +239,7 @@ smoke("stories 673, 676, 678, 679, on a wide screen: Telegram's token turned dow
   await page.getByText("K7QM2XPD", { exact: true }).waitFor();
   await page.getByText("私聊 telegram，发送这个码").waitFor();
   await page.getByText(/^(10:00|9:5\d)$/).waitFor();
+  expect(started.at(-1)).not.toContain("--paste");
   const id = [...flows.values()].find((f) => f.name === "telegram")!.id;
   set(id, { state: "done" });
   await page.getByText("创建成功").waitFor();

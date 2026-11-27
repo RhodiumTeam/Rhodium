@@ -2,7 +2,8 @@
 // Read once at startup; changes need a restart, but for a bot rh bot adds.
 import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
-import { isAbsolute } from "node:path";
+import { checkWindowsPermissions, createPrivateWindows, windows, windowsRoot } from "./windows";
+import { isAbsolute, join } from "node:path";
 import { version } from "../package.json";
 import { AGENTS } from "./agents";
 import type { AgentKind, Platform } from "./contracts";
@@ -13,7 +14,7 @@ import { PLATFORMS } from "./platforms";
  *  tests), the environment's, if it has one. BUILD: 1.0.0-4a9cf6e, or 1.0.0 with no commit, as
  *  rhodium --version prints it. */
 export const COMMIT = process.env.RHODIUM_BUILD_COMMIT || null;
-export const BUILD = COMMIT ? `${version}-${COMMIT}` : version;
+export const BUILD = COMMIT ? `${version}-${windows ? "windows-preview-" : process.platform === "darwin" ? "macos-preview-" : ""}${COMMIT}` : version;
 
 // Every duration Rhodium waits on, as the config file leaves it. Tests set them to seconds.
 export const durations = {
@@ -36,7 +37,7 @@ export const durations = {
   memoryLook: "10s", // architecture §4.2, how often each running holder unit's memory pressure is read
   tuiConfirm: "30s", // product §4.2, how long what was typed into a slot's terminal has to show in its transcript before it is not known to have got there
   menuRetry: "1m", // architecture §8.4, before a menu push that failed is tried again
-  feishuEdit: "3s", // architecture §8.2, the least time between two edits of a turn's Feishu card
+  feishuEdit: "400ms", // architecture §8.2, the least time between two edits of a turn's Feishu card: each pushes text its card types out
   // The longest each is kept; limits.stateMaxMB may see them go sooner (architecture §7.8).
   holdDirKeep: "7d", // architecture §4.3
   inboundKeep: "90d", // architecture §7.1, inbound and outbound records with their quoted text (§8.3), and the media dir (§7.8)
@@ -241,12 +242,15 @@ function overlay<T extends Record<string, unknown>>(where: string, base: T, give
 
 /** Where the socket directory is when the config does not say; `rh` looks there too. */
 export function defaultSocketDir(env: Record<string, string | undefined>): string {
+  if (windows) return join(windowsRoot(env), "run");
+  if (process.platform === "darwin" && !env.XDG_RUNTIME_DIR) return join(env.HOME ?? "", ".rhodium", "run");
   return `${env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.()}`}/rhodium`;
 }
 
 export function loadConfig(path: string, env: Record<string, string | undefined> = process.env): Config {
   const mode = statSync(path).mode & 0o777;
-  if (mode !== 0o600) {
+  if (windows) checkWindowsPermissions([path]);
+  else if (mode !== 0o600) {
     throw new Error(`config: ${path} has mode 0${mode.toString(8)}; it holds bot tokens, chmod it to 0600`);
   }
   const { durations: d, limits: l, defaults: t, bots: b, programs: p, board: w, herdr: h, ...top } = Bun.TOML.parse(
@@ -258,8 +262,8 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
     { stateDir: "", socketDir: "", lockDir: "", unitPrefix: "rh-", unit: "rhodium", agentPath: "", memoryHigh: "4G", holdBin: "", mainChat: "" },
     top,
   );
-  if (!paths.stateDir && !env.HOME) throw new Error("config: HOME is not set, so stateDir must be given");
-  const stateDir = paths.stateDir || `${env.HOME}/.local/state/rhodium`;
+  if (!windows && !paths.stateDir && !env.HOME) throw new Error("config: HOME is not set, so stateDir must be given");
+  const stateDir = paths.stateDir || (windows ? join(windowsRoot(env), "state") : `${env.HOME}/.local/state/rhodium`);
   for (const k of ["unitPrefix", "unit"] as const) {
     if (!/^[A-Za-z0-9:_.-]+$/.test(paths[k])) throw new Error(`config: ${k} may only use letters, digits and : _ . - (systemd unit names)`);
   }
@@ -342,6 +346,11 @@ export function loadConfig(path: string, env: Record<string, string | undefined>
   };
 }
 
+function writePrivateConfig(path: string, text: string) {
+  if (windows) createPrivateWindows([path], text);
+  else writeFileSync(path, text, { mode: 0o600, flag: "wx" });
+}
+
 /** Puts text in place of the config file: written beside it first, mode 0600, and taking its place
  *  only once it loads as a config that check, which throws otherwise, finds as meant. Returns what
  *  check does. */
@@ -349,7 +358,7 @@ function rewrite<T>(path: string, text: string, check: (config: Config) => T): T
   const next = `${path}.new`;
   rmSync(next, { force: true }); // left by a write that failed, maybe with another mode
   try {
-    writeFileSync(next, text, { mode: 0o600 });
+    writePrivateConfig(next, text);
     const out = check(loadConfig(next));
     renameSync(next, path);
     return out;
@@ -426,13 +435,13 @@ export function renameTarget(path: string, from: string, to: string): { bots: st
   const next = `${path}.new`;
   rmSync(next, { force: true }); // left by a write that failed, maybe with another mode
   try {
-    writeFileSync(next, text.replace(quoted, `$1$2${to}$2`), { mode: 0o600 });
+    writePrivateConfig(next, text.replace(quoted, `$1$2${to}$2`));
     const now = loadConfig(next).bots;
     const want = (b: string) => JSON.stringify({ ...was[b], ...(bots.includes(b) && { target: to }) });
     const left = Object.keys({ ...was, ...now }).filter((b) => want(b) !== JSON.stringify(now[b]));
     if (left.length) throw new Error(`Bot ${left.join("、")} 的 target 不是单独一行 target = "${from}" 的写法，没法只改引号里的名字`);
     const backup = `${path}.${new Date().toISOString().replace(/:/g, "-")}.bak`;
-    writeFileSync(backup, text, { mode: 0o600, flag: "wx" });
+    writePrivateConfig(backup, text);
     renameSync(next, path);
     return { bots, backup };
   } catch (err) {

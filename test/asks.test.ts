@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Posted } from "../src/fake-im";
 import { installFakeAgent } from "./fake-agent/fake-agent";
-import { asking, endTurn, on, startTurn, type FakeAsk } from "./fake-agent/scripts";
+import { askWithdrawn, asking, endTurn, on, startTurn, type FakeAsk } from "./fake-agent/scripts";
 import { askLine, askText, parseAnswer } from "../src/asks";
 import { sourceLine } from "../src/prompt";
 import { newInstance, recorded, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
@@ -538,6 +538,20 @@ test("an ask whose agent stopped is no longer open: your next message starts a t
   await until(() => asked().length === 2, 15_000);
   expect(asked()).toEqual(["go", "1"]);
   expect(answers()).toEqual([]);
+}, 30_000);
+
+test("a message right after /stop, before claude withdraws its ask, is no answer to that ask: it goes in once the turn ends (#31)", async () => {
+  // Claude withdraws the ask a while after the ask, the interrupt still unread: /stop and the next message come in between.
+  const plain = startTurn.length + 3 + endTurn("").length;
+  await slot({ claude: { script: { on, steps: [...startTurn, ...askWithdrawn(bash("p-1", "make"), 1500), ...endTurn(""), ...startTurn, ...endTurn("fake reply"), { goto: plain }] } } });
+  await say("go");
+  await posts(1);
+  await say("/stop");
+  await say("next");
+  await until(() => asked().length === 2, 15_000);
+  expect(asked()).toEqual(["go", "next"]);
+  expect(answers()).toEqual([]);
+  expect((await rhodium.im.log("q", ME)).some((p) => p.text.startsWith("已拒绝"))).toBe(false);
 }, 30_000);
 
 test("Codex's approvals read as the table in docs/im-style.md §4.2: a patch of several files says how many and shows each diff; more permissions, one a line", () => {

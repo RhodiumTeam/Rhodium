@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { botApi, ME } from "./bot-api";
 import type { Script, Step } from "./fake-agent/fake-agent";
-import { asking, endTurn, on, startTurn, textDelta, toolCall } from "./fake-agent/scripts";
+import { asking, askingCall, endTurn, on, startTurn, textDelta, toolCall } from "./fake-agent/scripts";
 import { BOARD_LOGIN, newInstance, until, withoutSource, type Instance } from "./instance";
 import { TelegramAdapter } from "../src/telegram";
 import { TELEGRAM_ROW } from "../src/commands";
@@ -116,30 +116,119 @@ test("story 73: a reply goes as a rich message in Telegram's Markdown; one Teleg
   ]);
 }, 30_000);
 
+test("#784: a turn's message goes as a draft, rich where it can, plain where Telegram turns the Markdown down; its final edit sends it as a message, whose id comes back", async () => {
+  api = botApi();
+  const bot = new TelegramAdapter("B1", "t", { platform: "telegram", token: TOKEN, apiRoot: api.url }, { log: () => {} });
+  const chat = String(ME);
+  const draft = await bot.send(chat, { text: "a", markdown: "**a**", seq: 42, draft: true });
+  expect(draft).toEqual({ status: "sent", messageId: "draft:42" });
+  api.next.push({ method: "sendRichMessageDraft", how: "refuse" });
+  expect(await bot.edit(chat, "draft:42", { text: "ab", markdown: "**ab**" })).toEqual({ status: "sent", messageId: "draft:42" });
+  expect(await bot.edit(chat, "draft:42", { text: "abc", markdown: "**abc**", final: true })).toEqual({ status: "sent", messageId: "1" });
+  // A message's final edit Telegram turns down as Markdown goes as plain text.
+  await bot.send(chat, { text: "x", markdown: "x", seq: 43, draft: true });
+  api.next.push({ method: "sendRichMessage", how: "refuse" });
+  expect(await bot.edit(chat, "draft:43", { text: "xy", markdown: "*xy*", final: true })).toEqual({ status: "sent", messageId: "2" });
+  const drafts = api.calls.filter((c) => c.method.endsWith("Draft")).map((c) => ({ method: c.method, draft: c.body.draft_id, shows: c.body.rich_message?.markdown ?? c.body.text }));
+  expect(drafts).toEqual([
+    { method: "sendRichMessageDraft", draft: 42, shows: "**a**" },
+    { method: "sendRichMessageDraft", draft: 42, shows: "**ab**" },
+    { method: "sendMessageDraft", draft: 42, shows: "ab" },
+    { method: "sendRichMessageDraft", draft: 43, shows: "x" },
+  ]);
+  expect(api.sent).toEqual([
+    { chat_id: chat, text: "**abc**", rich: true },
+    { chat_id: chat, text: "xy" },
+  ]);
+  expect(api.calls.some((c) => c.method === "editMessageText")).toBe(false);
+});
+
 /** A Telegram bot t, its apiRoot the stand-in's, sending your messages to slot w/a. */
 const tg = () => ["[bots.t]", 'platform = "telegram"', `token = "${TOKEN}"`, `apiRoot = "${api.url}"`, `owner = "${ME}"`, 'target = "w/a"'].join("\n");
 
-test("stories 72, 73: an edit Telegram can't take as Markdown goes as plain text; one to what the message shows is done; one still over the flood limit after the waits is not sent anew", async () => {
+test("stories 72, 73, #784: a draft Telegram can't take as Markdown goes as plain text; one still over the flood limit after the waits is not sent anew; the end sends the message", async () => {
   api = botApi();
   const deltas = Array.from({ length: 4 }, (_, i): Step[] => [{ sleep: 1000 }, { emit: [textDelta(`${i} `)] }]).flat();
   rhodium = newInstance({
     toml: tg(),
-    // A second for the tool's own edit, from running to done, before the text comes.
+    // A second for the tool's own update, from running to done, before the text comes.
     claude: { script: { on, steps: [...startTurn, toolCall("toolu_read", "Read", { file_path: "notes.txt" }), { sleep: 1000 }, ...deltas, ...endTurn("0 1 2 3"), { goto: 0 }] } },
   });
   const d = await rhodium.start();
   await rhodium.slots("a");
-  const edit = "editMessageText";
-  api.next.push({ method: edit, how: "refuse", rich: true }, { method: edit, how: "same", rich: true }, ...Array.from({ length: 3 }, () => ({ method: edit, how: "flood0" as const, rich: true })));
+  const draft = "sendRichMessageDraft";
+  api.next.push({ method: draft, how: "refuse" }, ...Array.from({ length: 3 }, () => ({ method: draft, how: "flood0" as const })));
   api.say("count");
-  const edits = () => api.calls.filter((c) => c.method === edit).map((c) => c.body.rich_message?.markdown ?? { plain: c.body.text });
-  const tool = "> [🔧 Read] `notes.txt`";
-  await until(() => edits().at(-1) === `${tool}\n\n0 1 2 3`, 20_000);
-  // The first edit turned down as Markdown, then made in plain text; the second "not modified"; the
-  // third over the flood limit three times. None of them sent the text anew.
-  expect(edits().slice(0, 4)).toEqual([tool, { plain: "[🔧 Read] notes.txt" }, `${tool}\n\n0`, `${tool}\n\n0 1`]);
-  expect(api.calls.filter((c) => c.method === "sendRichMessage" || c.method === "sendMessage")).toHaveLength(1);
+  const drafts = () => api.calls.filter((c) => c.method.endsWith("Draft")).map((c) => c.body.rich_message?.markdown ?? { plain: c.body.text });
+  const read = "[🔧 Read] `notes.txt`";
+  const open = (line: string) => `<details open><summary>🔧 工具 ×1（运行中）</summary>\n\n${line}\n\n</details>`;
+  const closed = `<details><summary>🔧 Read</summary>\n\n${read}\n\n</details>`;
+  await until(() => api.sent.at(-1)?.text === `${closed}\n\n0 1 2 3`, 20_000);
+  // The first turned down as Markdown, then shown in plain text; the second over the flood limit
+  // three times. None of them went as a message.
+  expect(drafts().slice(0, 6)).toEqual([open(`${read}，正在运行`), { plain: "[🔧 Read] notes.txt，正在运行" }, open(read), open(read), open(read), `${closed}\n\n0`]);
+  expect(api.sent).toHaveLength(1);
+  expect(api.calls.some((c) => c.method === "editMessageText")).toBe(false);
   expect(d.logs.filter((l) => l.msg === "edit failed")).toEqual([expect.objectContaining({ flood: true })]);
+}, 30_000);
+
+test("#784: a draft's final edit still over the flood limit after the waits goes again as a new message, rather than the draft going and taking the reply with it", async () => {
+  api = botApi();
+  rhodium = newInstance({ toml: tg(), claude: { script: { on, steps: [...startTurn, ...endTurn("done"), { goto: 0 }] } } });
+  const d = await rhodium.start();
+  await rhodium.slots("a");
+  api.next.push(...Array.from({ length: 3 }, () => ({ method: "sendRichMessage", how: "flood0" as const })));
+  api.say("hi");
+  await until(() => api.sent.length === 1, 15_000);
+  expect(api.sent).toEqual([{ chat_id: String(ME), text: "done", rich: true }]);
+  expect(api.calls.filter((c) => c.method === "sendRichMessage")).toHaveLength(4);
+  expect(d.logs.filter((l) => l.msg === "edit failed")).toEqual([expect.objectContaining({ error: expect.stringContaining("429") })]);
+}, 30_000);
+
+test("#784: a turn that ends while a draft update waits out the flood limit still sends its final message", async () => {
+  api = botApi();
+  // The second draft update floods for two seconds; the turn ends a second in, so its final edit
+  // joins that update while it waits.
+  const steps: Step[] = [...startTurn, { emit: [textDelta("a ")] }, { sleep: 1500 }, { emit: [textDelta("b")] }, { sleep: 1000 }, ...endTurn("a b"), { goto: 0 }];
+  rhodium = newInstance({ toml: tg(), claude: { script: { on, steps } } });
+  await rhodium.start();
+  await rhodium.slots("a");
+  api.say("hi");
+  await until(() => api.calls.some((c) => c.method.endsWith("Draft")), 15_000);
+  api.next.push(...Array.from({ length: 3 }, () => ({ method: "sendRichMessageDraft", how: "flood" as const })));
+  await until(() => api.sent.length === 1, 15_000);
+  expect(api.sent).toEqual([{ chat_id: String(ME), text: "a b", rich: true }]);
+}, 30_000);
+
+test("#784: once a turn's draft update is turned down and goes as a real message, that message's final edit lost to the flood limit is not sent again", async () => {
+  api = botApi();
+  const steps: Step[] = [...startTurn, { emit: [textDelta("a ")] }, { sleep: 1500 }, { emit: [textDelta("b")] }, { sleep: 3000 }, ...endTurn("a b c"), { goto: 0 }];
+  rhodium = newInstance({ toml: tg(), claude: { script: { on, steps } } });
+  const d = await rhodium.start();
+  await rhodium.slots("a");
+  api.say("hi");
+  await until(() => api.calls.some((c) => c.method.endsWith("Draft")), 15_000);
+  // The next draft update fails as Markdown and as plain text: the router sends it as a message.
+  api.next.push({ method: "sendRichMessageDraft", how: "refuse" }, { method: "sendMessageDraft", how: "refuse" });
+  await until(() => api.sent.length === 1, 15_000);
+  // Its edits then stay over the flood limit, the final one with them.
+  api.next.push(...Array.from({ length: 6 }, () => ({ method: "editMessageText", how: "flood0" as const })));
+  await until(() => d.logs.some((l) => l.msg === "edit failed" && /429/.test(String(l.error))), 15_000);
+  await Bun.sleep(1500);
+  expect(api.sent).toEqual([{ chat_id: String(ME), text: "a b", rich: true }]);
+}, 30_000);
+
+test("#784: an ask at the turn's first step, its draft still going out, waits for the draft's final edit, so it comes under the turn's message even when that send is slow", async () => {
+  api = botApi();
+  const steps: Step[] = [...startTurn, ...askingCall(["p-1", "Bash", { command: "make" }]), ...endTurn("Built."), { goto: 0 }];
+  rhodium = newInstance({ toml: tg(), claude: { script: { on, steps } } });
+  await rhodium.start();
+  await rhodium.slots("a");
+  // The draft's final edit, a message now, waits a second out over the flood limit.
+  api.next.push({ method: "sendRichMessage", how: "flood" });
+  api.say("build it");
+  await until(() => api.sent.length >= 2, 15_000);
+  expect(api.sent.slice(0, 2).map((s) => s.text)).toEqual([expect.stringContaining("[🔧 Bash]"), expect.stringContaining("允许吗")]);
 }, 30_000);
 
 test("stories 75, 82: an ask's options go as inline buttons; your press is answered, reaches the agent, and takes the buttons off", async () => {

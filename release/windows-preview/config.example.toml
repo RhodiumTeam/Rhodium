@@ -1,0 +1,14 @@
+# windows-task.ps1 fills the four path values when it first creates config.toml.
+stateDir = __STATE_DIR__
+socketDir = __RUN_DIR__
+lockDir = __LOCK_DIR__
+
+[board]
+bind = "127.0.0.1"
+port = 17860
+auth = "none"
+
+[programs]
+# If Task Scheduler cannot find the CLI, use its absolute executable path.
+# Example only: claude = 'C:\Users\YourName\.local\bin\claude.exe'
+claude = __CLAUDE_EXE__

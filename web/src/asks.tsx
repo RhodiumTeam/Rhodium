@@ -63,8 +63,8 @@ export function Asks({ d, turn }: { d: SlotData; turn: boolean }) {
   const asks = d.asks.filter((a) => !lines.some((l) => l.id === a.id));
   if (!asks.length && !lines.length) return null;
   return (
-    <div className="card-scroll max-h-[60dvh] overflow-y-auto border-t px-4 pt-3 pb-2">
-      <div className="mx-auto grid max-w-3xl gap-2">
+    <div className="chat-inset card-scroll max-h-[60dvh] overflow-y-auto border-t px-4 pt-3 pb-2">
+      <div className="chat-column mx-auto grid gap-2">
         {lines.map((l) => (
           <p key={l.id} className="rounded-lg border border-dashed px-3 py-2 text-sm text-muted-foreground">
             {l.why}

@@ -35,15 +35,15 @@ const useEntry = () => useSyncExternalStore((f) => (entered.add(f), () => void e
 
 /** Whether the board found no Herdr, as /api/board last said: asked here only while nothing has, not
  *  again at every event, as on a phone's chat with no list beside it. */
-const useNoHerdr = () => !!useQuery({ queryKey: ["board"], queryFn: () => json<BoardData>("api/board"), enabled: (q) => q.state.data === undefined }).data?.noHerdr;
+const useTerminalBoard = () => useQuery({ queryKey: ["board"], queryFn: () => json<BoardData>("api/board"), enabled: (q) => q.state.data === undefined }).data;
 
 /** Whether the three ways to switch a slot to the terminal show (the key under where you type, 切到终端
  *  in a row's menu and the topology's): 终端入口 on, and Herdr there. A slot already in the terminal
  *  keeps its own, and /rh_tui typed still goes. */
 export function useTerminalEntry(): boolean {
   const on = useEntry();
-  const none = useNoHerdr();
-  return on && !none;
+  const board = useTerminalBoard();
+  return on && !board?.noHerdr;
 }
 
 /** A gear that opens the settings card on side of it: over it at the sidebar's foot, under it in the
@@ -86,7 +86,7 @@ function SettingsCard() {
   const [on, setOn] = useState(reminding);
   const checked = on && leave === "granted";
   const entry = useEntry();
-  const noHerdr = useNoHerdr();
+  const noHerdr = useTerminalBoard()?.noHerdr;
   return (
     <>
       <div className="flex items-center justify-between">

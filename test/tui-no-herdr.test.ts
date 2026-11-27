@@ -41,3 +41,25 @@ test("story 586: without Herdr, rh tui says so and does nothing: the headless ag
   // With it, the agent goes first.
   expect(tui(true).effects.map((e) => e.kind)).toContain("stop");
 });
+
+test("a supported native launcher can switch any of the three agents", () => {
+  for (const agent of ["claude", "pi", "codex"] as const) {
+    const conversations = state.conversations.map(c => ({ ...c, agent }));
+    const input = { kind: "rh" as const, id: "r", caller: { token: null, pid: null, tty: true, cwd: "/" }, argv: ["tui", "w/a"] };
+    const d = route({ ...state, conversations }, input, { ...ctx(true), tuiUnavailable: () => undefined });
+    expect(d.writes).toContainEqual(expect.objectContaining({ op: "update", table: "slot", patch: expect.objectContaining({ mode: "tui" }) }));
+  }
+});
+
+test("a preflight error for the configured Codex program preserves the running slot", () => {
+  const reason = "Configure programs.codex to use a supported launcher.";
+  const native = { ...ctx(true), tuiUnavailable: () => reason };
+  const s = {
+    ...state,
+    slots: state.slots.map(slot => ({ ...slot, state: "running" as const, interruptedAt: null })),
+    conversations: state.conversations.map(c => ({ ...c, agent: "codex" as const })),
+  };
+  const d = route(s, { kind: "rh", id: "r", caller: { token: null, pid: null, tty: true, cwd: "/" }, argv: ["tui", "w/a", "!"] }, native);
+  expect(d.writes).toEqual([]);
+  expect(d.effects).toEqual([{ kind: "rh_reply", id: "r", reply: { ok: false, error: reason } }]);
+});

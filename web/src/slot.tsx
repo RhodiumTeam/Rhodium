@@ -4,7 +4,7 @@
 // loads this only once you open a slot. A slot in the terminal shows its pane instead (spec web-terminal).
 import { useQuery } from "@tanstack/react-query";
 import { Menu } from "@base-ui/react/menu";
-import { AArrowDown, AArrowUp, ALargeSmall, Archive, ArchiveRestore, Ellipsis, Expand, FoldVertical, Maximize2, MessageSquareText, Minimize2, Network, PanelLeftClose, PanelLeftOpen, Pencil, Quote, Settings, Shrink, SquarePen, SquareTerminal, Trash2 } from "lucide-react";
+import { AArrowDown, AArrowUp, ALargeSmall, MoveHorizontal, Archive, ArchiveRestore, Ellipsis, Expand, FoldVertical, Maximize2, MessageSquareText, Minimize2, Network, PanelLeftClose, PanelLeftOpen, Pencil, Quote, Settings, Shrink, SquarePen, SquareTerminal, Trash2 } from "lucide-react";
 import { lazy, Suspense, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { useLocation } from "wouter";
@@ -20,6 +20,7 @@ import { Details } from "./details";
 import { Carried } from "./media";
 import { Face, Mark } from "./faces";
 import { Stick, type Place } from "./stick";
+import { isYourTick, TickStrip, ticksOf } from "./ticks";
 import { Fold, folded, KEY, MARKDOWN, Running, SaidOf, type Shown } from "./tools";
 import { SettingsMenu, useTerminalEntry } from "./settings";
 import { useUnreadBut } from "./unread";
@@ -521,6 +522,14 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
   // The caret back where you type on a computer (spec web-maximize "焦点"): the menu gives it back to
   // nothing, where a short Esc would stop nothing.
   const root = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(() => kept(() => localStorage, "chat-width"));
+  const [hasRoom, setHasRoom] = useState(false);
+  useEffect(() => {
+    const el = root.current!;
+    const observe = new ResizeObserver(([entry]) => setHasRoom(entry!.contentRect.width > 51 * parseFloat(getComputedStyle(document.documentElement).fontSize)));
+    observe.observe(el);
+    return () => observe.disconnect();
+  }, []);
   const typeHere = () => void (matchMedia("(pointer: fine)").matches && root.current?.querySelector("textarea")?.focus());
   const more: Choice[] = [
     // As /new and /compact do (story 305): a slot in the terminal or archived has neither. Neither keeps
@@ -588,7 +597,7 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
   // Files dropped on the chat are attached where you type (#286); the browser opens none.
   const files = (e: DragEvent) => e.dataTransfer.types.includes("Files") && (e.preventDefault(), true);
   return (
-    <div ref={root} className="flex h-dvh flex-col" onDragOver={files} onDrop={(e) => files(e) && attach(d.id, [...e.dataTransfer.files])}>
+    <div ref={root} data-chat-width={hasRoom && (!terminal || reading) ? width : undefined} className="flex h-dvh flex-col" onDragOver={files} onDrop={(e) => files(e) && attach(d.id, [...e.dataTransfer.files])}>
       <TopBar
         title={
           renaming ? (
@@ -626,7 +635,20 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
             <span className={cn(buttonVariants({ variant: "ghost", size: "icon-sm" }))}>{reading ? <SquareTerminal className="size-4.5" /> : <MessageSquareText className="size-4.5" />}</span>
           </button>
         )}
-        <Pick label="更多" choices={more} head={terminal && !reading && <FontSize px={font} set={(px) => setFont(keepTerminalFont(px))} />} className="focus-child -my-0.5 grid size-11 shrink-0 place-items-center">
+        <Pick label="更多" choices={more} head={terminal && !reading ? <FontSize px={font} set={(px) => setFont(keepTerminalFont(px))} /> : hasRoom && (
+          <div className="flex h-11 items-center gap-2.5 pr-1 pl-3 select-none">
+            <MoveHorizontal className="size-4 text-muted-foreground" />宽度
+            <Menu.RadioGroup value={width ?? "std"} onValueChange={(v) => {
+              const next = v === "std" ? null : String(v);
+              setWidth(next);
+              keep(() => localStorage, "chat-width", next);
+            }} className="ml-auto flex rounded-lg bg-muted p-0.5">
+              {Object.entries({ std: "标准", wide: "宽", full: "铺满" }).map(([value, label]) => (
+                <Menu.RadioItem key={value} value={value} closeOnClick={false} className="rounded-md px-2.5 py-1.5 text-sm text-muted-foreground outline-none data-checked:bg-background data-checked:text-foreground data-checked:shadow-sm data-highlighted:text-foreground">{label}</Menu.RadioItem>
+              ))}
+            </Menu.RadioGroup>
+          </div>
+        )} className="focus-child -my-0.5 grid size-11 shrink-0 place-items-center">
           <span className={cn(buttonVariants({ variant: "ghost", size: "icon-sm" }))}>
             <Ellipsis className="size-4.5" />
           </span>
@@ -656,7 +678,9 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
           // Its 复制 and 引用 always show (story 571).
           const lastSaid = shown.findLast((b) => b.kind === "assistant")?.at;
           return (
-            <div className="mx-auto grid max-w-3xl grid-cols-[minmax(0,1fr)] gap-4 px-4 pt-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+            <>
+            <TickStrip key={log.conversation ?? d.id} ticks={ticksOf(shown)} />
+            <div className="chat-inset chat-column mx-auto grid grid-cols-[minmax(0,1fr)] gap-4 px-4 pt-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
               {!log.blocks.length && <p className="text-sm text-muted-foreground">{log.conversation ? "对话里还没有消息。" : "还没有对话。"}</p>}
               {shown.map((b) => (
                 <Said key={b.at} b={b} conversation={log.conversation ?? ""} keys={{ slot: d.id, quotes: bottom || (reading && typesIn), last: b.at === lastSaid }} />
@@ -673,6 +697,7 @@ export function ChatView({ d, log, place, live, graph = true }: { d: SlotData; l
                   <Pending key={s.id} s={s} slot={d.id} log={log} changed={changed} />
                 ))}
             </div>
+            </>
           );
         }}
       </Stick>}
@@ -796,7 +821,7 @@ export function Said({ b, conversation, keys }: { b: Shown; conversation: string
       const f = b.from;
       return (
         // One column no wider than the room: an auto one grows to what is in it, the chat then scrolling sideways.
-        <div className={cn("group grid grid-cols-[minmax(0,1fr)] justify-items-end gap-1", f ? "pl-4" : "pl-10")}>
+        <div data-tick-at={isYourTick(b) ? b.at : undefined} className={cn("group grid grid-cols-[minmax(0,1fr)] justify-items-end gap-1", f ? "pl-4" : "pl-10")}>
           <div className={cn("flex items-center gap-1.5", f && "mr-9")}>
             {f ? (
               <>

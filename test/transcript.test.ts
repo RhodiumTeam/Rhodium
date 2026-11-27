@@ -489,6 +489,7 @@ describe("messagePage", () => {
     rendered: [{ content: "<system-reminder>\nThe user sent a new message while you were working:\n…\n</system-reminder>" }],
     renderedRole: "system",
   });
+
   const MID_TURN = [
     CLAUDE[1],
     CLAUDE[5],
@@ -714,12 +715,27 @@ describe("messagePage", () => {
     expect(await lastSaid(transcript("last-none.jsonl", PI.slice(0, 2)))).toBeNull();
   });
 
+  const call = (id: string, command: string) => ({ type: "assistant", timestamp: T(2), message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command } }] } });
+
+  for (const [order, command] of [
+    ["slot first", "git status && rh send w/other hello && rh send w/next ignored && rh send me - <<'EOF2'\nfirst line\nsecond line\nEOF2"],
+    ["slot heredoc first", "rh send w/other - <<'EOF'\nhi\nEOF\n&& rh send me - <<'EOF2'\nfirst line\nsecond line\nEOF2"],
+    ["me first", "rh send me 'first line\nsecond line' && rh send me ignored && rh send w/other hello"],
+  ] as const) {
+    test(`one command keeps the first send to you even after sends to slots: ${order}`, async () => {
+      const { blocks } = await latest(transcript("both.jsonl", [call("c1", command)]));
+      expect(blocks).toHaveLength(1);
+      const tool = blocks[0]!;
+      if (tool.kind !== "tool") throw new Error("expected a tool block");
+      expect(tool.send).toEqual({ to: "me", text: "first line\nsecond line", files: [] });
+    });
+  }
+
   test("stories 561, 562, 567, 568: your message's pictures and file come by their hashes, in place of the lines naming them, with no picture's data; an rh send to you in a shell call, its text and files, a here-document's too, none in another command's words or a here-document; the list's line says [图片] [文件]", async () => {
     const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(64));
     const data = Buffer.from("not really a picture").toString("base64");
     const picture = { type: "image", source: { type: "base64", media_type: "image/png", data } };
     const words = `[来自 网页]\n看这个\n[图片] /s/media/${a}\n[图片] /s/media/${b}\n[文件] notes.txt：/s/media/${c}`;
-    const call = (id: string, command: string) => ({ type: "assistant", timestamp: T(2), message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command } }] } });
     const file = transcript("media.jsonl", [
       { type: "user", timestamp: T(1), message: { role: "user", content: [{ type: "text", text: words }, picture, picture] } },
       call("c1", "rh send me --file /w/shot.png 测试过了 2>&1"),
@@ -733,6 +749,10 @@ describe("messagePage", () => {
       call("c7", "rh send me --file out.png  # the chart"),
       call("c8", "# notify; rh send me hi"),
     ]);
+    const delivered = await latest(transcript("send-stdin", [call("a", "rh send w/x - <<'EOF'\nline\nit's done\nEOF"), call("b", "rh send me - <<'EOF'\nMarkdown\nEOF")]));
+    expect(delivered.blocks[0]).toMatchObject({ kind: "tool" });
+    expect((delivered.blocks[0] as Extract<Block, { kind: "tool" }>).send).toBeUndefined();
+    expect(delivered.blocks[1]).toMatchObject({ send: { to: "me", text: "Markdown", files: [] } });
     const { blocks } = await latest(file);
     expect(JSON.stringify(blocks)).not.toContain(data);
     expect(blocks[0]).toMatchObject({ kind: "user", source: "网页", text: "看这个", media: [{ kind: "image", hash: a }, { kind: "image", hash: b }, { kind: "file", hash: c, name: "notes.txt" }] });

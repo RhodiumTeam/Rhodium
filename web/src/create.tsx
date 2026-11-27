@@ -1,3 +1,4 @@
+import { pickerPath } from "./picker-path";
 // New slots and imports from the board (spec web-write "新建和导入", spec web-import-composer stories
 // 634-639): one sheet for each, a dialog in the middle of a wide or medium screen, from the bottom on a
 // phone. From a workspace, in it with no picker; from the home's +, the sidebar's buttons on top or a
@@ -23,7 +24,7 @@ import { act, Pick, type Choice } from "./write";
 
 /** The workspaces, with their directories, as the board has them, once it answers; asked only while the
  *  sheet is open, as a refresh asks again for every query in use. */
-const useWorkspaces = (open: boolean) => useQuery({ queryKey: ["board"], queryFn: () => json<BoardData>("api/board"), enabled: open }).data?.workspaces;
+const usePickerBoard = (open: boolean) => useQuery({ queryKey: ["board"], queryFn: () => json<BoardData>("api/board"), enabled: open }).data;
 
 /** Where a sheet's picker starts (story 540): ws's directory, ~ for none; undefined while the workspaces
  *  are not yet known. */
@@ -130,7 +131,6 @@ function useFresh(open: boolean, reset: () => void) {
   }
 }
 
-const slash = (p: string) => (p.endsWith("/") ? p : `${p}/`);
 
 /** Where a sheet makes its slot: the folder, by its path, the workspace there, and whether that is a
  *  new one, to be made. */
@@ -181,14 +181,18 @@ function FolderLine({ git }: { git: FolderData }) {
  *  workspace, the picker is a line naming it and its directory, where the sheet makes its slot. go:
  *  takes the picker to a folder. dropped: its folders are down, over what is under the path, from a tap in
  *  the path or on the arrow at its end, till a tap outside, Esc or focus moving away (story 664). */
-function useDirPicker(open: boolean, start: string | undefined, fixed?: Fixed, paneIn?: string, steady = false) {
+function useDirPicker(open: boolean, windows: boolean, start: string | undefined, fixed?: Fixed, paneIn?: string, steady = false) {
   const [typed, setTyped] = useState<string | null>(null);
   const [dropped, setDropped] = useState(false);
   const [named, setNamed] = useState<{ path: string; name: string } | null>(null);
   // The last folder's, till this one's comes, as the list's: the sheet stays put as you go.
   const [git, setGit] = useState<FolderData | null>(null);
   useFresh(open, () => (setTyped(null), setNamed(null), setGit(null), setDropped(false)));
-  const text = fixed ? slash(fixed.dir) : (typed ?? (start === undefined ? undefined : slash(start)));
+  const slash = (p: string) => {
+    const path = pickerPath(p, windows);
+    return path.endsWith("/") ? path : path + "/";
+  };
+  const text = fixed ? slash(fixed.dir) : typed !== null ? pickerPath(typed, windows) : start === undefined ? undefined : slash(start);
   const cut = text?.lastIndexOf("/") ?? -1;
   const folder = text === undefined ? undefined : text.slice(0, cut + 1) || text;
   const tail = text?.slice(cut + 1) ?? "";
@@ -226,7 +230,7 @@ function useDirPicker(open: boolean, start: string | undefined, fixed?: Fixed, p
         <Folder className="size-4 shrink-0 text-muted-foreground" />
         {/* A long name truncated, the directory keeping its room, up to most of the line. */}
         <span className="min-w-0 truncate font-medium">{fixed.name}</span>
-        <span className="max-w-3/5 shrink-0 truncate font-mono text-xs text-muted-foreground">{listed?.path ?? fixed.dir}</span>
+        <span className="max-w-3/5 shrink-0 truncate font-mono text-xs text-muted-foreground">{listed?.path ?? pickerPath(fixed.dir, windows)}</span>
       </p>
     );
     return { at: { path: fixed.dir, workspace: fixed.name, fresh: false } as At, wsName: "", picker: header, go: () => {}, dropped: false };
@@ -355,9 +359,9 @@ type From = { open: boolean; close: () => void; ws?: string; inWs?: boolean; don
  *  name; its agent, by logo. Long-term, in its workspace's directory, as rh new makes it. From a
  *  workspace, in it, its name filled in as the workspace's default one (story 636). */
 export function NewSlot({ open, close, ws, inWs, done }: From) {
-  const workspaces = useWorkspaces(open);
+  const { workspaces, windowsPaths } = usePickerBoard(open) ?? {};
   const fixed = fixedOf(workspaces, ws, inWs);
-  const { at, wsName, picker } = useDirPicker(open, startIn(workspaces, ws), fixed);
+  const { at, wsName, picker } = useDirPicker(open, !!windowsPaths, startIn(workspaces, ws), fixed);
   // A phone's sheet grows up from the bottom: its folders' room kept from the start, the path stays put.
   const wide = useMedia(ROOM);
   // null: as yet untouched, the default.
@@ -514,9 +518,12 @@ function ImportItem({ row, picked, all, words, pick, children }: { row: ImportRo
         </span>
         <span className="flex min-w-0 items-center gap-3 overflow-hidden text-xs whitespace-nowrap text-muted-foreground tabular-nums">
           {row.pane ? (
-            <span className="inline-flex items-center gap-1">
-              <SquareTerminal className={icon} />在 Herdr 里开着
-            </span>
+            <>
+              <span className="inline-flex shrink-0 items-center gap-1">
+                <SquareTerminal className={icon} />在 Herdr 里开着
+              </span>
+              {all && <span className="min-w-0 truncate font-mono">{row.dir}</span>}
+            </>
           ) : (
             <>
               <span className="shrink-0">{ago(row.at)}</span>
@@ -624,7 +631,7 @@ function Preview({ agent, session }: { agent: AgentKind; session: string }) {
  *  what was said too once ticked; from the top, a search looks in every folder, and picking one found
  *  takes the picker to its folder. One picked, its slot's name, filled in from its title. */
 function ImportSheet({ open, close, ws, inWs, done }: From) {
-  const workspaces = useWorkspaces(open);
+  const { workspaces, windowsPaths } = usePickerBoard(open) ?? {};
   const fixed = fixedOf(workspaces, ws, inWs);
   const [agent, setAgent] = useState<AgentKind>(DEFAULT_AGENT);
   const [typed, setTyped] = useState("");
@@ -642,7 +649,7 @@ function ImportSheet({ open, close, ws, inWs, done }: From) {
     return () => clearTimeout(wait);
   }, [typed]);
   // A pane's slot lands by the pane's own directory: no workspace is made, or shown, for the folder.
-  const dirs = useDirPicker(open, startIn(workspaces, ws), fixed, picked?.pane ? picked.dir : undefined, true);
+  const dirs = useDirPicker(open, !!windowsPaths, startIn(workspaces, ws), fixed, picked?.pane ? picked.dir : undefined, true);
   const { picker, go, dropped } = dirs;
   // While the folders are down, the list, its pick and the name stay the last folder's; folded, the new
   // one's (story 665).

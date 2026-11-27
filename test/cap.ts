@@ -12,7 +12,7 @@ const unit = `rhodium-test-capped-${process.pid}.scope`;
 const inScope = () => readFileSync("/proc/self/cgroup", "utf8").trim().endsWith(`/${unit}`);
 
 // A worker of bun test --parallel loads this again for each file it runs, by then in its scope.
-if (!inScope()) {
+if (process.platform === "linux" && !inScope()) {
   // What systemd-run --scope does for itself, done for this process, which is already running.
   const call = Bun.spawn(["busctl", "--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
     "StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail",

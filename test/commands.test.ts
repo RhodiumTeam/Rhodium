@@ -8,7 +8,7 @@ import type { Posted } from "../src/fake-im";
 import { resetText } from "../src/im-commands";
 import { sourceLine } from "../src/prompt";
 import { compaction, endTurn, on, startTurn, state as session } from "./fake-agent/scripts";
-import { newInstance, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
+import { newInstance, settled, until, withoutSource, type Instance, type InstanceOptions } from "./instance";
 
 // rhodium inherits it, and shows /usage's reset times in it.
 process.env.TZ = "Etc/GMT-9";
@@ -46,7 +46,8 @@ const state = async () => (await ok("ls")).match(/^w\/a +\S+ +\S+ +(\S+)/m)?.[1]
 
 /** Waits until the bot has posted n messages in your chat, and returns them. */
 async function posts(n = 1): Promise<Posted[]> {
-  await until(async () => (await rhodium.im.log("q", ME)).length >= n, 15_000);
+  // What the agent says streams in on QQ (#797): its messages are whole once their streams close.
+  await until(async () => (await rhodium.im.log("q", ME)).length >= n && settled(await rhodium.im.log("q", ME)), 15_000);
   return rhodium.im.log("q", ME);
 }
 
@@ -321,14 +322,19 @@ describe.each(["claude", "pi"] as const)("story 54: common commands on %s, in th
     await say("Count to a million.");
     await until(async () => (await state()) === "运行中", 15_000);
     const stop = await say(word);
-    expect((await posts())[0]).toMatchObject({ text: "已停下这一回合，对话留着。", replyTo: stop.messageId });
+    // Messages but for what the agent said as it went, which streams in on QQ (#797) and closes as it was.
+    const sent = async (n: number) => {
+      await until(async () => (await posts()).filter((p) => !p.stream).length >= n, 15_000);
+      return (await posts()).filter((p) => !p.stream);
+    };
+    expect((await sent(1))[0]).toMatchObject({ text: "已停下这一回合，对话留着。", replyTo: stop.messageId });
     await until(async () => (await state()) === "空闲", 15_000);
 
     // The stopped turn sends no final reply; the next message gets one, from the same agent process.
     const next = await say("And now?");
-    const [, reply, ...more] = await posts(2);
-    expect(reply).toMatchObject({ text: "fake reply", replyTo: next.messageId });
-    expect(more).toEqual([]);
+    await until(async () => (await posts()).some((p) => p.replyTo === next.messageId), 15_000);
+    expect((await posts()).filter((p) => p.replyTo === next.messageId).map((p) => p.text)).toEqual(["fake reply"]);
+    expect((await posts()).at(-1)!.replyTo).toBe(next.messageId);
     expect(asked(agent)).toEqual([["Count to a million.", "And now?"]]);
   }, 30_000);
 

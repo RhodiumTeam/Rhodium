@@ -276,12 +276,29 @@ test("a backfill Feishu turns down is logged and not tried again; what is pushed
 });
 
 const sends = () => api.sent.map(({ method, receive_id, receive_id_type, msg_type, card }) => ({ method, receive_id, receive_id_type, msg_type, card }));
-/** The card a message is sent as: its body element, the summary shown in the chat list. */
-const card = (element: object, summary: string) => ({ schema: "2.0", config: { update_multi: true, width_mode: "fill", summary: { content: summary } }, body: { elements: [element] } });
-const markdown = (content: string) => ({ tag: "markdown", content });
-const plain = (content: string) => ({ tag: "div", text: { tag: "plain_text", content } });
+/** The card a message is sent as: its body elements, the summary shown in the chat list; streaming:
+ *  a card entity's streaming mode, left out for a card sent as itself. */
+const card = (elements: object[], summary: string, streaming?: boolean) => ({
+  schema: "2.0",
+  config: { update_multi: true, width_mode: "fill", summary: { content: summary }, ...(streaming !== undefined && { streaming_mode: streaming, streaming_config: expect.any(Object) }) },
+  body: { elements },
+});
+const markdown = (content: string, id = "e0") => ({ tag: "markdown", element_id: id, content });
+const plain = (content: string, id = "e0") => ({ tag: "div", element_id: id, text: { tag: "plain_text", content } });
+/** What a card shows: each part's text, a panel's as its title, ▼ open or ▶ folded, over it; no buttons. */
+const showing = (c: any): string =>
+  c.body.elements
+    .filter((el: any) => el.tag !== "column_set")
+    .map((el: any) => (el.tag === "collapsible_panel" ? `${el.expanded ? "▼" : "▶"} ${el.header.title.content}\n${el.elements[0].content}` : (el.content ?? el.text.content)))
+    .join("\n\n");
+/** What card entity message id shows now. */
+const shows = (id: string) => showing(api.sent.findLast((s) => s.message_id === id)!.card);
+/** The open platform calls made, card entities' ids as ck. */
+const paths = () => api.calls.map((c) => `${c.method} ${c.path.replace(/ck_\d+/, "ck")}`);
+const CK = "/open-apis/cardkit/v1/cards";
+const IM = "/open-apis/im/v1/messages";
 
-test("stories 456, 458: a message goes as a card to your open_id: Markdown in a markdown element, Rhodium's own text in a plain one; its summary the last line with text, cut to 50", async () => {
+test("stories 456, 458, 783: a message goes as a card entity, made and then sent by its id to your open_id: Markdown in a markdown element, Rhodium's own text in a plain one; its summary the last line with text, cut to 50; streaming mode off", async () => {
   api = feishuApi();
   const bot = adapter();
   const long = "长".repeat(60);
@@ -289,29 +306,143 @@ test("stories 456, 458: a message goes as a card to your open_id: Markdown in a 
   expect(r).toEqual({ status: "sent", messageId: api.sent[0]!.message_id });
   expect(await bot.send(ME, { text: "已配对。" })).toMatchObject({ status: "sent" });
   expect(sends()).toEqual([
-    { method: "POST", receive_id: ME, receive_id_type: "open_id", msg_type: "interactive", card: card(markdown(`**第一行**\n${long}`), "长".repeat(50)) },
-    { method: "POST", receive_id: ME, receive_id_type: "open_id", msg_type: "interactive", card: card(plain("已配对。"), "已配对。") },
+    { method: "POST", receive_id: ME, receive_id_type: "open_id", msg_type: "interactive", card: card([markdown(`**第一行**\n${long}`)], "长".repeat(50), false) },
+    { method: "POST", receive_id: ME, receive_id_type: "open_id", msg_type: "interactive", card: card([plain("已配对。")], "已配对。", false) },
   ]);
+  expect(paths()).toEqual([`POST ${CK}`, `POST ${IM}`, `POST ${CK}`, `POST ${IM}`]);
 });
 
 test("story 459: a card whose Markdown Feishu turns down goes again as plain text, sent and edited alike", async () => {
   api = feishuApi();
   const bot = adapter();
   api.next.push({ how: "refuse", method: "POST" });
-  expect(await bot.send(ME, { text: "four tables", markdown: "| a |" })).toMatchObject({ status: "sent" });
+  const id = ((await bot.send(ME, { text: "four tables", markdown: "| a |" })) as { messageId: string }).messageId;
+  api.next.push({ how: "refuse", method: "PUT" });
+  expect(await bot.edit(ME, id, { text: "four tables, more", markdown: "| a | b |" })).toEqual({ status: "sent", messageId: id });
   api.next.push({ how: "refuse", method: "PATCH" });
-  expect(await bot.edit(ME, "om_9", { text: "four tables, more", markdown: "| a | b |" })).toEqual({ status: "sent", messageId: "om_9" });
+  expect(await bot.edit(ME, "om_9", { text: "four tables, old card", markdown: "| a | b |" })).toEqual({ status: "sent", messageId: "om_9" });
   expect(api.sent.map((s) => [s.method, s.card.body.elements[0]])).toEqual([
     ["POST", plain("four tables")],
-    ["PATCH", plain("four tables, more")],
+    ["CARD", plain("four tables, more")],
+    ["PATCH", plain("four tables, old card")],
   ]);
-  expect(api.calls.map((c) => c.method)).toEqual(["POST", "POST", "PATCH", "PATCH"]);
+  expect(paths()).toEqual([`POST ${CK}`, `POST ${CK}`, `POST ${IM}`, `PUT ${CK}/ck`, `PUT ${CK}/ck`, `PATCH ${IM}/om_9`, `PATCH ${IM}/om_9`]);
 });
 
-test("an edit replaces the whole card", async () => {
+test("story 783: a card sent before card entities, with none on record, is edited by replacing it whole", async () => {
   api = feishuApi();
-  expect(await adapter().edit(ME, "om_9", { text: "done", markdown: "**done**" })).toEqual({ status: "sent", messageId: "om_9" });
-  expect(api.sent).toEqual([{ method: "PATCH", message_id: "om_9", card: card(markdown("**done**"), "done") }]);
+  expect(await adapter().edit(ME, "om_9", { text: "done", markdown: "**done**", final: true })).toEqual({ status: "sent", messageId: "om_9" });
+  expect(api.sent).toEqual([{ method: "PATCH", message_id: "om_9", card: card([markdown("**done**")], "done") }]);
+});
+
+test("story 783: text that grows streams into its part, typed out: streaming mode opened for the first, then text changes alone; the last edit closes it and sets the summary", async () => {
+  api = feishuApi();
+  const bot = adapter();
+  const { messageId: id } = (await bot.send(ME, { text: "一", markdown: "一" })) as { messageId: string };
+  await bot.edit(ME, id, { text: "一二", markdown: "一二" });
+  await bot.edit(ME, id, { text: "一二三", markdown: "一二三" });
+  expect(await bot.edit(ME, id, { text: "一二三\n四", markdown: "一二三\n四", final: true })).toEqual({ status: "sent", messageId: id });
+  expect(paths().slice(2)).toEqual([`PATCH ${CK}/ck/settings`, `PUT ${CK}/ck/elements/e0/content`, `PUT ${CK}/ck/elements/e0/content`, `PUT ${CK}/ck/elements/e0/content`, `PATCH ${CK}/ck/settings`]);
+  const [e] = api.entities.values();
+  expect(e!.streaming).toBe(false);
+  expect(e!.card.config.summary).toEqual({ content: "四" });
+  expect(shows(id)).toBe("一二三\n四");
+});
+
+test("story 783: a tool part is a panel: a tool line added streams into it and retitles it; folded, it is changed alone, and what the agent says next is added under it", async () => {
+  api = feishuApi();
+  const bot = adapter();
+  const panel = (open: boolean, title: string, lines: string) => `\uE010${open ? "+" : "-"}${title}\n${lines}\uE011`;
+  const { messageId: id } = (await bot.send(ME, { text: "x", markdown: panel(true, "🔧 工具 ×1（运行中）", "[🔧 Read] `a.ts`") })) as { messageId: string };
+  expect(shows(id)).toBe("▼ 🔧 工具 ×1（运行中）\n[🔧 Read] `a.ts`");
+  await bot.edit(ME, id, { text: "x", markdown: panel(true, "🔧 工具 ×2（运行中）", "[🔧 Read] `a.ts`\n[🔧 Bash] `ls`") });
+  expect(shows(id)).toBe("▼ 🔧 工具 ×2（运行中）\n[🔧 Read] `a.ts`\n[🔧 Bash] `ls`");
+  await bot.edit(ME, id, { text: "x", markdown: `${panel(false, "🔧 Read、Bash", "[🔧 Read] `a.ts`\n[🔧 Bash] `ls`")}\n\n看完了` });
+  expect(shows(id)).toBe("▶ 🔧 Read、Bash\n[🔧 Read] `a.ts`\n[🔧 Bash] `ls`\n\n看完了");
+  await bot.edit(ME, id, { text: "x", markdown: `${panel(false, "🔧 Read、Bash", "[🔧 Read] `a.ts`\n[🔧 Bash] `ls`")}\n\n看完了，没问题` });
+  expect(paths().slice(2)).toEqual([
+    `PATCH ${CK}/ck/elements/e0`,
+    `PATCH ${CK}/ck/settings`,
+    `PUT ${CK}/ck/elements/e0t/content`,
+    `PATCH ${CK}/ck/elements/e0`,
+    `POST ${CK}/ck/elements`,
+    `PUT ${CK}/ck/elements/e1/content`,
+    `PUT ${CK}/ck/elements/e1/content`,
+  ]);
+  expect(shows(id)).toBe("▶ 🔧 Read、Bash\n[🔧 Read] `a.ts`\n[🔧 Bash] `ls`\n\n看完了，没问题");
+});
+
+test("story 783: streaming mode closed by Feishu after 10 minutes (200850), or by hand (300309), is opened again and the text goes once more", async () => {
+  api = feishuApi();
+  const bot = adapter();
+  const { messageId: id } = (await bot.send(ME, { text: "一", markdown: "一" })) as { messageId: string };
+  await bot.edit(ME, id, { text: "一二", markdown: "一二" });
+  api.timeOut();
+  await bot.edit(ME, id, { text: "一二三", markdown: "一二三" });
+  const [e] = api.entities.values();
+  e!.streaming = false;
+  await bot.edit(ME, id, { text: "一二三四", markdown: "一二三四" });
+  const content = `PUT ${CK}/ck/elements/e0/content`;
+  const open = `PATCH ${CK}/ck/settings`;
+  expect(paths().slice(2)).toEqual([open, content, content, open, content, content, open, content]);
+  expect(shows(id)).toBe("一二三四");
+});
+
+test("story 783: after a restart a card is known by the entity on record: its first edit replaces it whole, and text streams after", async () => {
+  api = feishuApi();
+  const kept = new Map<string, string>();
+  const more = { entity: (m: string) => kept.get(m), saveEntity: (m: string, e: string) => void kept.set(m, e) };
+  const { messageId: id } = (await adapter(SECRET, undefined, more).send(ME, { text: "一", markdown: "一" })) as { messageId: string };
+  expect(kept.get(id)).toMatch(/^ck_\d+ \d+$/);
+  const bot = adapter(SECRET, undefined, more);
+  await bot.edit(ME, id, { text: "一二", markdown: "一二" });
+  await bot.edit(ME, id, { text: "一二三", markdown: "一二三" });
+  expect(paths().slice(2)).toEqual([`PUT ${CK}/ck`, `PATCH ${CK}/ck/settings`, `PUT ${CK}/ck/elements/e0/content`]);
+  expect(api.sent.find((s) => s.method === "CARD")!.card.config.streaming_mode).toBe(false);
+  expect(shows(id)).toBe("一二三");
+});
+
+test("story 783: after a restart a panel sent before it, pressed, is redrawn whole with streaming mode off, and a press after redraws it again", async () => {
+  api = feishuApi();
+  const kept = new Map<string, string>();
+  const more = { entity: (m: string) => kept.get(m), saveEntity: (m: string, e: string) => void kept.set(m, e) };
+  const { messageId: id } = (await adapter(SECRET, undefined, more).send(ME, { text: "第 1 页", buttons: [{ label: "下一页", data: "p2" }] })) as { messageId: string };
+  const bot = adapter(SECRET, undefined, more);
+  expect(await bot.edit(ME, id, { text: "第 2 页", buttons: [{ label: "下一页", data: "p3" }] })).toMatchObject({ status: "sent" });
+  const [e] = api.entities.values();
+  expect(e!.streaming).toBe(false);
+  expect(e!.card.config.streaming_mode).toBe(false);
+  expect(await bot.edit(ME, id, { text: "第 3 页", buttons: [{ label: "下一页", data: "p4" }] })).toMatchObject({ status: "sent" });
+  expect(e!.streaming).toBe(false);
+  expect(shows(id)).toBe("第 3 页");
+});
+
+test("story 783: a new paragraph is added empty and its text streams in, so even a short last reply is typed out", async () => {
+  api = feishuApi();
+  const bot = adapter();
+  const tools = "\uE010-🔧 Read\n[🔧 Read] `a.ts`\uE011";
+  const { messageId: id } = (await bot.send(ME, { text: "x", markdown: tools })) as { messageId: string };
+  await bot.edit(ME, id, { text: "x", markdown: `${tools}\n\n好的，改完了。`, final: true });
+  expect(paths().slice(2)).toEqual([`POST ${CK}/ck/elements`, `PATCH ${CK}/ck/settings`, `PUT ${CK}/ck/elements/e1/content`, `PATCH ${CK}/ck/settings`]);
+  expect(showing(api.sent.find((s) => s.method === "CARD")!.card)).toBe("▶ 🔧 Read\n[🔧 Read] `a.ts`\n\n");
+  expect(shows(id)).toBe("▶ 🔧 Read\n[🔧 Read] `a.ts`\n\n好的，改完了。");
+});
+
+test("story 783: a change Feishu turns down while a press on the card is answered (200810) is tried again once, after a wait; a part's change turned down otherwise replaces the card whole", async () => {
+  api = feishuApi();
+  const bot = adapter();
+  const { messageId: id } = (await bot.send(ME, { text: "选", buttons: [{ label: "A", data: "a" }] })) as { messageId: string };
+  api.next.push({ how: "busy-card" });
+  const t0 = Date.now();
+  expect(await bot.edit(ME, id, { text: "已选" })).toMatchObject({ status: "sent" });
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+  expect(shows(id)).toBe("已选");
+  const { messageId: two } = (await bot.send(ME, { text: "一", markdown: "一" })) as { messageId: string };
+  await bot.edit(ME, two, { text: "一二", markdown: "一二" });
+  api.next.push({ how: "denied", path: /content$/ });
+  await bot.edit(ME, two, { text: "一二三", markdown: "一二三" });
+  expect(paths().slice(-2)).toEqual([`PUT ${CK}/ck/elements/e0/content`, `PUT ${CK}/ck`]);
+  expect(shows(two)).toBe("一二三");
 });
 
 test("story 469: out of the month's quota (99991403, HTTP 429) a send or an edit fails for its quota, tried once", async () => {
@@ -335,7 +466,7 @@ test("over the rate limit Feishu took nothing: the bot waits the seconds it give
   // Past a minute's wait it gives up at once.
   api.next.push({ how: "flood", reset: 61 });
   expect(await bot.edit(ME, "om_9", { text: "hi" })).toEqual({ status: "failed", error: expect.stringContaining("230020"), flood: true });
-  expect(api.calls).toHaveLength(6);
+  expect(api.calls).toHaveLength(7);
 });
 
 test("credentials Feishu turns down fail a send, and the SDK's error is logged by its message, without the request that carried the secret", async () => {
@@ -348,26 +479,28 @@ test("credentials Feishu turns down fail a send, and the SDK's error is logged b
   expect(logs.filter((l) => /wrong-secret|app_secret|config/.test(l))).toEqual([]);
 });
 
-test("any other refusal fails; a server error or no answer may have arrived, so it is unknown", async () => {
+test("any other refusal fails; a server error or no answer may have arrived, so it is unknown; making the card entity sent nothing, so there it fails all the same", async () => {
   api = feishuApi();
   const bot = adapter(SECRET, 500);
-  api.next.push({ how: "denied" }, { how: "error" }, { how: "timeout" });
+  api.next.push({ how: "denied", path: /im/ }, { how: "error", path: /im/ }, { how: "timeout", path: /im/ }, { how: "error" }, { how: "timeout" });
   const results: SendResult[] = [];
-  for (let i = 0; i < 3; i++) results.push(await bot.send(ME, { text: "hi" }));
+  for (let i = 0; i < 5; i++) results.push(await bot.send(ME, { text: "hi" }));
   expect(results).toEqual([
     { status: "failed", error: expect.stringContaining("230013") },
     { status: "unknown", error: expect.stringContaining("500") },
     { status: "unknown", error: expect.stringContaining("timeout") },
+    { status: "failed", error: expect.stringContaining("500") },
+    { status: "failed", error: expect.stringContaining("timeout") },
   ]);
   expect(logs.filter((l) => l.includes(SECRET))).toEqual([]);
 });
 
-test("a token Feishu takes the connection for and never answers gives the send up after timeoutMs, as unknown, rather than hold up every bot's sends", async () => {
+test("a token Feishu takes the connection for and never answers gives the send up after timeoutMs rather than hold up every bot's sends: failed, as nothing went out", async () => {
   api = feishuApi();
   api.token.hangs = true;
   // Another app: the SDK would not ask again for a token it has.
   const bot = new FeishuAdapter("B1", "fs", { platform: "feishu", appId: "cli_00000000000000a1", secret: SECRET, apiRoot: api.url }, { editEvery: 3000, log: (m) => logs.push(m), timeoutMs: 500 });
-  expect(await bot.send(ME, { text: "hi" })).toEqual({ status: "unknown", error: expect.stringContaining("timeout") });
+  expect(await bot.send(ME, { text: "hi" })).toEqual({ status: "failed", error: expect.stringContaining("timeout") });
   expect(api.calls).toEqual([]);
 }, 10_000);
 
@@ -773,7 +906,7 @@ test("story 460: taking a card's buttons off edits it to what it last showed, wi
   const id = api.sent[0]!.message_id;
   await bot.edit(ME, id, { text: "选一个，第 2 页", markdown: "**选一个**，第 2 页", buttons: [{ label: "B", data: "b" }] });
   expect(await bot.dropButtons(ME, id)).toEqual({ status: "sent", messageId: id });
-  expect(api.sent.at(-1)).toEqual({ method: "PATCH", message_id: id, card: card(markdown("**选一个**，第 2 页"), "选一个，第 2 页") });
+  expect(api.sent.at(-1)).toEqual({ method: "CARD", message_id: id, card: card([markdown("**选一个**，第 2 页")], "选一个，第 2 页", false) });
   expect(await adapter().dropButtons(ME, id)).toEqual({ status: "failed", error: expect.any(String) });
   expect(api.sent).toHaveLength(3);
 });
@@ -846,18 +979,24 @@ const asked = () =>
 /** What the progress scripts' turn shows in the end: its tools, then its reply; and in Markdown. */
 const PROGRESS_SHOWN = `[🔧 Read] notes.txt\n[🔧 Bash] ls\n\n${PROGRESS_PIECES.join("").trimEnd()}`;
 const PROGRESS_MD = `> [🔧 Read] \`notes.txt\`  \n> [🔧 Bash] \`ls\`\n\n${PROGRESS_PIECES.join("").trimEnd()}`;
+/** The same on Feishu's card: its tools a panel, folded (showing). */
+const PROGRESS_CARD = `▶ 🔧 Read、Bash\n[🔧 Read] \`notes.txt\`\n[🔧 Bash] \`ls\`\n\n${PROGRESS_PIECES.join("").trimEnd()}`;
+/** What the last card sent or changed shows. */
+const lastCard = () => (api.sent.length ? showing(api.sent.at(-1)!.card) : "");
 
 test("stories 455, 456, 458, 467: through Feishu you talk with the slot; its turn is one card, sent once and then edited, at most every editEvery; Feishu pushing your message again does not reach the agent twice", async () => {
   api = feishuApi();
   await withFeishu({ claude: { script: "progress-fast" } });
   const m = api.say("look around");
-  await until(() => api.sent.at(-1)?.card.body.elements[0].content === PROGRESS_MD, 15_000);
+  await until(() => lastCard() === PROGRESS_CARD && api.entities.values().next().value?.streaming === false, 15_000);
   const [first, ...edits] = api.sent;
   expect(first).toMatchObject({ method: "POST", receive_id: ME, receive_id_type: "open_id" });
   expect(edits.length).toBeGreaterThanOrEqual(1);
-  expect(edits.every((e) => e.method === "PATCH" && e.message_id === first!.message_id)).toBe(true);
-  const gaps = api.calls.slice(1).map((c, i) => c.at - api.calls[i]!.at);
-  expect(gaps.filter((ms) => ms < 390)).toEqual([]);
+  expect(edits.every((e) => e.method === "CARD" && e.message_id === first!.message_id)).toBe(true);
+  // The text streamed in, each part's pushes at most every editEvery.
+  const pushes = Map.groupBy(api.calls.filter((c) => c.path.endsWith("/content")), (c) => c.path);
+  expect(pushes.size).toBeGreaterThanOrEqual(1);
+  expect([...pushes.values()].flatMap((ps) => ps.slice(1).map((c, i) => c.at - ps[i]!.at)).filter((ms) => ms < 390)).toEqual([]);
   expect(api.sent.at(-1)!.card.config.summary).toEqual({ content: PROGRESS_PIECES.at(-1)!.slice(0, 50) });
   expect(asked()).toEqual(["[来自 飞书私聊]\nlook around"]);
 
@@ -1002,10 +1141,12 @@ test("story 469: out of Feishu's quota, the turn's card goes through your other 
   expect(posts[0]!.kind).toBe("send");
   expect(posts[0]!.text).toStartWith(LEAD);
   expect(posts.slice(1).every((p) => p.kind === "edit" && p.messageId === posts[0]!.messageId && p.text.startsWith(LEAD))).toBe(true);
+  // Feishu's panels are its own: there, the tool lines are quoted, as Telegram's.
+  expect(posts.at(-1)!.markdown).toStartWith(`${LEAD}> [🔧 Read] \`notes.txt\`  \n> [🔧 Bash] \`ls\`\n\n`);
   expect(api.calls.map((c) => c.method)).toEqual(["POST"]);
   // The next turn tries Feishu again.
   api.say("again");
-  await until(() => api.sent.length > 0 && api.sent.at(-1)?.card.body.elements[0].content === PROGRESS_MD, 15_000);
+  await until(() => lastCard() === PROGRESS_CARD, 15_000);
 }, 30_000);
 
 test("story 469: through a bot that can't edit (QQ), the card refused for Feishu's quota is one message, not a reply to yours on Feishu, and the turn's last text one more", async () => {
@@ -1025,26 +1166,28 @@ test("story 469: through a bot that can't edit (QQ), the card refused for Feishu
 
 // Feishu's quota runs out mid-turn, as it most likely does: an edit is turned down, and the new card
 // the turn sends instead goes through the other bot.
-test("story 469: out of Feishu's quota on an edit, the turn goes on through your other bot, which edits; Feishu was asked to send, edit, and send once more", async () => {
+test("story 469: out of Feishu's quota on an edit, the turn goes on through your other bot, which edits; Feishu was asked to make and send the card, change it, and make one more", async () => {
   api = feishuApi();
   await withFeishu({ bots: { t: { like: "telegram", owner: TG_ME } }, claude: { script: "progress-fast" } });
-  api.next.push({ how: "quota", method: "PATCH" }, { how: "quota", method: "POST" });
+  api.next.push({ how: "quota", path: /cards\/ck_/ }, { how: "quota", path: /cards$/ });
   api.say("look around");
   const posts = await lastShows(LEAD + PROGRESS_SHOWN, "t", TG_ME);
   expect(posts[0]!.kind).toBe("send");
   expect(posts.slice(1).every((p) => p.kind === "edit" && p.messageId === posts[0]!.messageId && p.text.startsWith(LEAD))).toBe(true);
-  expect(api.calls.map((c) => c.method)).toEqual(["POST", "PATCH", "POST"]);
+  // The change turned down is whichever the turn's first edit makes.
+  expect(paths()).toEqual([`POST ${CK}`, `POST ${IM}`, expect.stringContaining(`${CK}/ck/`), `POST ${CK}`]);
 }, 30_000);
 
-test("story 469: out of Feishu's quota on an edit, through a bot that can't edit (QQ) the turn is one message, and its last text one more", async () => {
+test("story 469: out of Feishu's quota on a card's change, through a bot that can't edit (QQ) the turn is one message, and its last text one more", async () => {
   api = feishuApi();
   await withFeishu({ bots: { q: { like: "qq", owner: TG_ME } }, claude: { script: "progress-fast" } });
-  api.next.push({ how: "quota", method: "PATCH" }, { how: "quota", method: "POST" });
+  api.next.push({ how: "quota", path: /cards\/ck_/ }, { how: "quota", path: /cards$/ });
   api.say("look around");
   const posts = await lastShows(LEAD + PROGRESS_SHOWN, "q", TG_ME);
   expect(posts.map((p) => p.kind)).toEqual(["send", "send"]);
   expect(posts[0]!.text).toStartWith(LEAD);
-  expect(api.calls.map((c) => c.method)).toEqual(["POST", "PATCH", "POST"]);
+  // The change turned down is whichever the turn's first edit makes.
+  expect(paths()).toEqual([`POST ${CK}`, `POST ${IM}`, expect.stringContaining(`${CK}/ck/`), `POST ${CK}`]);
 }, 30_000);
 
 test("story 469: with two Feishu bots and no other, a card refused for the quota goes through the other once, not back and forth; once the turn is over Feishu is asked no more", async () => {
@@ -1110,8 +1253,8 @@ test("stories 460, 82: through Feishu an ask's options are buttons on its card; 
   const buttons = ask.card.body.elements.slice(1).map((r: any) => r.columns.map((c: any) => [c.elements[0].text.content, c.elements[0].behaviors[0].value.d]));
   expect(buttons.map((r: string[][]) => r.map(([label]) => label))).toEqual([["允许", "拒绝"]]);
   const first = api.press(ask.message_id, buttons[0][0][1]);
-  await until(() => api.sent.some((s) => s.card.body.elements[0].content?.includes("answered")), 15_000);
-  await until(() => api.sent.some((s) => s.method === "PATCH" && s.message_id === ask.message_id && s.card.body.elements.length === 1), 15_000);
+  await until(() => api.sent.some((s) => showing(s.card).includes("answered")), 15_000);
+  await until(() => api.sent.some((s) => s.method === "CARD" && s.message_id === ask.message_id && s.card.body.elements.length === 1), 15_000);
   expect(api.acks.find((a) => a.event_id === first)!.data).toEqual({});
   const again = api.press(ask.message_id, buttons[0][0][1]);
   await until(() => api.acks.some((a) => a.event_id === again), 5_000);

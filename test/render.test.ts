@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import type { AgentEvent } from "../src/contracts";
 import { feishuCapabilities } from "../src/feishu";
 import { QQ_CAPABILITIES } from "../src/qq";
-import { append, chunkText, edit, finish, finishEdit, freeze, hide, markdown, moveOn, start, type Msg, type View } from "../src/render";
+import { append, chunkText, edit, finish, finishEdit, flow, freeze, hide, markdown, moveOn, PANEL, PANEL_END, pause, settle, start, type Flow, type Msg, type View } from "../src/render";
 import { TELEGRAM_CAPABILITIES } from "../src/telegram";
 import { shortParts } from "../src/tool-line";
 
@@ -262,6 +262,125 @@ test("QQ: something said over the limit goes in pieces, the tool line only on th
   expect(qq(turn, { max: 100, room: 2 })).toEqual(["中间还有 1 段话没发出来，看板上能看到。\n\n[🔧 Bash]\n\ndone"]);
 });
 
+// ---- QQ's streams (im-style §3.2): what is said grows in a message as it is said. ----
+
+/** A message a QQ turn sent: a stream's frames, each the whole of what it shows, and whether it closed. */
+type Streamed = { text: string; frames?: string[]; closed?: true };
+
+/** A turn on QQ, streaming: "under", something else going to the chat (an ask, a picture); { now },
+ *  the clock moving on. room: as qq()'s; streams false: another stream is open in the chat. Every
+ *  frame of a stream must begin with the one before it, as QQ requires (40111001). */
+function qqStream(steps: (AgentEvent | "under" | { now: number })[], o: { room?: number; max?: number; reply?: string; streams?: boolean } = {}): Streamed[] {
+  let now = 0;
+  const v = (): View => ({ verbose: false, dir: DIR, now, caps: { ...QQ_CAPABILITIES, maxTextLength: o.max ?? 2000 } });
+  let p = start();
+  let room = o.room ?? 18;
+  const out: Streamed[] = [];
+  let live: Streamed | undefined;
+  const put = (fs: Flow[]) => {
+    for (const f of fs) {
+      if ("send" in f) out.push({ text: f.send });
+      else if ("open" in f) out.push((live = { text: f.open.text, frames: [f.open.text] }));
+      else {
+        if (!live || !f.edit.text.startsWith(live.text) || !(f.edit.markdown ?? "").startsWith(markdown(live.text, v().caps)!)) throw new Error(`not a frame of the open stream: ${f.edit.text}`);
+        live.frames!.push(f.edit.text);
+        live.text = f.edit.text;
+        if (f.final) [live.closed, live] = [true, undefined];
+      }
+      if (!("edit" in f)) room--;
+    }
+  };
+  for (const s of steps) {
+    if (s === "under") {
+      const r = pause(p, v());
+      put(r.out);
+      p = r.progress;
+      continue;
+    }
+    if (!("conv" in s)) now = s.now;
+    const r = flow(p, "conv" in s ? s : null, v(), room, o.streams ?? true);
+    p = r.progress;
+    put(r.out);
+  }
+  const r = settle(p, v());
+  put(r.out);
+  if (live) throw new Error("a stream was left open");
+  return [...out, ...finish(r.progress, o.reply, v()).map((text) => ({ text }))];
+}
+
+test("#797 QQ: what the agent says streams in as it says it, the tool line before it on top; a stream closes once a tool starts or the turn ends, and the last is the final reply", () => {
+  const turn = [delta("我先"), delta("看一下配置。"), message("我先看一下配置。"), ...tool("Read"), ...tool("Grep"), delta("配置里少了 X，"), delta("我来补上。"), message("配置里少了 X，我来补上。")];
+  expect(qqStream(turn)).toEqual([
+    { text: "我先看一下配置。", frames: ["我先", "我先看一下配置。", "我先看一下配置。"], closed: true },
+    { text: "[🔧 Read、Grep]\n\n配置里少了 X，我来补上。", frames: ["[🔧 Read、Grep]\n\n配置里少了 X，", "[🔧 Read、Grep]\n\n配置里少了 X，我来补上。", "[🔧 Read、Grep]\n\n配置里少了 X，我来补上。"], closed: true },
+  ]);
+  // A message that comes whole, with no text as it was said, goes as before: once something comes after it.
+  expect(qqStream([message("A"), ...tool("Read"), message("B")])).toEqual([{ text: "A" }, { text: "[🔧 Read]\n\nB" }]);
+});
+
+test("#797 QQ: no stream opens with only the hint's reply left, nor while another stream is open in the chat; what is said then goes as before", () => {
+  const turn = [delta("A"), ...tool("Read"), delta("B")];
+  expect(qqStream(turn, { room: -1 })).toEqual([{ text: "A\n\n[🔧 Read]\n\nB" }]);
+  expect(qqStream(turn, { streams: false })).toEqual([{ text: "A" }, { text: "[🔧 Read]\n\nB" }]);
+  // The final reply may take the reply kept for it: one stream opens with two replies left.
+  expect(qqStream(turn, { room: 0 })).toEqual([{ text: "A", frames: ["A", "A"], closed: true }, { text: "[🔧 Read]\n\nB" }]);
+});
+
+test("#797 QQ: nothing a stream showed changes as more comes: a local picture or link is held back till its line is whole, as is a # that may open a heading", () => {
+  const [m] = qqStream(["看 ", "![图](", "/tmp/a.png)", "。\n#", "39 好", "\n- #", "#", " 标题"].map(delta));
+  expect(m!.text).toBe("看 图。\n#39 好\n- ## 标题");
+  expect(m!.frames!.some((f) => f.includes("![") || f.endsWith("#"))).toBe(false);
+});
+
+test("#797 QQ: a frame that would change what the stream showed closes it as it was; what was said goes again from that line, as a message once it is over", () => {
+  expect(qqStream([delta("ab\nc"), delta("d"), message("ab\nXd"), ...tool("Read")])).toEqual([{ text: "ab\ncd", frames: ["ab\nc", "ab\ncd", "ab\ncd"], closed: true }, { text: "Xd" }]);
+});
+
+test("#797 QQ: a stream over the limit closes where it got to, a code block it leaves open closed, and what follows goes on in another, the block opened again", () => {
+  const code = Array.from({ length: 8 }, (_, i) => `line ${i}`).join("\n");
+  const [a, b, c] = qqStream([delta("```ts\n"), ...code.split("\n").map((l) => delta(`${l}\n`)), delta("```"), ...tool("Read")], { max: 44 });
+  // It had shown line 4 already: it closes after it.
+  expect(a!.text).toBe("```ts\nline 0\nline 1\nline 2\nline 3\nline 4\n```");
+  expect(b!.text).toBe("```ts\nline 5\nline 6\nline 7\n```");
+  expect([a!.closed, b!.closed, c]).toEqual([true, true, undefined]);
+});
+
+test("#797 QQ: a stream cut inside a code block keeps the indent of the line the next one starts with, as pieces do", () => {
+  const code = Array.from({ length: 8 }, (_, i) => `  l${i}`).join("\n");
+  const [a, b] = qqStream([delta("```py\n"), ...code.split("\n").map((l) => delta(`${l}\n`)), delta("```"), ...tool("Read")], { max: 30 });
+  expect(a!.text).toBe("```py\n  l0\n  l1\n  l2\n  l3\n  l4");
+  expect(b!.text).toBe("```py\n  l5\n  l6\n  l7\n```");
+  // Cut at a space inside a line, the next one starts after that space.
+  const words = "aaaa bbbb cccc dddd eeee ffff gggg hhhh".split(" ");
+  expect(qqStream([...words.map((w) => delta(`${w} `)), ...tool("Read")], { max: 30 }).map((m) => m.text)).toEqual(["aaaa bbbb cccc dddd eeee ffff", "gggg hhhh"]);
+});
+
+test("#797 QQ: a thing said that has come whole closes its stream at once, its held-back end shown, not once a tool starts", () => {
+  // Claude says the whole of it (item) long before the tool it then writes the input of starts.
+  expect(qqStream([delta("看 [READ"), message("看 [README](https://e.x)："), "under"])).toEqual([{ text: "看 [README](https://e.x)：", frames: ["看", "看 [README](https://e.x)："], closed: true }]);
+});
+
+test("#797 QQ: a stream runs at most nine minutes: then it closes, and what is said after goes on in another", () => {
+  const out = qqStream([delta("早。\n"), { now: QQ_CAPABILITIES.stream! - 1 }, delta("还在说。\n"), { now: QQ_CAPABILITIES.stream! }, delta("晚。")]);
+  expect(out.map((m) => [m.text, m.closed])).toEqual([
+    ["早。\n还在说。", true],
+    ["晚。", true],
+  ]);
+  // The clock alone closes it too, with no more said.
+  expect(qqStream([delta("早。"), { now: QQ_CAPABILITIES.stream! }]).map((m) => m.frames)).toEqual([["早。", "早。"]]);
+});
+
+test("#797 QQ: something else going to the chat closes the stream as it is; what is said after goes on under it, in another", () => {
+  expect(qqStream([delta("先说"), "under", delta("，再说。")])).toEqual([
+    { text: "先说", frames: ["先说", "先说"], closed: true },
+    { text: "，再说。", frames: ["，再说。", "，再说。"], closed: true },
+  ]);
+});
+
+test("#797 QQ: with messages kept for want of room, no stream opens: they keep their order", () => {
+  expect(qqStream([message("A"), ...tool("Read"), delta("B"), ...tool("Bash"), delta("C")], { room: 0 })).toEqual([{ text: "A\n\n[🔧 Read]\n\nB\n\n[🔧 Bash]\n\nC" }]);
+});
+
 // ---- Telegram (im-style §3.3). ----
 
 test("Telegram: one message, in the order things happened; tool parts are quotes, the step still running their last line", () => {
@@ -270,7 +389,29 @@ test("Telegram: one message, in the order things happened; tool parts are quotes
     "我先看一下配置。\n\n[🔧 Read] src/config.ts\n[🔧 Grep] X\n\n配置里少了 X，我来补上，然后跑测试。\n\n[🔧 Edit] src/config.ts\n[🔧 Bash] npm test\n[🔧 Bash] npm test，正在运行",
   );
   const r = edit(start(), started("Bash", { command: "npm test" }), { verbose: true, dir: DIR, now: 0, caps: TELEGRAM_CAPABILITIES });
-  expect(r.out).toEqual([{ text: "[🔧 Bash] npm test，正在运行", markdown: "> [🔧 Bash] `npm test`，正在运行" }]);
+  expect(r.out).toEqual([{ text: "[🔧 Bash] npm test，正在运行", markdown: "<details open><summary>🔧 工具 ×1（运行中）</summary>\n\n[🔧 Bash] `npm test`，正在运行\n\n</details>" }]);
+});
+
+test("#784 Telegram: a tool part is a <details> block, open while it is the message's last and the turn goes on, its title how many calls; closed once something follows it or the message is done, its title the short tool line", () => {
+  const bash = started("Bash", { command: "npm test" });
+  const steps = [...tool("Read", at("src/config.ts")), bash];
+  const { shows } = telegram(steps);
+  expect(shows.at(-1)).toBe("[🔧 Read] src/config.ts\n[🔧 Bash] npm test，正在运行");
+  let p = start();
+  const v: View = { verbose: true, dir: DIR, now: 0, caps: TELEGRAM_CAPABILITIES };
+  const outs = steps.map((e) => {
+    const r = edit(p, e, v);
+    p = r.progress;
+    return r.out.at(-1)?.markdown;
+  });
+  expect(outs.at(-1)).toBe("<details open><summary>🔧 工具 ×2（运行中）</summary>\n\n[🔧 Read] `src/config.ts`\n\n[🔧 Bash] `npm test`，正在运行\n\n</details>");
+  // Text after it closes it.
+  const r = edit(edit(p, ended(bash), v).progress, delta("Done."), v);
+  expect(r.out[0]!.markdown).toBe("<details><summary>🔧 Read、Bash</summary>\n\n[🔧 Read] `src/config.ts`\n\n[🔧 Bash] `npm test`\n\n</details>\n\nDone.");
+  // So does the message's end, a step still running left out (freeze).
+  expect(freeze(p, v).markdown).toBe("<details><summary>🔧 Read</summary>\n\n[🔧 Read] `src/config.ts`\n\n</details>");
+  // Short tool lines are a quote of one line, as before.
+  expect(freeze(p, { ...v, verbose: false }).markdown).toBe("> [🔧 Read]");
 });
 
 test("Telegram: the final reply stays in the turn's message as its last part, with all that was said", () => {
@@ -279,7 +420,7 @@ test("Telegram: the final reply stays in the turn's message as its last part, wi
     {
       text: "我先看一下配置。\n\n[🔧 Read] src/config.ts\n[🔧 Grep] X\n\n配置里少了 X，我来补上，然后跑测试。\n\n[🔧 Edit] src/config.ts\n[🔧 Bash ×2] npm test\n\n改好了，测试都过了。\nX 的默认值设成了 30，和文档里写的一致。",
       markdown:
-        "我先看一下配置。\n\n> [🔧 Read] `src/config.ts`  \n> [🔧 Grep] `X`\n\n配置里少了 X，我来补上，然后跑测试。\n\n> [🔧 Edit] `src/config.ts`  \n> [🔧 Bash ×2] `npm test`\n\n改好了，测试都过了。\nX 的默认值设成了 30，和文档里写的一致。",
+        "我先看一下配置。\n\n<details><summary>🔧 Read、Grep</summary>\n\n[🔧 Read] `src/config.ts`\n\n[🔧 Grep] `X`\n\n</details>\n\n配置里少了 X，我来补上，然后跑测试。\n\n<details><summary>🔧 Edit、Bash ×2</summary>\n\n[🔧 Edit] `src/config.ts`\n\n[🔧 Bash ×2] `npm test`\n\n</details>\n\n改好了，测试都过了。\nX 的默认值设成了 30，和文档里写的一致。",
     },
   ]);
 });
@@ -307,7 +448,7 @@ test("Telegram: a step running a minute or more says for how long", () => {
 
 test("Telegram: an argument with backticks still shows as code", () => {
   const r = edit(start(), started("Grep", { pattern: "a`b" }), { verbose: true, dir: DIR, now: 0, caps: TELEGRAM_CAPABILITIES });
-  expect(r.out[0]!.markdown).toBe("> [🔧 Grep] ``a`b``，正在运行");
+  expect(r.out[0]!.markdown).toBe("<details open><summary>🔧 工具 ×1（运行中）</summary>\n\n[🔧 Grep] ``a`b``，正在运行\n\n</details>");
 });
 
 test("Telegram: when something else goes to the chat, the message stops as it was, without the running step, and the turn goes on in a new one", () => {
@@ -338,7 +479,7 @@ test("Telegram: an approval as the turn's first step: its message stops with the
 test("Telegram: a message that showed only the step running stops with that step, done, never empty", () => {
   const send = started("Bash", { command: "rh send me hi" });
   const { messages } = telegram([send, "under"]);
-  expect(messages).toEqual([{ text: "[🔧 Bash] rh send me hi", markdown: "> [🔧 Bash] `rh send me hi`" }]);
+  expect(messages).toEqual([{ text: "[🔧 Bash] rh send me hi", markdown: "<details><summary>🔧 Bash</summary>\n\n[🔧 Bash] `rh send me hi`\n\n</details>" }]);
 });
 
 test("Telegram: a step a stopped message showed as all it had, done, shows in no tool line after it", () => {
@@ -506,4 +647,28 @@ test("a message cut inside a local picture still being written loses none of wha
   const cut = text.indexOf(")") - 3;
   const { messages } = telegram([delta(text.slice(0, cut)), delta(text.slice(cut)), message(text)]);
   expect(messages.map((m) => m.text).join("").slice(-6)).toBe("最后几个字。");
+});
+
+// ---- Feishu: a tool part is a folding panel (docs/im-style.md §3.1). ----
+
+test("story 783: on Feishu, with detailed tool lines, a tool part's Markdown is a panel: open while it is the turn's last part, titled by its count; folded once the agent speaks or the message freezes, titled by its short line", () => {
+  const caps = feishuCapabilities(400);
+  const v = (verbose = true): View => ({ verbose, dir: DIR, now: 0, caps });
+  const steps = [...tool("Read", at("a.ts")), started("Bash", { command: "ls" })];
+  let p = start();
+  const md: (string | undefined)[] = [];
+  for (const e of steps) {
+    const r = edit(p, e, v());
+    p = r.progress;
+    md.push(r.out.at(-1)?.markdown);
+  }
+  expect(md.at(-1)).toBe(`${PANEL}+🔧 工具 ×2（运行中）\n[🔧 Read] \`a.ts\`\n[🔧 Bash] \`ls\`${PANEL_END}`);
+  // Its plain text is as Telegram's: the step running says so.
+  expect(edit(start(), steps[0]!, v()).out[0]!.text).toBe("[🔧 Read] a.ts，正在运行");
+  const said = edit(edit(p, ended(steps.at(-1)!), v()).progress, delta("看完了"), v()).out[0]!;
+  expect(said.markdown).toBe(`${PANEL}-🔧 Read、Bash\n[🔧 Read] \`a.ts\`\n[🔧 Bash] \`ls\`${PANEL_END}\n\n看完了`);
+  // Frozen, the step still running is left out, as on Telegram.
+  expect(freeze(p, v()).markdown).toBe(`${PANEL}-🔧 Read\n[🔧 Read] \`a.ts\`${PANEL_END}`);
+  // Short tool lines (/rh_verbose off) stay a quoted line, no panel.
+  expect(freeze(p, v(false)).markdown).toBe("> [🔧 Read]");
 });

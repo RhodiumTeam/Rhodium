@@ -18,6 +18,8 @@ package.json
 tsconfig.json
 # The workflow that makes a release's packages, which runs only there (#385).
 .github/**
+# The Windows exploration branch's own CI, which the public repo has no branch for.
+!.github/workflows/windows-native.yml
 deploy/**
 docs/**
 holder/**

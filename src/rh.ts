@@ -1,5 +1,6 @@
 // The rh command line: one request to rhodium's unix socket per call (architecture §9.1).
 // Help and the agent skill are printed locally, so they work without a running rhodium.
+import { dialWindows, windows } from "./windows";
 import { createConnection } from "node:net";
 import { isatty } from "node:tty";
 import type { Ask } from "./bot";
@@ -33,6 +34,13 @@ export async function rh(args: string[], env: Record<string, string | undefined>
   try {
     // Loaded only here, with the QR code drawing it brings.
     if (args[0] === "bot" && args[1] !== "rm") return await (await import("./bot")).bot(args.slice(1), ask);
+    if (args[0] === "send" && args.at(-1) === "-") {
+      let body = 2;
+      if (!args[1]?.includes("/") && !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(args[1] ?? "")) {
+        while (args[body] === "--file") body += 2;
+      }
+      if (body === args.length - 1) args = [...args.slice(0, body), (await Bun.stdin.text()).replace(/\n$/, "")];
+    }
     reply = await ask(args);
   } catch (err) {
     process.stderr.write(`rh: 连不上 rhodium（${path}）：${(err as Error).message}\n`);
@@ -46,10 +54,11 @@ export async function rh(args: string[], env: Record<string, string | undefined>
   return 0;
 }
 
-function call(path: string, line: string): Promise<string> {
+async function call(path: string, line: string): Promise<string> {
+  const sock = windows ? await dialWindows(path) : createConnection(path, () => sock.write(line));
   return new Promise((ok, fail) => {
     let buf = "";
-    const sock = createConnection(path, () => sock.write(line));
+    if (windows) sock.write(line);
     sock.setEncoding("utf8");
     sock.on("data", (chunk: string) => (buf += chunk));
     sock.on("error", fail);

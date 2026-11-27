@@ -74,6 +74,7 @@ const FAILURES = {
   refuse: [400, { code: 230099, msg: "Failed to create card content, ext=ErrCode: 11310; ErrMsg: table number over limit" }],
   denied: [400, { code: 230013, msg: "Bot has NO availability to this user." }],
   resolution: [400, { code: 234039, msg: "Image resolution exceeds limit." }], // a picture's upload, per Feishu's docs
+  "busy-card": [400, { code: 200810, msg: "card is being updated by a callback" }],
   error: [500, { code: 1, msg: "internal error" }],
   timeout: [0, {}],
 } as const;
@@ -85,8 +86,13 @@ const CLIENT_CONFIG = { PingInterval: 120, ReconnectCount: -1, ReconnectInterval
 
 type Event = { schema: "2.0"; header: Record<string, string>; event: Record<string, unknown> };
 /** A message the bot sent or edited: where to, its type and content parsed (a card, or a picture's or
- *  a file's key). */
-type Sent = { method: "POST" | "PATCH"; message_id: string; receive_id?: string; receive_id_type?: string; msg_type?: string; card: any };
+ *  a file's key). A card sent as a card entity is the entity's card, and each change to the entity
+ *  after is one more (method CARD), with what the whole card shows then. */
+type Sent = { method: "POST" | "PATCH" | "CARD"; message_id: string; receive_id?: string; receive_id_type?: string; msg_type?: string; card: any };
+/** A CardKit card entity: its card, the last sequence a change to it carried, whether its streaming
+ *  mode is on (closed: by hand, or by Feishu after 10 minutes), and the message it went out as. */
+type Entity = { card: any; seq: number; streaming: boolean; closed?: "hand" | "timeout"; message_id?: string };
+const CARDKIT = "/open-apis/cardkit/v1/cards";
 /** A picture or a file the bot uploaded: its form's fields, and the file's own bytes. */
 type Upload = { kind: "image" | "file"; key: string; fields: Record<string, string>; bytes: Uint8Array };
 /** A slash command of the app's / menu, as Feishu lists it. */
@@ -103,8 +109,10 @@ export function feishuApi() {
   const acks: { event_id: string; event_type: string; code: number; data?: unknown }[] = [];
   const sent: Sent[] = [];
   // How the next calls go wrong, in order; method: the first waits for a call of that method (POST
-  // sends and uploads, PATCH edits, GET reads), and other calls go through meanwhile.
-  const next: { how: Failure; method?: "GET" | "POST" | "PATCH"; reset?: number }[] = [];
+  // sends and uploads, PATCH edits, GET reads), path: for a call whose path matches; other
+  // calls go through meanwhile.
+  const next: { how: Failure; method?: "GET" | "POST" | "PUT" | "PATCH"; path?: RegExp; reset?: number }[] = [];
+  const entities = new Map<string, Entity>(); // by card id
   const files = new Map<string, Uint8Array<ArrayBuffer>>(); // what a message's picture or file key downloads as
   const downloads: { message_id: string; key: string; type: string | null }[] = [];
   const forwards = new Map<string, unknown[]>(); // a forward's messages, by its id, as message.get gives them
@@ -215,15 +223,33 @@ export function feishuApi() {
         return ok(commands[slash]!, "");
       }
       calls.push({ method: req.method, path, query: Object.fromEntries(url.searchParams), at: Date.now() });
-      if (next[0] && (!next[0].method || next[0].method === req.method)) {
+      if (next[0] && (!next[0].method || next[0].method === req.method) && (!next[0].path || next[0].path.test(path))) {
         const { how, reset } = next.shift()!;
         if (how === "timeout") return new Promise<Response>(() => {}); // never answered
         const [status, body] = FAILURES[how];
         return Response.json(body, { status, headers: reset === undefined ? {} : { "x-ogw-ratelimit-reset": String(reset) } });
       }
+      if (path === CARDKIT && req.method === "POST") {
+        const body = (await req.json()) as { type: string; data: string };
+        const card = JSON.parse(body.data);
+        const card_id = `ck_${++n}`;
+        entities.set(card_id, { card, seq: 0, streaming: !!card.config?.streaming_mode });
+        return ok({ card_id });
+      }
+      const entity = /^\/open-apis\/cardkit\/v1\/cards\/([^/]+)(.*)$/.exec(path);
+      if (entity) return change(entities.get(entity[1]!), entity[2]!, req.method, await req.json());
       if (path === "/open-apis/im/v1/messages" && req.method === "POST") {
         const body = (await req.json()) as { receive_id: string; msg_type: string; content: string };
-        const s: Sent = { method: "POST", message_id: `om_${++n}`, receive_id: body.receive_id, receive_id_type: url.searchParams.get("receive_id_type") ?? undefined, msg_type: body.msg_type, card: JSON.parse(body.content) };
+        let card = JSON.parse(body.content);
+        const message_id = `om_${++n}`;
+        if (card.type === "card") {
+          const e = entities.get(card.data?.card_id);
+          // A card entity goes out once, as Feishu has it.
+          if (!e || e.message_id) return Response.json({ code: 230099, msg: "card entity not found or sent already" }, { status: 400 });
+          e.message_id = message_id;
+          card = structuredClone(e.card);
+        }
+        const s: Sent = { method: "POST", message_id, receive_id: body.receive_id, receive_id_type: url.searchParams.get("receive_id_type") ?? undefined, msg_type: body.msg_type, card };
         sent.push(s);
         const at = String(Date.now());
         const placeholder = JSON.stringify({ title: null, elements: [[{ tag: "img", image_key: "img_v3_01" }, { tag: "text", text: "请升级至最新版本客户端，以查看内容" }, { tag: "text", text: "" }]] });
@@ -303,6 +329,36 @@ export function feishuApi() {
     },
   });
 
+  /** A change to a card entity (CardKit, docs/spec/feishu.md "改卡片"): its sequence above the last
+   *  (300317); its text streamed only in streaming mode (300309 closed by hand, 200850 after 10
+   *  minutes); its settings, a part's text, a part, parts added at the end, or the whole card. */
+  function change(e: Entity | undefined, rest: string, method: string, body: any): Response {
+    const fail = (code: number, msg: string) => Response.json({ code, msg }, { status: 400 });
+    if (!e) return fail(200740, "card not found");
+    if (!Number.isInteger(body.sequence) || body.sequence <= e.seq || body.sequence > 2 ** 31 - 1) return fail(300317, "sequence number compare failed");
+    e.seq = body.sequence;
+    const find = (els: any[], id: string): any => els.reduce((hit: any, el: any) => hit ?? (el.element_id === id ? el : el.elements && find(el.elements, id)), undefined);
+    const el = /^\/elements\/([^/]+)/.exec(rest)?.[1];
+    const target = el && find(e.card.body.elements, el);
+    if (el && !target) return fail(300301, "element not found");
+    if (rest === "/settings" && method === "PATCH") {
+      const config = JSON.parse(body.settings).config ?? {};
+      Object.assign(e.card.config, config);
+      if (config.streaming_mode !== undefined) [e.streaming, e.closed] = [config.streaming_mode, config.streaming_mode ? undefined : "hand"];
+    } else if (rest === "" && method === "PUT") {
+      e.card = JSON.parse(body.card.data);
+      [e.streaming, e.closed] = [!!e.card.config?.streaming_mode, undefined];
+    }
+    else if (rest === "/elements" && method === "POST") e.card.body.elements.push(...JSON.parse(body.elements));
+    else if (rest.endsWith("/content") && method === "PUT") {
+      if (!e.streaming) return e.closed === "timeout" ? fail(200850, "card streaming timeout") : fail(300309, "streaming mode is closed");
+      target.content = body.content;
+    } else if (el && method === "PATCH") Object.assign(target, JSON.parse(body.partial_element));
+    else return Response.json({ code: 404, msg: `no ${method} ${rest} here` }, { status: 404 });
+    if (e.message_id) sent.push({ method: "CARD", message_id: e.message_id, card: structuredClone(e.card) });
+    return Response.json({ code: 0, data: {}, msg: "success" });
+  }
+
   /** A message in a chat as Feishu pushes it: from you in your private chat, unless said otherwise.
    *  message_id: the one Feishu pushes again with a new event id. A new one is kept in the chat's
    *  messages, and pushed only while the long connection is up. Gives the event id and the message id. */
@@ -372,6 +428,9 @@ export function feishuApi() {
     /** You send text in your private chat with the bot. */
     say: (text: string, o?: Parameters<typeof message>[2]) => message("text", { text }, o),
     message,
+    entities,
+    /** Feishu closes every card's streaming mode, as it does 10 minutes after it was opened. */
+    timeOut: () => entities.forEach((e) => ([e.streaming, e.closed] = [false, "timeout"])),
     /** Feishu drops the long connection, as on a network fault. */
     drop: () => sock?.close(),
     stop: () => server.stop(true),

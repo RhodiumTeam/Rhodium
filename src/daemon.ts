@@ -1,16 +1,20 @@
 // The rhodium daemon: single-instance lock, boot number, the main loop and its clock,
 // the rh socket and the IM bots' inbound streams (architecture §2, §5, §8, §9.1).
+import { windowsAgentArgv } from "./windows-tui-launch";
+import { detached, holderExecutable } from "./detached";
+import { Database } from "bun:sqlite";
+import { createPrivateWindows, serveWindowsCli, windows, windowsRoot } from "./windows";
 import { dlopen } from "bun:ffi";
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { AGENT_KINDS, AGENTS } from "./agents";
 import { avatarDir, errorKind, refreshAvatars } from "./avatars";
 import { botFlows } from "./bot-flow";
 import { inFront, serveBoard, type Fronts, type Hear } from "./board";
 import { version } from "../package.json";
-import { addBot, BUILD, COMMIT, fixedOwners, hasHerdr, loadConfig, owners, paired, removeBot, renameTarget, setMainChat, type BotConfig, type Config } from "./config";
-import type { AdapterDeps, BoardAct, Connected, ImAdapter, InboundMessage, Input, Kept, OutboundMessage, Platform, RhCaller, SendResult } from "./contracts";
+import { addBot, BUILD, COMMIT, fixedOwners, hasHerdr, locate, loadConfig, owners, paired, removeBot, renameTarget, setMainChat, type BotConfig, type Config } from "./config";
+import type { AdapterDeps, AgentKind, BoardAct, Connected, ImAdapter, InboundMessage, Input, Kept, OutboundMessage, Platform, RhCaller, SendResult } from "./contracts";
 import { createDoctor } from "./doctor";
 import { fakeBotFromConfig } from "./fake-im";
 import { makeFeishu } from "./feishu";
@@ -186,8 +190,14 @@ export function createLoop(opts: {
           const keep = (path: string, max: number) => keepFile(join(config.stateDir, "media"), path, max);
           const diskFree = () => freeDisk(config.stateDir);
           const herdr = () => hasHerdr(config);
+          const tuiUnavailable = (agent: AgentKind) => {
+            if (!windows) return;
+            const program = config.programs[agent];
+            try { windowsAgentArgv(agent, [locate(program, config.agentPath) ?? program], config.agentPath); }
+            catch (error) { return (error as Error).message; }
+          };
           const inboundOf = (chat: string) => tx.find("inbound", { chat }).map((i) => i.id);
-          const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, herdr, front, retarget, dropBot, inboundOf });
+          const d: Decision = route(state, input, { now: Date.now(), newId: ulid, newPairCode, config, capabilities, keepFile: keep, diskFree, herdr, tuiUnavailable, front, retarget, dropBot, inboundOf });
           for (const w of d.writes) apply(tx, w);
           for (const e of d.events) tx.append(e);
           // A message of the agent's is whole: its local pictures are checked and kept now, as rh send's
@@ -284,7 +294,7 @@ let libc: ReturnType<typeof dlopen<{ flock: { args: ["i32", "i32"]; returns: "i3
 /** Takes the lock on the file at path, made if new, without waiting: its fd, which holds the lock
  *  until closed, or null if someone else has it. */
 export function lock(path: string): number | null {
-  libc ??= dlopen("libc.so.6", { flock: { args: ["i32", "i32"], returns: "i32" } });
+  libc ??= dlopen(process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6", { flock: { args: ["i32", "i32"], returns: "i32" } });
   const LOCK_EX = 2;
   const LOCK_NB = 4;
   const fd = openSync(path, "a");
@@ -294,7 +304,20 @@ export function lock(path: string): number | null {
 }
 
 /** The single-instance lock on a dir. Its fd stays open for the life of the process. */
-const lockDir = (dir: string) => lock(join(dir, "rhodium.lock")) !== null;
+const instanceLocks: Database[] = [];
+function lockDir(dir: string) {
+  if (!windows) return lock(join(dir, "rhodium.lock")) !== null;
+  const db = new Database(join(dir, "instance-lock.db"), { create: true });
+  try {
+    db.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE");
+    instanceLocks.push(db);
+    return true;
+  } catch (err) {
+    db.close();
+    if ((err as { code?: string }).code === "SQLITE_BUSY") return false;
+    throw err;
+  }
+}
 
 // ---- The rh socket: one JSON request line in, one JSON reply line out, per connection. ----
 
@@ -317,7 +340,7 @@ function parseRequest(line: string): RhRequest | null {
       (c.pid === null || Number.isSafeInteger(c.pid)) &&
       typeof c.tty === "boolean" &&
       typeof c.cwd === "string" &&
-      c.cwd.startsWith("/") &&
+      isAbsolute(c.cwd) &&
       (r.credentials === undefined || (typeof r.credentials === "object" && r.credentials !== null && Object.values(r.credentials).every((v) => typeof v === "string"))) &&
       (r.flow === undefined || r.flow?.op === "start" || (["get", "cancel", "credentials"].includes(r.flow?.op) && typeof r.flow.id === "string"));
     if (!ok) return null;
@@ -419,7 +442,7 @@ async function send(store: Store, adapters: Map<string, ImAdapter>, id: string, 
     const payload = JSON.parse(row.payload) as Payload;
     // An ask settled before its message went out gets no buttons to answer it with.
     const buttons = payload.buttons && (!payload.ask || tx.get("ask", payload.ask)?.status === "open") ? payload.buttons : undefined;
-    const message: OutboundMessage = { text: payload.text, ...(payload.markdown !== undefined && { markdown: payload.markdown }), replyTo, seq, ...(payload.file && { file: payload.file }), ...(buttons && { buttons }) };
+    const message: OutboundMessage = { text: payload.text, ...(payload.markdown !== undefined && { markdown: payload.markdown }), replyTo, seq, ...(payload.file && { file: payload.file }), ...(buttons && { buttons }), ...(payload.stream && { stream: true as const }), ...(payload.draft && { draft: true as const }) };
     return { row, payload, message };
   });
   if (!job) return;
@@ -489,16 +512,16 @@ function connection(store: Store, bot: string, up: boolean): void {
 
 // ---- Startup. ----
 
-export async function runDaemon(args: string[]): Promise<void> {
+export async function runDaemon(args: string[], checkPi?: typeof import("./pi-pane-credentials").piPaneHasCredentials): Promise<void> {
   const env = process.env;
-  let configPath = `${env.XDG_CONFIG_HOME || `${env.HOME}/.config`}/rhodium/config.toml`;
+  let configPath = windows ? join(windowsRoot(env), "config.toml") : `${env.XDG_CONFIG_HOME || `${env.HOME}/.config`}/rhodium/config.toml`;
   if (args[0] === "--config" && args[1] && args.length === 2) configPath = args[1];
   else if (args.length) {
     console.error("usage: rhodium [--config <path>]");
     process.exit(2);
   }
 
-  process.umask(0o077); // the db, sockets and logs are private
+  if (!windows) process.umask(0o077); // the db, sockets and logs are private
   let config: Config;
   try {
     config = loadConfig(configPath);
@@ -507,8 +530,10 @@ export async function runDaemon(args: string[]): Promise<void> {
     process.exit(1);
   }
   // Run by hand, by rh dev or in a Herdr pane, the configured unit's journal is some other process's, if anything.
-  if (unitOf(process.pid) !== config.unit) config.unit = "";
-  for (const dir of [config.stateDir, config.socketDir, config.lockDir]) mkdirSync(dir, { recursive: true });
+  if (detached || unitOf(process.pid) !== config.unit) config.unit = "";
+  const directories = [...new Set([config.stateDir, config.socketDir, config.lockDir])];
+  if (windows) createPrivateWindows(directories);
+  else for (const dir of directories) mkdirSync(dir, { recursive: true });
   // The socket dir too: a second rhodium there would unlink the first one's rh.sock.
   // A Set, because a second flock on the same file would fail against our own first one.
   for (const dir of new Set([config.stateDir, config.socketDir])) {
@@ -774,18 +799,26 @@ export async function runDaemon(args: string[]): Promise<void> {
 
   // The message an edit platform keeps editing through a turn (architecture §8.2), by outbound id:
   // one request in flight at a time, at the platform's pace; newer text replaces what has not gone out.
-  const editing = new Map<string, { text: string; markdown?: string; final: boolean }>();
+  type EditJob = { text: string; markdown?: string; final: boolean; done?: Promise<void>; hold?: Promise<void> };
+  const editing = new Map<string, EditJob>();
   function edit(e: Extract<Effect, { kind: "edit" }>): void {
     const id = e.outbound;
     const queued = editing.get(id);
-    if (queued) return void Object.assign(queued, { text: e.text, markdown: e.markdown, final: queued.final || !!e.final });
-    const job = { text: e.text, markdown: e.markdown, final: !!e.final };
+    if (queued) {
+      Object.assign(queued, { text: e.text, markdown: e.markdown, final: queued.final || !!e.final });
+      return void (e.final && holdFor(id, queued.hold!));
+    }
+    const job: EditJob = { text: e.text, markdown: e.markdown, final: !!e.final };
     editing.set(id, job);
+    // What is sent after a final edit waits for it (holdFor), unless its own send was put off: it
+    // then waits for the send queue itself, so that would wait for nothing ever.
+    const putOff = Promise.withResolvers<void>();
     // Behind the message's own send, which is on the send queue already.
     const ahead = sending;
-    void ahead.then(async () => {
+    job.done = ahead.then(async () => {
       // Its send was put off, say to go through another bot (refused): edited once that has gone.
       for (let behind = ahead; store.tx((tx) => tx.get("outbound", id))?.status === "pending" && sending !== behind; ) {
+        putOff.resolve();
         behind = sending;
         await behind;
       }
@@ -797,29 +830,47 @@ export async function runDaemon(args: string[]): Promise<void> {
         log("edit failed", { outbound: id, ...why });
         if (row) loop.enqueue({ kind: "edit_failed", outbound: id, chat: row.chat, trace: row.trace, text: job.text, markdown: job.markdown, final: job.final });
       };
+      let msgId = row?.platformMsgId ?? "";
       try {
         const adapter = chat && adapters.get(chat.bot);
-        const unchanged = e.unchanged && job.text === e.text;
+        // The text the message shows already, as far as is known.
+        const shown = e.unchanged ? e.text : undefined;
         // Its send may have arrived with this very text: never twice (architecture §7.4).
-        if (row?.status === "unknown" && unchanged) return;
+        if (row?.status === "unknown" && job.text === shown) return;
         // Its send failed or may not have arrived: nothing to edit.
-        if (!row?.platformMsgId || !chat || !adapter) return failed({ reason: "no sent message to edit" });
-        if (unchanged) return;
+        if (!msgId || !chat || !adapter) return failed({ reason: "no sent message to edit" });
+        // Text it shows already goes again only when final, to an adapter that asks for that (#781).
+        const again = () => !!job.final && !!adapter.capabilities.finalEdit;
+        if (job.text === shown && !again()) return;
         for (;;) {
           const every = adapter.capabilities.editEvery;
           if (every) await Bun.sleep((lastTouched.get(id) ?? row.createdAt) + every - Date.now());
           await pace(chat.id, adapter);
-          const { text, markdown } = job;
-          const r = await adapter.edit(chat.platformChatId, row.platformMsgId, { text, ...(markdown !== undefined && { markdown }) });
+          const { text, markdown, final } = job;
+          const r = await adapter.edit(chat.platformChatId, msgId, { text, ...(markdown !== undefined && { markdown }), ...(final && { final: true as const }) });
           if (r.status !== "failed") touched(id, adapter);
           // Turned down. One that may have taken is left at that: rather than show the text twice.
-          // One over the flood limit too: a new message now would be turned down as well.
-          if (r.status === "failed" && r.flood) return log("edit failed", { outbound: id, error: r.error, flood: true });
+          // One over the flood limit too: a new message now would be turned down as well. Not a
+          // draft's final edit: the draft goes, and the reply with it, so it goes as a new message (#784).
+          // A real message, say one sent for a draft update turned down, keeps the reply: left at that.
+          const draft = msgId.startsWith("draft:");
+          if (r.status === "failed" && r.flood && !(final && draft)) {
+            // The final edit came in while this one waited out the flood: it still has to go.
+            if (job.final && draft) continue;
+            return log("edit failed", { outbound: id, error: r.error, flood: true });
+          }
           if (r.status === "failed") return failed({ status: r.status, error: r.error });
           if (r.status === "unknown") log("edit outcome unknown", { outbound: id, error: r.error });
-          // What it shows now, for a later quote of it (architecture §8.3).
-          else store.tx((tx) => tx.update("outbound", { id }, { text: clip(text, config.limits.quoteMaxChars) }));
-          if (job.text === text) break;
+          // What it shows now, for a later quote of it (architecture §8.3); a draft's final edit made
+          // it a message of its own id (#784), which a quote names it by.
+          else {
+            const now = r.status === "sent" && r.messageId !== undefined && r.messageId !== msgId ? r.messageId : undefined;
+            const moved = now ? { platformMsgId: now, ref: now } : {};
+            msgId = now ?? msgId;
+            store.tx((tx) => tx.update("outbound", { id }, { text: clip(text, config.limits.quoteMaxChars), ...moved }));
+          }
+          // Final came in while this text was on its way: once more, marked final.
+          if (job.text === text && (final || !again())) break;
         }
       } catch (err) {
         log("edit failed", { outbound: id, error: String(err) });
@@ -828,6 +879,16 @@ export async function runDaemon(args: string[]): Promise<void> {
         if (editing.get(id) === job) editing.delete(id);
       }
     });
+    job.hold = Promise.race([job.done, putOff.promise]);
+    if (e.final) holdFor(id, job.hold);
+  }
+  /** A draft's final edit sends it as a message (#784): what is sent after it waits for that, so it
+   *  stays above, an ask say, even when the draft's own send is still going out. */
+  function holdFor(id: string, done: Promise<void>): void {
+    const row = store.tx((tx) => tx.get("outbound", id));
+    const chat = row && ["pending", "sending", "sent"].includes(row.status) && store.tx((tx) => tx.get("chat", row.chat));
+    if (!chat || !adapters.get(chat.bot)?.capabilities.draftTtl) return;
+    sending = sending.then(() => done.catch(() => {}));
   }
   /** Takes the buttons off the messages that ask the ask (story 82), at the platform's pace and
    *  behind the send queue, so one still going out is sent by then. */
@@ -882,7 +943,7 @@ export async function runDaemon(args: string[]): Promise<void> {
       loop.enqueue({ kind: "notice", text: `rh doctor 自检：\n${text}` });
     },
   });
-  const tui = createTui({ cfg: config, store, loop, capabilities });
+  const tui = createTui({ cfg: config, store, loop, capabilities }, checkPi);
   const runner = createRunner({
     cfg: config,
     store,
@@ -943,7 +1004,7 @@ export async function runDaemon(args: string[]): Promise<void> {
   // had started before it would have been started twice.
   loop.enqueue({ kind: "recovery" });
   // Holder units held up over MemoryHigh (architecture §4.2).
-  watchMemory({ cfg: config, store, loop });
+  if (!detached) watchMemory({ cfg: config, store, loop });
   // A build the main chat has not heard of says so there, once, with the note upgrade.sh built it
   // with (architecture §12). Run from source with no commit, it is no build to tell of.
   if (COMMIT && store.tx((tx) => tx.get("meta", "toldBuild")?.value) !== BUILD) {
@@ -959,8 +1020,10 @@ export async function runDaemon(args: string[]): Promise<void> {
   // And the minute clock of a step a turn's message shows running (im-style §3.1), which shows the
   // minutes at once; it stops once no step runs.
   // A slot's in the terminal too, its turn read off the transcript (architecture §10.6).
+  // So is the clock of a turn's stream (Capabilities.stream), which closes one that has run its time.
   for (const s of store.tx((tx) => [...tx.find("slot", { state: "running" }), ...tx.find("slot", { state: "waiting" }), ...tx.find("slot", { mode: "tui" })])) {
     if (s.conversation) loop.enqueue({ kind: "clock", timer: "tool_running", key: s.conversation });
+    if (s.conversation) loop.enqueue({ kind: "clock", timer: "stream_cap", key: s.conversation });
   }
   // And the clock of what waits for each slot in the terminal (architecture §10.5).
   for (const s of store.tx((tx) => tx.find("slot", { mode: "tui" }))) loop.enqueue({ kind: "clock", timer: "tui_held", key: s.id });
@@ -1043,9 +1106,11 @@ export async function runDaemon(args: string[]): Promise<void> {
   );
 
   const socket = join(config.socketDir, "rh.sock");
-  await serveRh(socket, (req, reply) => {
+  const onRh = (req: RhRequest, reply: (r: RhReply) => void) => {
     const pid = req.caller.pid;
-    const caller = { ...req.caller, unit: pid === null ? null : unitOf(pid), ancestors: pid === null ? [] : ancestors(pid) };
+    // A local pipe authenticates the Windows account, which the owner and agents share.
+    // Until native process attribution is verified, never grant owner rights from a client-reported tty.
+    const caller = detached ? { ...req.caller, tty: false } : { ...req.caller, unit: pid === null ? null : unitOf(pid), ancestors: pid === null ? [] : ancestors(pid) };
     const f = req.flow;
     if (f) {
       const done =
@@ -1056,7 +1121,14 @@ export async function runDaemon(args: string[]): Promise<void> {
     const id = ulid();
     waiting.set(id, reply);
     loop.enqueue({ kind: "rh", id, caller, argv: req.argv });
-  });
+  };
+  if (windows) {
+    await serveWindowsCli(holderExecutable(config.holdBin), socket, (line, reply) => {
+      const req = parseRequest(line);
+      if (!req) return reply(JSON.stringify({ ok: false, error: "rh 请求格式不对" }));
+      onRh(req, (r) => reply(JSON.stringify(r)));
+    });
+  } else await serveRh(socket, onRh);
   // IM and rh go on without the board. What its page writes comes to the main loop as rh does.
   let board = "";
   try {

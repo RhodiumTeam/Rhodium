@@ -9,7 +9,7 @@ import type { Posted } from "../src/fake-im";
 import { sourceLine } from "../src/prompt";
 import { installFakeAgent } from "./fake-agent/fake-agent";
 import { on } from "./fake-agent/scripts";
-import { newInstance, rhHold, until, withoutSource, type Instance } from "./instance";
+import { newInstance, rhHold, settled, until, withoutSource, type Instance } from "./instance";
 
 const FIXTURES = join(import.meta.dir, "fixtures/claude");
 const ME = "you-openid";
@@ -28,7 +28,8 @@ async function twoSlots(): Promise<string> {
 
 /** Waits until the bot has posted n messages in the chat, and returns them. */
 async function posts(bot: string, chat: string, n = 1): Promise<Posted[]> {
-  await until(async () => (await rhodium.im.log(bot, chat)).length >= n, 15_000);
+  // What the agent says streams in on QQ (#797): its messages are whole once their streams close.
+  await until(async () => (await rhodium.im.log(bot, chat)).length >= n && settled(await rhodium.im.log(bot, chat)), 15_000);
   return rhodium.im.log(bot, chat);
 }
 

@@ -30,17 +30,19 @@
 
 ## 方案
 
-新加一个适配器 `src/feishu.ts`，基于飞书官方的 `@larksuiteoapi/node-sdk`。它和 Telegram 一样是能编辑的平台：一个回合一张卡片，不断改。差别都写在能力表和适配器里，路由和渲染器照能力表走。
+新加一个适配器 `src/feishu.ts`，基于飞书官方的 `@larksuiteoapi/node-sdk`。它和 Telegram 一样是能编辑的平台：一个回合一张卡片，不断改。卡片是卡片实体，正文逐字往外长，详细的工具段是折叠面板（2026-11-17 起，#783，见[改卡片](#改卡片)）。差别都写在能力表和适配器里，路由和渲染器照能力表走。
 
 手机上的飞书私聊大致是这样：
 
 ```
 ┌──────────────────────────────────────────┐
 │ 我先看一下配置。                            │
-│ ┃ [🔧 Read] src/config.ts                  │  ← 工具段，引用块
-│ ┃ [🔧 Bash] npm test，正在运行              │
-│ 配置里少了 X，我来补上，然后跑测试。          │
-└──────────────────────────────────────────┘  ← 一张卡片，同一张最多每 3 秒改一次
+│ ▶ 🔧 Read                                 │  ← 工具段，收起的折叠面板
+│ 配置里少了 X，我来补上，然后跑测试。          │  ← 逐字往外长
+│ ▼ 🔧 工具 ×2（运行中）                      │  ← 正在跑的工具段，展开
+│   [🔧 Edit] src/config.ts                  │
+│   [🔧 Bash] npm test                       │
+└──────────────────────────────────────────┘  ← 一张卡片，同一张最多每 0.4 秒改一次
 ┌──────────────────────────────────────────┐
 │ 要运行这条命令，允许吗？                     │
 │ rm -rf build && npm run build             │
@@ -89,7 +91,7 @@ https://…
 ### 收发
 
 455. 作为用户，我想要在飞书私聊里发文字和富文本，agent 收到的是我写的字，以便直接派活。
-456. 作为用户，我想要一个回合的过程和最终回复在同一张卡片里，同一张最多每 3 秒改一次，工具段、代码块、表格照 agent 写的显示，以便在手机上看着进展，又不多耗调用次数。
+456. 作为用户，我想要一个回合的过程和最终回复在同一张卡片里，同一张最多每 0.4 秒改一次（原来 3 秒，#783 改），工具段、代码块、表格照 agent 写的显示，以便在手机上看着进展，又不多耗调用次数。
 457. 作为用户，我想要卡片里的字照写的显示：agent 写的 `:OK:`、`<font>` 不变成表情和颜色，Rhodium 拼进来的名字和路径里的 `_`、`*` 也不变成格式，以便读到的就是写的。
 458. 作为用户，我想要卡片在会话列表和通知里显示最新的一句，以便不点进去也知道到哪了。
 459. 作为用户，我想要飞书不认卡片里的 Markdown 时，这条照样发出去，改成纯文字，以便消息不会因为格式丢掉。
@@ -116,10 +118,9 @@ https://…
 
 - 只做国内飞书，不做 Lark。只做私聊。
 - 扫码为主，扫码的人就是你，不用配对。也能粘贴凭据，再配对。
-- 一张卡片从头改到尾，同一张最多每 3 秒改一次。用整张改（PATCH），不用飞书的流式卡片（CardKit）：
-  - 回合常常超过 10 分钟，流式卡片 10 分钟后自己关掉。
-  - 按卡片实体发出的卡片，不能再整张改。
-  - 每 3 秒改一次已经够看，流式还多两次调用。
+- 一张卡片从头改到尾，用飞书的卡片实体（CardKit）流式改，有打字机效果，同一张最多每 0.4 秒改一次（2026-11-17 定，#783）。
+  - 原来定的是整张改（PATCH）、每 3 秒一次，不用流式卡片。当时的两条理由，2026-11-17 核对文档、实测以后都不成立：卡片实体能整张换掉（`PUT /cardkit/v1/cards/:id`），流式模式 10 分钟后关掉了还能重开。
+  - 不加开关，直接取代原来的整张改（你定的）。
 - 不做按钮行。`/` 菜单经斜杠命令接口推。
 - 每次连上都补拉这个私聊最近 24 小时，按消息 ID 去重。
 - 语音先回暂不支持。合并转发展开成文字。
@@ -136,7 +137,7 @@ https://…
 | 补拉回来的旧消息照常交给 agent，来源行带发送时间 | 和 QQ 续上断点、Telegram 接着拉一样；超过 5 分钟的本来就带发送时间 |
 | 补拉不早于这个 Bot 第一次接进这个应用的时刻 | 选了已有应用时，私聊里以前那边处理过的话不该交给 agent |
 | 私聊窗口的 ID 用你的 open_id，不用私聊的 chat_id | 路由、头像、`/` 菜单都假定私聊窗口的 ID 就是你的用户 ID |
-| 改卡片的间隔做成配置项 `durations.feishuEdit`，默认 3 秒 | 先看每月调用次数再调；改配置重启就行 |
+| 改卡片的间隔做成配置项 `durations.feishuEdit`，默认 0.4 秒（原来 3 秒） | 和打字速度配着调；每月额度退回 1 万次时调大；改配置重启就行 |
 | 卡片的摘要取正文最后一个非空行的前 50 字 | 会话列表里看到最新进展，不是“[卡片]” |
 | 不是 http、https 的链接只留文字 | Claude 常写指向本地文件的链接，飞书收到就拒收整张卡片。2026-11-10 起本机文件的链接先改写成“名字（路径）”，这一条只管别的地址，例如 `mailto:`（哪些算，见[架构](../architecture.md) §8.3） |
 | 多于 3 张表格、不是飞书的图片地址，不清理 | 少见；拒收了整张退回纯文字，字不丢。多于 3 张表格会不会拒收还没查清，见[要先实测的](#要先实测的)第 10 条 |
@@ -171,7 +172,7 @@ target = "dispatcher/main"
 ```
 
 - `apiRoot`：只给测试用。开放平台和扫码的地址都换成它。
-- `durations.feishuEdit`：同一张卡片两次改之间至少隔多久，默认 `3s`。
+- `durations.feishuEdit`：同一张卡片两次改之间至少隔多久，默认 `400ms`。
 - 库里的 meta 表多两行。键都带 App ID，同一个名字下换了应用不会串，和 `telegramOffset:`、`qqSession:` 一样：
   - `feishuChat:<App ID>`：你和 Bot 私聊的 chat_id，以 `oc_` 开头，补拉要用。
     - 从 Rhodium 自己发出消息的应答里记，应答带 `chat_id`。Rhodium 只给你发，所以记下的一定是你的私聊。
@@ -275,7 +276,7 @@ target = "dispatcher/main"
   - 只有 `text` 时（Rhodium 自己的纯文字），放进一个纯文本元素（`div` 加 `plain_text`），照原样显示，不用转义。
   - 飞书拒收 Markdown 的那张（报 230099；说是表格超过 3 张会拒收，还没查清，见[要先实测的](#要先实测的)第 10 条），同一条改用纯文本元素再发一次、或再改一次。和 Telegram 拒收 rich message 时一样。
 - 按钮跟在正文后面，见[按钮](#按钮)。
-- 摘要（`config.summary`，会话列表和通知里显示的那句）：`text` 最后一个非空行的前 50 字。每次改都跟着换。
+- 摘要（`config.summary`，会话列表和通知里显示的那句）：`text` 最后一个非空行的前 50 字。整张换掉时跟着换，定稿时也换；流式期间飞书自己显示“生成中”。
 - 一条最多 4000 字（`maxTextLength`）。卡片和改卡片的请求最多 30KB，4000 字转义后也放得下。
 - 只有第一次发会提醒你，之后的改不提醒，和 Telegram 一样。
 - 适配器在内存里记着最近发过或改过的 500 张卡片的内容，用在两处：
@@ -307,7 +308,7 @@ target = "dispatcher/main"
 
 - 发送失败带 `quota`，路由照 QQ 主动消息额度用完那样，改经别的 Bot 发，开头写“飞书私聊那边发不出去，改发在这里。”（[架构 §8.2](../architecture.md#82-发送策略)）。
 - 路由的 `refused` 现在按 QQ 的被动回复处理带了入站消息的那种。不是 QQ 的 Bot，不管带没带，一律改经别的 Bot 发。不改的话，飞书会同一条一直重发。
-- 改卡片失败带 `quota`，照编辑失败改发一条新消息。新消息也发不出，同样改经别的 Bot。这个回合之后就在那边接着改，不会每 3 秒多一条。
+- 改卡片失败带 `quota`，照编辑失败改发一条新消息。新消息也发不出，同样改经别的 Bot。这个回合之后就在那边接着改，不会每改一次多一条。
 - 下一条照旧先试飞书。被拒的调用不算额度，下个月 1 号额度回来，自然就恢复了。
 - 不额外通知：改发的消息开头已经说了。
 
@@ -316,8 +317,19 @@ target = "dispatcher/main"
 - 能力表加 `editEvery`：同一条消息两次改之间至少隔多久，从它发出或上一次改算起。飞书是 `durations.feishuEdit`，Telegram 不设。
 - 只管回合的过程消息，也就是 `src/daemon.ts` 的编辑队列。按下面板后原地往下走、撤按钮，照旧马上改：那是你在等的。
 - 同一私聊的请求照旧按 `sendLimit` 排。飞书每秒 5 个：发给同一个人每秒最多 5 条。
-- 编辑队列本来就只留最新内容，等的这 3 秒里来的字都并进下一次。
-- 一个两分钟的回合约 1 次发、40 次改。探针连改 10 次，每次 0.7 到 0.9 秒，没碰到限流。
+- 编辑队列本来就只留最新内容，等的这 0.4 秒和上一次请求的时间里来的字都并进下一次。
+- 一个两分钟的回合最多约 300 次调用，算法见[架构 §8.1](../architecture.md#81-能力表)的每月调用额度。
+
+### 改卡片
+
+2026-11-17 定（#783）。怎么改，每种改动用哪个接口、什么时候整张换掉、sequence 怎么取、流式模式什么时候开和关，写在[架构 §8.2](../architecture.md#82-发送策略)的“飞书，实时编辑”；实测在 §8.1 的卡片实体实测。这里只记要点：
+
+- 每条文字消息先建卡片实体，再按 card_id 发出。消息 ID 对应的 card_id 记在 meta 表 `feishuCard:<消息 ID>`，重启后还能接着改。
+- 文字变长时流式改文字，客户端逐字打出来。打字速度是 `src/feishu.ts` 里的一个常量，略慢于改的节奏，验收时目测再调。
+- 工具段的折叠面板展开、收起、换标题，只改那一块。写法见 [IM 文字与交互规范 §3.3](../im-style.md#33-telegram) 末尾。
+- 带按钮的卡片（面板、提问）照旧整张换掉，不开流。
+- 定稿时关流，同时换摘要。
+- 升级前发的卡片没有 card_id，照旧用 im PATCH 整张改。
 
 ### 按钮
 
@@ -361,7 +373,7 @@ target = "dispatcher/main"
   - 要权限 `contact:user.base:readonly`。默认权限清单里没有。没有时只回 open_id，`profile` 就不给这两样（[架构 §7.9](../architecture.md#79-头像缓存)本来就这样处理）。
   - 通讯录接口不算每月额度。
 - 看板和拓扑图加飞书的平台标志（`web/src/faces.tsx` 的 `Mark`）。
-- 工具行默认用详细写法，按能力表算（能编辑的平台），不按平台名。`src/board.ts` 的 `verboseIn` 现在写死了 Telegram，要跟着改。
+- 工具行默认用详细写法，按能力表算（`progress` 是 `edit` 的平台），不按平台名。`src/board.ts` 的 `verboseIn` 现在写死了 Telegram，要跟着改。
 
 ### `rh bot`
 
@@ -425,10 +437,10 @@ target = "dispatcher/main"
 | 哪里 | 变化 |
 |---|---|
 | `Platform` | 加 `"feishu"`；`PLATFORM` 里写“飞书” |
-| `Capabilities` | 加 `editEvery`（毫秒，可选）；`markdown.extensions` 加 `"emoji"` |
-| 飞书的能力表 | `progress: "edit"`；`buttons: true`；不设 `copy`；`sendLimit: { kind: "rate", perChatPerSecond: 5 }`；`editEvery` 取 `durations.feishuEdit`；`menu: { scope: "global", maxItems: 100 }`；`maxTextLength: 4000`；`maxFileBytes` 图片 10MB、文件 30MB；`markdown: { extensions: ["html", "emoji"] }` |
+| `Capabilities` | 加 `editEvery`（毫秒，可选）；`markdown.extensions` 加 `"emoji"`；#783 加 `panels`（工具段是折叠面板） |
+| 飞书的能力表 | `progress: "edit"`；`finalEdit: true`；`panels: true`；`buttons: true`；不设 `copy`；`sendLimit: { kind: "rate", perChatPerSecond: 5 }`；`editEvery` 取 `durations.feishuEdit`；`menu: { scope: "global", maxItems: 100 }`；`maxTextLength: 4000`；`maxFileBytes` 图片 10MB、文件 30MB；`markdown: { extensions: ["html", "emoji"] }` |
 | 配置 | `[bots.<名字>]` 的 `platform` 可以是 `feishu`；`[durations]` 加 `feishuEdit` |
-| meta 表 | `feishuChat:<App ID>`、`feishuSince:<Bot 行 ID>:<App ID>` |
+| meta 表 | `feishuChat:<App ID>`、`feishuSince:<Bot 行 ID>:<App ID>`；#783 加 `feishuCard:<消息 ID>` |
 | `rh bot` | 平台加 `feishu`；加 `--paste`；`--api-root` 也给飞书 |
 | 路由 | `refused` 里不是 QQ 的 Bot 一律改经别的 Bot 发 |
 | 看板 | 飞书的平台标志；工具行默认写法按能力表算 |
@@ -442,8 +454,14 @@ target = "dispatcher/main"
 | 换访问凭证（SDK 自己管） | 鉴权；`rh bot --paste` 验 App ID 和密钥 | 不算 |
 | 长连接（SDK 自己管） | 收消息和按钮 | 不算 |
 | `GET /open-apis/bot/v3/info` | Bot 的名字、头像、open_id | 算 |
-| `POST /open-apis/im/v1/messages` | 发卡片、图片、文件 | 算 |
-| `PATCH /open-apis/im/v1/messages/<ID>` | 改卡片 | 算 |
+| `POST /open-apis/im/v1/messages` | 发卡片（按 card_id）、图片、文件 | 算 |
+| `POST /open-apis/cardkit/v1/cards` | 建卡片实体 | 没查清（#783） |
+| `PUT /open-apis/cardkit/v1/cards/<card_id>/elements/<element_id>/content` | 流式改一块的文字 | 没查清 |
+| `PATCH /open-apis/cardkit/v1/cards/<card_id>/elements/<element_id>` | 改一块的属性：折叠面板收起、换标题 | 没查清 |
+| `POST /open-apis/cardkit/v1/cards/<card_id>/elements` | 末尾加块 | 没查清 |
+| `PUT /open-apis/cardkit/v1/cards/<card_id>` | 整张换掉 | 没查清 |
+| `PATCH /open-apis/cardkit/v1/cards/<card_id>/settings` | 开关流式模式、换摘要 | 没查清 |
+| `PATCH /open-apis/im/v1/messages/<ID>` | 改升级前发的卡片 | 算 |
 | `GET /open-apis/im/v1/messages` | 补拉 | 算 |
 | `GET /open-apis/im/v1/messages/<ID>` | 合并转发的子消息 | 算 |
 | `GET /open-apis/im/v1/messages/<ID>/resources/<key>` | 下载图片和文件 | 算 |
@@ -490,7 +508,7 @@ target = "dispatcher/main"
   - 收：每种消息转成什么，照[收到的消息](#收到的消息)那张表，用录下的事件；合并转发用录下的 `message.get` 回答展开；回复带 `ref`；按下带卡片的文字。
   - 回执：`rhodium` 拉下一条之前不回执；转换出错回执失败；群消息不交。
   - 发：卡片的形状（`markdown` 或纯文本元素、按钮的行、摘要、`update_multi`）；拒收 Markdown 改用纯文本；图片和文件先上传再发；每种结果怎么报，照上面那张表；99991403 带 HTTP 429 报 `quota`，不重试。
-  - 改：整张改；`dropButtons` 用记着的内容去掉按钮，不知道内容报失败。
+  - 改：文字流式改、面板只改那一块、末尾加块；带按钮的整张换掉；重启后靠 meta 接着改；300309、200850 重开流；200810 等一下再试；定稿关流；升级前的卡片走 im PATCH；`dropButtons` 用记着的内容去掉按钮，不知道内容报失败。
   - 按下：等到提示就回提示，2.5 秒等不到回 `{}`；别人按的（另一个 open_id），交出的 `sender` 和 `chat` 是他，不是你。
   - 补拉：Bot 自己的、`feishuSince` 之前的不交；没有 `feishuChat` 不补拉；分页翻完；`seen` 说收下过的不下载、不展开、不交；补拉交完之前推来的排在补拉的后面；`feishuChat` 从发出消息的应答里记，变了就换。
   - 连接状态：连上报 `true`，断开报 `false`，重试每失败一次再报一次。
@@ -526,7 +544,7 @@ target = "dispatcher/main"
 
 收发：
 
-- 发一句，让 Claude 读几个文件再回答：一张卡片，工具段在引用块里，大约 3 秒一跳，最后一段是回答。会话列表里显示最新的一句。
+- 发一句，让 Claude 读几个文件再回答：一张卡片，正文逐字往外长，不一顿一顿的；工具段是折叠面板，跑的时候展开、标题“（运行中）”，下一段话开始就收起。最后一段是回答。定稿后会话列表里显示最后一句。流式期间会话列表里的摘要显示什么，看一眼记下。
 - 让 agent 原样回 `:OK:`、`<font color='red'>红</font>`、`a < b && c`：都显示成字，不是表情、红字。
 - 发 `/rh_ls`、`/status`：标题和粗体正常，名字里带 `_` 的槽位原样显示。
 - 等[要先实测的](#要先实测的)第 10 条查清飞书拒收什么，再让 agent 回一段会被拒收的话：整张退回纯文字，字都在。
@@ -563,7 +581,6 @@ target = "dispatcher/main"
 | Lark（飞书国际版） | 不做（第 33 轮定） |
 | 群聊 | 随群聊（[产品说明](../product.md) §9） |
 | 按钮行（机器人菜单） | 不做。机器人菜单只能在后台手配；靠 `/` 菜单和 `/rh_help` |
-| 流式卡片的逐字动画 | 不做，理由见[已定的大方向](#已定的大方向) |
 | 语音转写 | 和 Telegram 一起做（[产品说明](../product.md) §13） |
 | 合并转发里的图片和文件 | 不取（第 33 轮定） |
 | 扫码时只要用得上的权限 | 看[要先实测的](#要先实测的)第 7 条。只带权限也拿不到凭据，就不做，`rh bot` 列出能在后台删的 |

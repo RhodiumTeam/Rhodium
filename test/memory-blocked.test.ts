@@ -141,7 +141,10 @@ test("#692: a real unit's memory.pressure, what it uses, its MemoryHigh, and its
   const run = await exec(["systemd-run", "--user", "--collect", "--quiet", `--unit=${unit}`, "--property=MemoryHigh=256M", "python3", "-c", hog]);
   expect(run.code).toBe(0);
   let seen: Awaited<ReturnType<typeof readUnit>> = null;
-  await until(async () => ((seen = await readUnit(unit, true)), (seen?.top[0]?.bytes ?? 0) >= 48 << 20), 10_000);
+  await until(async () => {
+    seen = await readUnit(unit, true);
+    return seen !== null && seen.current >= 48 << 20 && (seen.top[0]?.bytes ?? 0) >= 48 << 20;
+  }, 10_000);
   expect(seen!.high).toBe(256 * 2 ** 20);
   expect(seen!.current).toBeGreaterThanOrEqual(48 << 20);
   expect(seen!.pressure).toEqual({ avg10: expect.any(Number), avg60: expect.any(Number) });

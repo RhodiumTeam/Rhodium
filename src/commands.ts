@@ -1,7 +1,7 @@
 // The one definition of rh's commands (docs/spec/v1.md "rh 命令"). `rh --help`, the agent's
 // `rh --skill`, IM's /rh_help and the command menus are all generated from it.
 // User-facing text is Chinese, like the rest of what the user reads.
-import { homedir } from "node:os";
+import { displayDirectory as tilde } from "./paths";
 import { AGENT_KINDS, AGENTS, DEFAULT_AGENT } from "./agents";
 import { durations, parseDuration } from "./config";
 import type { AgentKind, Choice, Importable, MenuItem, RowButton } from "./contracts";
@@ -155,21 +155,21 @@ export const COMMANDS: CommandDef[] = [
   },
   {
     name: "send",
-    usage: "me|<平台>|<Bot 名> [--file <路径>]... [<文字>] | <工作区/槽位> <文字>",
+    usage: "me|<平台>|<Bot 名> [--file <路径>]... [<文字>|-] | <工作区/槽位> <文字>|-",
     summary:
-      "给用户发消息。rh send me 是往用户的 IM 推一条通知：推到现在指着你的聊天窗口，有几个时取用户最近用的那个，都没有就推到主窗口。用户最后是在网页上给你说话、网页又开在前台时不推，回执会写明；这一次发的内容网页上看得到，之后要说的话写在回复里就行。" +
+      "给用户发消息。rh send me 是往用户的 IM 推一条通知：推到现在指着你的聊天窗口，有几个时取用户最近用的那个，都没有就推到主窗口。用户最后是在网页上给你说话、网页又开在前台时不推，回执会写明；这时这条消息已在网页上整条显示，回复里不用再写一遍。" +
       "也可以指定去处：qq、telegram、feishu 发到用户在那个平台上的私聊，写配置里的 Bot 名就从那个 Bot 发；指定的地方发不出去，改照 rh send me 的规则发。回执写明推到了哪、有没有改发、有没有推，照回执告诉用户。Rhodium 不记去处，也不替你定时：用户要你定期汇报时，你自己定时，到点用 rh send 发，每次都带上去处。" +
       "只用来发文件，以及内部回合（汇报、rh send 等没有人在等回复的回合）里要告诉用户的话；用户从 IM 开始的回合，或者用户从 IM 发的消息并进来的回合，进度直接写在回复里，不要往同一个窗口用 rh send me 发文字。" +
       "文字原样发出，以 - 开头也行；那个窗口的目标不是你时，开头加一行〔工作区/槽位〕标明是你发的。--file 要紧跟在 me 或去处后面，可以给几个：" +
       ".png .jpg .jpeg .gif .webp 按图片发，其他按文件发，每个一条消息，跟在文字后面；超过平台的大小上限就报错，什么都不发。" +
       "在一个回合里用它发到了这个回合的窗口，Rhodium 就不再代发这个回合的最终回复；之后用户又发来消息、并进这个回合，或者在 IM 里回答了你的提问的，照常代发。" +
-      "给槽位发：要写全名“工作区/槽位”。它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
+      "文字写成 - 时从标准输入读正文，例如 heredoc，多行和排版不受命令行引号限制。给槽位发：要写全名“工作区/槽位”。它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
     child: {
-      usage: "me --file <路径>... | <工作区/槽位> <文字>",
+      usage: "me --file <路径>... | <工作区/槽位> <文字>|-",
       summary:
         "给用户发文件，或者给别的槽位发消息。你是子槽位，不能给用户发文字：要说的话写在最终回复里。" +
         "用户直接找你要文件时，用 rh send me --file <路径> 发，不带文字，可以给几个：.png .jpg .jpeg .gif .webp 按图片发，其他按文件发，每个一条消息；超过平台的大小上限就报错，什么都不发。用户没有直接找你时发不出去，把文件的路径写在最终回复里。" +
-        "给槽位发：要写全名“工作区/槽位”，父槽位也行。它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
+        "文字写成 - 时从标准输入读正文，例如 heredoc，多行和排版不受命令行引号限制。给槽位发：要写全名“工作区/槽位”，父槽位也行。它在跑回合就并进当前回合，空闲就开始新回合，未运行就唤醒它（同时运行的槽位已到上限时唤醒不了，调用报错）；它有提问在等用户回答时先排队，答完再投。要给它文件，在文字里写路径",
     },
     who: "both",
   },
@@ -322,7 +322,7 @@ export function sortSlots(slots: SlotEntry[], first?: string, urgent = false): S
 }
 
 /** A directory as you read it, under ~ when it is in your home. */
-export const tilde = (dir: string) => (dir === homedir() || dir.startsWith(`${homedir()}/`) ? `~${dir.slice(homedir().length)}` : dir);
+export { tilde };
 
 /** /rh_use: the bot's default first, 回到默认 if this chat picked its own; then every other slot. */
 function useList(l: Lists): Candidate[] {

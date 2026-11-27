@@ -928,9 +928,12 @@ test("credentials come only from the bot's own config entry, never from qq-cli's
   }
 });
 
-test("capabilities match architecture §8.1: append only, buttons shown on Markdown only, up to 11 (8 choices and a row of 上一页、下一页、取消), passive quota, one global / panel of 20 and the custom menu for the row, files up to the SDK's limits, Markdown", () => {
+test("capabilities match architecture §8.1: append only, what is said streamed in at most every 500 ms for 9 minutes, its last frame sent even unchanged, buttons shown on Markdown only, up to 11 (8 choices and a row of 上一页、下一页、取消), passive quota, one global / panel of 20 and the custom menu for the row, files up to the SDK's limits, Markdown", () => {
   expect(adapter(fakeClient().client).capabilities).toEqual({
     progress: "append",
+    stream: 9 * 60_000,
+    editEvery: 500,
+    finalEdit: true,
     buttons: "markdown",
     maxButtons: 11,
     copy: 256,
@@ -940,4 +943,145 @@ test("capabilities match architecture §8.1: append only, buttons shown on Markd
     maxFileBytes: { image: 30 * 2 ** 20, file: 100 * 2 ** 20 },
     markdown: { extensions: ["heading"], literal: true },
   });
+});
+
+// ---- Streams (#797): stream_messages, which only grow (architecture §8.2). ----
+
+type StreamFrame = { input_mode: string; input_state: number; content_type: string; content_raw: string; event_id: string; msg_id: string; msg_seq: number; index: number; stream_msg_id?: string };
+
+/** fakeClient with QQ's stream_messages as the 2026-11-17 probes found it: a frame must begin with the
+ *  one before it (40111001), and none goes once the stream is closed (40034018). down: codes to answer
+ *  the next frames with. */
+function streamClient(down: number[] = []) {
+  const f = fakeClient();
+  const frames: { path: string; body: StreamFrame }[] = [];
+  const streams = new Map<string, { last: string; done: boolean }>();
+  const fail = (code: number) => new ApiError(`API Error: ${code}`, 400, "/stream", code, String(code));
+  f.client.api.post = async <T>(path: string, body: unknown): Promise<T> => {
+    const b = body as StreamFrame;
+    frames.push({ path, body: b });
+    const code = down.shift();
+    if (code) throw fail(code);
+    const s = b.stream_msg_id ? streams.get(b.stream_msg_id) : undefined;
+    if (b.stream_msg_id && !s) throw fail(40034019);
+    if (s?.done) throw fail(40034018);
+    if (s && !b.content_raw.startsWith(s.last)) throw fail(40111001);
+    const id = b.stream_msg_id ?? `stream${streams.size + 1}`;
+    streams.set(id, { last: b.content_raw, done: b.input_state === 10 });
+    return { id, timestamp: 0 } as T;
+  };
+  return { ...f, frames };
+}
+
+/** A store's meta table, as the daemon hands it (AdapterDeps.kept). */
+function keptIn() {
+  const dir = mkdtempSync(join(tmpdir(), "rhodium-test-qq-stream-"));
+  const store = openStore(join(dir, "rh.db"));
+  return { kept: kept(store), done: () => (store.close(), rmSync(dir, { recursive: true, force: true })) };
+}
+
+const streamer = (client: QQClient, k: ReturnType<typeof kept>) => new QQAdapter("bot1", "dev", creds, { client, log: () => {}, kept: k });
+
+test("#797: a stream opens as a passive reply, msg_id and event_id the message's; its frames keep one msg_seq, the index one up each, the last closing it (input_state 10); a new rhodium carries it on", async () => {
+  const { client, frames } = streamClient();
+  const k = keptIn();
+  try {
+    const a = streamer(client, k.kept);
+    expect(await a.send("U1", { text: "Lo", markdown: "Lo", replyTo: "M1", seq: 77, stream: true })).toEqual({ status: "sent", messageId: "stream1" });
+    expect(await a.edit("U1", "stream1", { text: "Look", markdown: "Look" })).toEqual({ status: "sent", messageId: "stream1" });
+    // rhodium restarted: the stream goes on from what the store keeps.
+    const b = streamer(client, k.kept);
+    expect(await b.edit("U1", "stream1", { text: "Look.", markdown: "Look.", final: true })).toEqual({ status: "sent", messageId: "stream1" });
+    expect(frames.map((f) => f.path)).toEqual(Array(3).fill("/v2/users/U1/stream_messages"));
+    expect(frames.map(({ body: { content_raw, index, input_state, msg_seq, msg_id, event_id, stream_msg_id } }) => [content_raw, index, input_state, msg_seq, msg_id, event_id, stream_msg_id])).toEqual([
+      ["Lo", 0, 1, 77, "M1", "M1", undefined],
+      ["Look", 1, 1, 77, "M1", "M1", "stream1"],
+      ["Look.", 2, 10, 77, "M1", "M1", "stream1"],
+    ]);
+    expect(frames.every((f) => f.body.input_mode === "replace" && f.body.content_type === "markdown")).toBe(true);
+    // Closed, it is no stream any more: an edit fails as on any message.
+    expect((await b.edit("U1", "stream1", { text: "Look..", markdown: "Look.." })).status).toBe("failed");
+    expect(frames.length).toBe(3);
+  } finally {
+    k.done();
+  }
+});
+
+test("#797: a frame QQ turns down for changing what the stream showed (40111001) fails, the stream closed with what it last took", async () => {
+  const { client, frames } = streamClient();
+  const k = keptIn();
+  try {
+    const a = streamer(client, k.kept);
+    await a.send("U1", { text: "abc", markdown: "abc", replyTo: "M1", seq: 5, stream: true });
+    const r = await a.edit("U1", "stream1", { text: "abX", markdown: "abX" });
+    expect(r.status).toBe("failed");
+    expect(frames.slice(1).map((f) => [f.body.content_raw, f.body.index, f.body.input_state])).toEqual([
+      ["abX", 1, 1],
+      ["abc", 2, 10],
+    ]);
+  } finally {
+    k.done();
+  }
+});
+
+test("#797: a closing frame QQ turns down for another reason (content moderation, say) fails, the stream still closed with what it last took", async () => {
+  const down: number[] = [];
+  const { client, frames } = streamClient(down);
+  const k = keptIn();
+  try {
+    const a = streamer(client, k.kept);
+    await a.send("U1", { text: "abc", markdown: "abc", replyTo: "M1", seq: 5, stream: true });
+    down.push(40054010);
+    expect((await a.edit("U1", "stream1", { text: "abcd", markdown: "abcd", final: true })).status).toBe("failed");
+    expect(frames.slice(1).map((f) => [f.body.content_raw, f.body.index, f.body.input_state])).toEqual([
+      ["abcd", 1, 10],
+      ["abc", 2, 10],
+    ]);
+    // Forgotten: a later edit tries nothing.
+    expect((await a.edit("U1", "stream1", { text: "abcd", markdown: "abcd", final: true })).status).toBe("failed");
+    expect(frames.length).toBe(3);
+  } finally {
+    k.done();
+  }
+});
+
+test("#797: a stream QQ ended (40034020, run past its time) fails its edit and is forgotten", async () => {
+  const down: number[] = [];
+  const { client, frames } = streamClient(down);
+  const k = keptIn();
+  try {
+    const a = streamer(client, k.kept);
+    await a.send("U1", { text: "a", markdown: "a", replyTo: "M1", seq: 5, stream: true });
+    down.push(40034020);
+    expect((await a.edit("U1", "stream1", { text: "ab", markdown: "ab", final: true })).status).toBe("failed");
+    expect((await a.edit("U1", "stream1", { text: "ab", markdown: "ab", final: true })).status).toBe("failed");
+    expect(frames.length).toBe(2);
+  } finally {
+    k.done();
+  }
+});
+
+test("#797: a new stream in a chat waits for the one open there to close: QQ shows one at a time, a new one ending the old", async () => {
+  const { client, frames } = streamClient();
+  const k = keptIn();
+  try {
+    const a = streamer(client, k.kept);
+    await a.send("U1", { text: "A", markdown: "A", replyTo: "M1", seq: 1, stream: true });
+    const second = a.send("U1", { text: "B", markdown: "B", replyTo: "M1", seq: 2, stream: true });
+    await Bun.sleep(20);
+    await a.edit("U1", "stream1", { text: "A.", markdown: "A.", final: true });
+    expect(await second).toEqual({ status: "sent", messageId: "stream2" });
+    expect(frames.map((f) => f.body.content_raw)).toEqual(["A", "A.", "B"]);
+  } finally {
+    k.done();
+  }
+});
+
+test("#797: a stream with no message to reply to (an active message, or a reply to a button press) goes as a plain message", async () => {
+  const { client, frames, sent } = streamClient();
+  const a = adapter(client);
+  expect((await a.send("U1", { text: "x", markdown: "x", seq: 3, stream: true })).status).toBe("sent");
+  expect((await a.send("U1", { text: "y", markdown: "y", replyTo: "event:E1", seq: 4, stream: true })).status).toBe("sent");
+  expect(frames).toEqual([]);
+  expect(sent.length).toBe(2);
 });

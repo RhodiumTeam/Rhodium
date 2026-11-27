@@ -148,9 +148,19 @@ test("/resume while a turn runs says so and leaves the turn alone", async () => 
   await say("first");
   await until(async () => (await rhodium.state("w/a")) === "运行中", 15_000);
   await say("/resume from-terminal");
-  expect((await posts())[0]!.text).toBe("/resume 没做成。\n原因：回合还在进行，先 /stop 再 /resume");
+  // What pi says as it goes streams in on QQ (#797): its "working" comes first.
+  expect((await posts(2)).map((p) => p.text)).toEqual(["working", "/resume 没做成。\n原因：回合还在进行，先 /stop 再 /resume"]);
   expect(await rhodium.state("w/a")).toBe("运行中");
   expect(rhodium.pi.runs()).toHaveLength(1);
+}, 30_000);
+
+test("#797: /stop cuts the turn short: the stream of what pi said closes as it was", async () => {
+  await slot({}, { pi: { script: "pi-until-interrupted" } });
+  await say("first");
+  expect((await posts())[0]).toMatchObject({ text: "working", stream: true });
+  await say("/stop");
+  await until(async () => (await rhodium.im.log("q", ME)).some((p) => p.final), 15_000);
+  expect((await rhodium.im.log("q", ME)).filter((p) => p.final).map((p) => p.text)).toEqual(["working"]);
 }, 30_000);
 
 test("/resume of a conversation another slot is on is refused: two pi would write one session file", async () => {

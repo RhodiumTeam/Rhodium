@@ -7,9 +7,18 @@
 // too: for a conversation on disk or the agent in a Herdr pane, with the same check that no one else
 // uses it; an imported pane is watched as one switched to.
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { localDrivePath, sameDirectory } from "./paths";
+import { holders } from "./session-processes";
+import { piPaneHasCredentials } from "./pi-pane-credentials";
+import { windows } from "./windows";
+import { detached } from "./detached";
+import { nativeProcess } from "./tui-process";
+import { lastSettings, managedVimFile, nativeVimLaunch, rememberVimLaunch, type VimLaunch } from "./tui-vim";
+import { windowsConversationLock } from "./tui-lock";
+import { isWindowsAgentNodeEntry, windowsPaneCommand } from "./windows-tui-launch";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AGENTS, AGENT_KINDS, terminalUnset, TYPING } from "./agents";
 import { claudeFlags } from "./claude";
 import { locate, type Config } from "./config";
@@ -27,6 +36,7 @@ import { codexCall, findConversations, hasTranscript, listConversations, piSetti
 
 /** A process's state, parent and start time (/proc/<pid>/stat); null once it is gone. */
 function procStat(pid: number): { state: string; ppid: number; start: number } | null {
+  if (detached) return nativeProcess(pid);
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     // Its name may hold spaces and parentheses: the fields go on after the last ")".
@@ -68,25 +78,6 @@ export function ancestors(pid: number): string[] {
   return out;
 }
 
-/** Every other process whose command line names the session: it has the conversation open. Not an
- *  rh import of it, nor the shell running that, which name it only to ask for it.
- *  ponytail: blind to pi, whose process title wipes its command line; rhodium's own pis hold the
- *  conversation lock, and Herdr's panes report pi's session. One you start by hand elsewhere goes unseen. */
-// ponytail: matched by the words "rh import" in the command line; by the rh call's parent chain if that misfires.
-function holders(session: string): number[] {
-  return readdirSync("/proc")
-    .filter((d) => /^\d+$/.test(d) && Number(d) !== process.pid)
-    .filter((d) => {
-      try {
-        const cmd = readFileSync(`/proc/${d}/cmdline`, "utf8").replaceAll("\0", " ");
-        return cmd.includes(session) && !/\brh import\b/.test(cmd);
-      } catch {
-        return false; // gone meanwhile
-      }
-    })
-    .map(Number);
-}
-
 /** Whether rh import takes a Herdr pane that reports an agent by this name: one of ours with paneImport. */
 const importsPane = (name: string | undefined): boolean => Object.hasOwn(AGENTS, name ?? "") && AGENTS[name as AgentKind].paneImport;
 
@@ -95,13 +86,37 @@ const shells = () => new Set(readFileSync("/etc/shells", "utf8").split("\n").fil
 
 /** The session a Herdr pane reports. pi's Herdr extension reports its session's file when it has
  *  one, named "<start time>_<id>.jsonl" (architecture §6.3); Claude's hook, the id. */
-function paneSession(pane: any): string | undefined {
+export function paneSession(pane: any): string | undefined {
   const v: string | undefined = pane?.agent_session?.value;
   return v?.endsWith(".jsonl") ? basename(v, ".jsonl").split("_").at(-1) : v;
 }
 
+/** A restored tab in our own workspace may be discarded once it contains only a shell. */
+export function restoredShell(pane: { agent?: string; agent_session?: unknown }, pid: number | undefined, needsReceipt = windows) {
+  return pid === undefined && (!needsReceipt || (!pane.agent && !pane.agent_session));
+}
+
+type ForegroundAgent = { pid: number; name: string; argv?: string[]; cwd?: string };
+
+/** Match the pane's reported agent to its foreground process before adopting its session. */
+export async function inspectPaneAgent(kind: AgentKind, pane: string, session: string, foreground: ForegroundAgent[], checkPi = piPaneHasCredentials) {
+  const named = (name: string | undefined, expected: string) => name === expected || (windows && !!name && basename(name).toLowerCase().replace(/\.exe$/, "") === expected);
+  const agent = foreground.find(f => named(f.name, kind) || named(f.argv?.[0], kind)) ?? (windows && foreground.find(
+    f => (named(f.name, "node") || named(f.argv?.[0], "node")) && isWindowsAgentNodeEntry(kind, f.argv?.[1]),
+  ));
+  if (!agent) throw new Error(`pane ${pane} 里的 ${kind} 已经退出了`);
+  const start = procStat(agent.pid)?.start ?? fail(`pane ${pane} 里的 ${kind} 已经退出了`);
+  if (kind === "pi") {
+    const has = await checkPi(agent.pid);
+    if (has !== false) fail(`${has ? `pane ${pane} 里的 pi 带着 Anthropic 的凭据` : `读不到 pane ${pane} 里 pi 的环境，不知道它带没带 Anthropic 的凭据`}，Rhodium 不能接管。在 pane 里退出它，再从磁盘导入：rh import ${session.slice(0, 8)}`);
+  }
+  if (kind === "pi" && !running(agent.pid, start)) fail(`pane ${pane} 里的 pi 已经退出了`);
+  if (!agent.cwd) throw new Error(`读不到 pane ${pane} 里的 ${kind} 的工作目录`);
+  return { pid: agent.pid, start, dir: windows ? localDrivePath(agent.cwd) : agent.cwd };
+}
+
 /** capabilities: as createRunner's, for the system prompt the terminal is started with. */
-export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabilities: (bot: string) => Capabilities | undefined }) {
+export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabilities: (bot: string) => Capabilities | undefined }, checkPi = piPaneHasCredentials) {
   const { cfg, store, loop } = o;
   const program = (p: string) => locate(p, cfg.agentPath) ?? fail(`${p} 不在 PATH 上（${cfg.agentPath}）`);
 
@@ -181,10 +196,15 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
   // Through TUI mode rhodium holds the conversation lock, as the holder does while headless
   // (architecture §10.1): by conversation, the lock's fd. Slots in TUI mode before this rhodium
   // started get theirs again.
-  const locks = new Map<string, number>();
+  const locks = new Map<string, () => void>();
+  function conversationLock(path: string) {
+    if (windows) return windowsConversationLock(path);
+    const fd = lock(path);
+    return fd === null ? null : () => closeSync(fd);
+  }
   for (const s of store.tx((tx) => tx.find("slot", { mode: "tui" }))) {
     if (!s.herdrPane || !s.conversation) continue;
-    const fd = lock(holderPaths(cfg, s.conversation).lock);
+    const fd = conversationLock(holderPaths(cfg, s.conversation).lock);
     if (fd === null) log("cannot take a TUI slot's conversation lock again", { slot: s.id });
     else locks.set(s.conversation, fd);
   }
@@ -192,15 +212,30 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
   /** The pid of the agent the pane runs: the pane's own process, once it runs neither a shell nor env
    *  (the launch command's, or a script's #!/usr/bin/env node). Not by name or command line: pi sets
    *  its process title, which leaves /proc only "pi". */
-  async function agentPid(socket: string, pane: string): Promise<number> {
-    const sh = shells();
+  async function agentPid(socket: string, pane: string, identity?: string): Promise<number> {
+    const sh = windows ? null : shells();
     const pid = await poll(async () => {
       const pid: number = (await request(socket, "pane.process_info", { pane_id: pane })).process_info.shell_pid;
+      if (windows) {
+        if (!identity) return;
+        let agent;
+        try { agent = JSON.parse(readFileSync(identity, "utf8")); }
+        catch { return; } // the launcher publishes the actual child after it starts
+        if (!agent) return;
+        if (agent.launcherPid !== undefined) {
+          if (agent.launcherPid !== pid || !running(pid, agent.launcherStart)) return;
+          if (typeof agent.error === "string") throw new Error(agent.error);
+        }
+        const proc = nativeProcess(agent.pid);
+        if (!proc || proc.start !== agent.start || proc.state === "Z") return;
+        // Older Codex receipts predate launcher identity and name a direct child.
+        return agent.launcherPid !== undefined || proc.ppid === pid ? agent.pid : undefined;
+      }
       let exe = "env";
       try {
-        exe = basename(readlinkSync(`/proc/${pid}/exe`));
+        exe = basename(detached ? nativeProcess(pid)?.exe || "env" : readlinkSync(`/proc/${pid}/exe`));
       } catch {} // gone, or not yet
-      return exe !== "env" && !sh.has(exe) ? pid : undefined;
+      return exe !== "env" && !sh!.has(exe) ? pid : undefined;
     });
     return pid ?? fail(`pane ${pane} 里的 agent 没有起来`);
   }
@@ -223,7 +258,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
       const models = namesOf(tx, "claude");
       return { slot, conv: tx.get("conversation", slot.conversation!)!, ws: tx.get("workspace", slot.workspace)!, models };
     });
-    let fd: number | null = null;
+    let fd: (() => void) | null = null;
     // What this switch made, to close again should it fail: a new workspace's own tab, and the slot's.
     let root: string | undefined;
     let tab: string | undefined;
@@ -246,7 +281,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
       const args = await terminal.args(slot, session, models, writePrompt(o, slot.id, who.child, true));
       // The holder lets go of the lock as it exits, a moment after it reported the agent's exit.
       const path = holderPaths(cfg, conv.id).lock;
-      for (const end = Date.now() + cfg.durations.stopGrace; (fd = lock(path)) === null && Date.now() < end; ) await Bun.sleep(50);
+      for (const end = Date.now() + cfg.durations.stopGrace; (fd = conversationLock(path)) === null && Date.now() < end; ) await Bun.sleep(50);
       if (fd === null) fail("对话锁还被别的进程拿着");
       // Kept for the watch: Herdr gone right after the switch is then tried every RETRY, not every LOOK.
       socket = await sessionSocket(program(cfg.programs.herdr), cfg.herdr.session);
@@ -257,17 +292,21 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
       // if it has the conversation (architecture §10.1).
       const ours = snapshot.workspaces.filter((w: any) => w.workspace_id === ws.herdrWorkspace || w.label === ws.name).map((w: any) => w.workspace_id);
       const left = snapshot.tabs.find((t: any) => t.label === slot.name && ours.includes(t.workspace_id));
-      const leftPane: string | undefined = left && snapshot.panes.find((p: any) => p.tab_id === left.tab_id)?.pane_id;
+      const previousPane = left && snapshot.panes.find((p: any) => p.tab_id === left.tab_id);
+      const leftPane: string | undefined = previousPane?.pane_id;
       // One with only a shell in it, say Herdr restored it without its agent, is as none: a new tab
       // opens. One in the Herdr workspace Rhodium made goes first, so the next switch need not wait for
       // it again; one Rhodium only found by its name may be yours, and stays.
-      const leftPid = leftPane ? await agentPid(socket, leftPane).catch(() => undefined) : undefined;
-      if (leftPane && leftPid === undefined && left.workspace_id === ws.herdrWorkspace) {
+      const holderDir = holderPaths(cfg, conv.id).dir;
+      const current = join(holderDir, "tui-current");
+      let identity = windows && existsSync(current) ? join(holderDir, readFileSync(current, "utf8") + ".pid") : undefined;
+      const leftPid = leftPane ? await agentPid(socket, leftPane, identity).catch(() => undefined) : undefined;
+      if (leftPane && left.workspace_id === ws.herdrWorkspace && restoredShell(previousPane, leftPid)) {
         await request(socket, "tab.close", { tab_id: left.tab_id });
         ({ snapshot } = await request(socket, "session.snapshot"));
       }
       // Only "no such process" counts, never a stored pid.
-      const found = session === null ? [] : holders(session);
+      const found = session === null ? [] : await holders(session);
       let adopt = leftPid !== undefined && found.includes(leftPid);
       if (leftPid !== undefined && !adopt) {
         // pi's command line names no session (holders): the session its pane reports, once it is up, does.
@@ -303,16 +342,31 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
         const env = { RHODIUM_SOCKET: join(cfg.socketDir, "rh.sock"), RHODIUM_SLOT: ref, RHODIUM_TOKEN: token, TELEGRAM_STATE_DIR, ...childEnv(child) };
         // Each agent's own terminal on the session, in the slot's directory; any but Claude without the
         // keys that would put it on your Claude subscription, as headless (agents.ts, architecture §6.3).
-        const unset = terminalUnset(conv.agent, process.env).flatMap((k) => ["-u", k]);
+        const unset = terminalUnset(conv.agent, process.env);
         // The tab runs the agent itself: no shell, so nothing typed shows on its screen, and the pane
         // ends with the agent (#372, architecture §10.3).
-        const command = ["/usr/bin/env", ...unset, `PATH=${cfg.agentPath}`, agent, ...args];
+        let command: string[];
+        if (windows) {
+          mkdirSync(holderDir, { recursive: true });
+          const id = randomUUID();
+          identity = join(holderDir, id + ".pid");
+          command = windowsPaneCommand(join(holderDir, id + ".request"), { agent: conv.agent, argv: [agent, ...args], env: { PATH: cfg.agentPath }, unset, identity });
+          const previous = existsSync(current) && readFileSync(current, "utf8");
+          writeFileSync(current + ".tmp", id);
+          renameSync(current + ".tmp", current);
+          if (previous && /^[0-9a-f-]{36}$/.test(previous)) {
+            rmSync(join(holderDir, previous + ".pid"), { force: true });
+            rmSync(join(holderDir, previous + ".request"), { force: true });
+          }
+        } else {
+          command = ["/usr/bin/env", ...unset.flatMap(k => ["-u", k]), `PATH=${cfg.agentPath}`, agent, ...args];
+        }
         const { layout } = await request(socket, "layout.apply", { workspace_id: workspace, tab_label: slot.name, root: { type: "pane", cwd: slot.dir, env, command } });
         tab = layout.tab_id as string;
         const pane: string = layout.root.pane_id;
         if (root) await request(socket, "tab.close", { tab_id: root });
         root = undefined;
-        at = { workspace, tab, pane, pid: await agentPid(socket, pane) };
+        at = { workspace, tab, pane, pid: await agentPid(socket, pane, identity) };
         // Its screen is up about when it reports its session: only then is the switch told, and the
         // pane handed to the slot's web page. Claude in a directory it has not trusted reports none
         // till you answer its question, which its screen shows: so no more than SCREEN_WAIT (§10.3).
@@ -322,6 +376,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
         else await reportedBy(socket, pane, SCREEN_WAIT);
       }
       opened = { ...at, session, start: procStat(at.pid)?.start ?? fail("pane 里的 agent 起来就退出了") };
+      if (detached && !adopt && conv.agent === "claude") rememberVimLaunch(holderDir, at.pid, opened.start, args, slot.dir);
       locks.set(conv.id, fd!);
       // /rh_tui from IM: your Herdr shows the pane when you get to it. Not done, the switch stands all the same.
       if (slot.tuiFocus) {
@@ -330,7 +385,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
       }
     } catch (err) {
       log("cannot switch to the terminal", { slot: slotId, error: String(err) });
-      if (fd !== null) closeSync(fd);
+      if (fd !== null) fd();
       for (const t of [tab, root]) if (socket && t) await request(socket, "tab.close", { tab_id: t }).catch(() => {});
       opened = { error: (err as Error).message };
     }
@@ -384,7 +439,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
     const session = paneSession(pane);
     if (!session) return;
     const v: string = pane.agent_session.value;
-    if (v.endsWith(".jsonl") && dirname(v) !== sessionsDir(s.dir, store.tx((tx) => tx.get("conversation", s.conversation!))!.agent)) {
+    if (v.endsWith(".jsonl") && !sameDirectory(dirname(v), sessionsDir(s.dir, store.tx((tx) => tx.get("conversation", s.conversation!))!.agent))) {
       reported.delete(s.id);
       elsewhere.add(s.id);
     } else {
@@ -480,7 +535,14 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
     const screen = typeof text === "string" ? text : undefined;
     let input = inputState(agent, status, screen);
     // Claude in vim mode takes text only in INSERT, which alone shows a mark: read as typing needs it (§10.5).
-    if (input === "ready" && agent === "claude" && vim(s.dir, s.tuiPid!)) input = inputState(agent, status, screen, true);
+    if (input === "ready" && agent === "claude") {
+      let native: VimLaunch | undefined;
+      if (detached && s.conversation) {
+        const info = await call(socket!, "pane.process_info", { pane_id: s.herdrPane }).catch(() => undefined);
+        native = nativeVimLaunch(holderPaths(cfg, s.conversation).dir, s.tuiPid!, s.tuiStart, info?.result?.process_info?.foreground_processes);
+      }
+      if (vim(s.dir, s.tuiPid!, homedir(), native)) input = inputState(agent, status, screen, true);
+    }
     if (input !== s.tuiInput)
       store.tx((tx) => {
         const now = tx.get("slot", s.id);
@@ -524,7 +586,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
       const info = await request(socket!, "pane.process_info", { pane_id: s.herdrPane }).catch(() => undefined);
       const inPane: number[] = (info?.process_info.foreground_processes ?? []).map((p: { pid: number }) => p.pid);
       const session = sessionOf(s);
-      const pid = session === null ? undefined : holders(session).find((p) => inPane.includes(p));
+      const pid = session === null ? undefined : (await holders(session)).find((p) => inPane.includes(p));
       const start = pid === undefined ? undefined : procStat(pid)?.start;
       if (start !== undefined) resumed[s.id] = { pid: pid!, start };
       // Herdr gone again since it answered: it took the agent with it, and the subscription's end says so.
@@ -593,7 +655,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
         const settings = await settingsIn(s, session).catch((err) => (log("cannot read what the terminal ran on", { slot: slotId, error: String(err) }), {}));
         result = { session, ...settings, ...(elsewhere.has(slotId) && { elsewhere: true as const }), ...(restarted && { restarted: true as const }) };
         const fd = locks.get(s.conversation);
-        if (fd !== undefined) closeSync(fd);
+        fd?.();
         locks.delete(s.conversation);
         reported.delete(slotId);
         elsewhere.delete(slotId);
@@ -619,7 +681,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
     const conv = store.tx((tx) => tx.get("conversation", s.conversation!))!;
     if (!s.tuiLaunched || s.tuiStart === null) return {};
     // The agent's start: tuiStart counts clock ticks after boot, 100 a second on Linux.
-    const since = Date.now() - Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]) * 1000 + s.tuiStart * 10;
+    const since = detached ? s.tuiStart / 1000 : Date.now() - Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]) * 1000 + s.tuiStart * 10;
     const read = async (id: string | null, side: "after" | "before" | "first") => {
       const file = id === null ? undefined : (await findConversations(id)).find((c) => c.agent === conv.agent && c.id === id)?.file;
       return !file ? {} : side === "first" ? await piSettings(file, since, side) : await ranOn(conv.agent, file, since, side);
@@ -639,11 +701,11 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
   /** Throws unless no one else uses the session: no other process names it on its command line, and
    *  no other Herdr pane reports it (architecture §10.1). With Herdr away there are no panes to look at. */
   async function nobodyHas(session: string, except?: { pid: number; pane: string }): Promise<void> {
-    const others = holders(session).filter((p) => p !== except?.pid);
+    const others = (await holders(session)).filter((p) => p !== except?.pid);
     if (others.length) fail("另一个进程正在用这段对话");
     const at = await herdrSocket();
     const snap = at && (await request(at, "session.snapshot").catch(() => undefined));
-    const pane = snap?.snapshot.panes.find((p: any) => paneSession(p) === session && p.pane_id !== except?.pane);
+    const pane = snap?.snapshot?.panes?.find((p: any) => paneSession(p) === session && p.pane_id !== except?.pane);
     if (pane) fail("Herdr 里另一个 pane 正在用这段对话");
   }
 
@@ -1021,7 +1083,8 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
     if (!hits.length) fail(`磁盘上没有对话 ${prefix}`);
     if (hits.length > 1) fail(`以 ${prefix} 开头的对话有 ${hits.length} 段，写长一点：${hits.slice(0, 5).map((h) => h.id).join("、")}${hits.length > 5 ? " 等" : ""}`);
     const { agent, id: session, file } = hits[0]!;
-    const dir = (await startedIn(file)) ?? fail(`对话 ${session} 的记录里没有它的目录`);
+    const cwd = (await startedIn(file)) ?? fail(`对话 ${session} 的记录里没有它的目录`);
+    const dir = windows ? localDrivePath(cwd) : cwd;
     if (!existsSync(dir)) fail(`对话 ${session} 的目录 ${dir} 已经不在了`);
     await nobodyHas(session);
     return { agent, session, dir };
@@ -1035,17 +1098,16 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
     // Your codex in a pane runs on your shared app-server, which knows of no slot (spec codex.md 不做的事).
     if ((p.agent_session?.agent ?? p.agent) === "codex") fail("Codex 只能从磁盘导入：rh import <线程 ID>");
     const reported = p.agent_session ?? fail(`pane ${pane} 里没有报告了对话的 agent`);
-    // ponytail: Claude only, as for rh tui; pi's pane reports come with #43.
     const kind: AgentKind = reported.agent;
     if (!importsPane(kind)) fail(`pane ${pane} 里的 agent 是 ${kind}，暂时只能导入 ${AGENT_KINDS.filter(importsPane).join("、")} 的 pane`);
+    const session = paneSession(p)!;
     const { process_info } = await request(at, "pane.process_info", { pane_id: pane });
-    const agent = (process_info.foreground_processes as { pid: number; name: string; cwd: string }[]).find((f) => f.name === kind);
-    const start = (agent && procStat(agent.pid)?.start) ?? fail(`pane ${pane} 里的 ${kind} 已经退出了`);
-    await nobodyHas(reported.value, { pid: agent!.pid, pane });
-    return { agent: kind, session: reported.value, dir: agent!.cwd, pane: { workspace: p.workspace_id, tab: p.tab_id, pane, pid: agent!.pid, start } };
+    const target = await inspectPaneAgent(kind, pane, session, process_info.foreground_processes, checkPi);
+    await nobodyHas(session, { pid: target.pid, pane });
+    return { agent: kind, session, dir: target.dir, pane: { workspace: p.workspace_id, tab: p.tab_id, pane, pid: target.pid, start: target.start } };
   }
 
-  /** What there is to import: the claude agents the panes of Rhodium's Herdr session report (none
+  /** What there is to import: the agents the panes of Rhodium's Herdr session report (none
    *  while Herdr is away), with what their conversation on disk last said, if it has said anything;
    *  and the conversations on disk started in dir but for those, once each. */
   async function importable(dir: string): Promise<{ dir: string; list: Importable[] }> {
@@ -1057,7 +1119,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
       (snap?.snapshot.panes ?? [])
         .filter((p: any) => importsPane(p.agent_session?.agent))
         .map(async (p: any) => {
-          const [session, cwd] = [p.agent_session.value, p.foreground_cwd ?? p.cwd];
+          const [session, cwd] = [paneSession(p)!, p.foreground_cwd ?? p.cwd];
           const c = (await inDir(cwd)).find((c) => c.id === session);
           return { agent: p.agent_session.agent, session, dir: cwd, pane: p.pane_id, ...(c && { at: c.modifiedAt.getTime(), said: c.title }) };
         }),
@@ -1085,7 +1147,7 @@ export function createTui(o: { cfg: Config; store: Store; loop: Loop; capabiliti
     loop.enqueue({ ...rest, found });
     const [s] = had ? [] : slots();
     if (!s?.conversation) return; // refused
-    const fd = lock(holderPaths(cfg, s.conversation).lock);
+    const fd = conversationLock(holderPaths(cfg, s.conversation).lock);
     if (fd === null) log("cannot take an imported slot's conversation lock", { slot: s.id });
     else locks.set(s.conversation, fd);
     void watch();
@@ -1481,20 +1543,20 @@ export function heard(h: Heard, k: TurnLine): Heard {
 /** Whether Claude's editorMode is vim for the slot's terminal: the first source that sets it, by Claude's
  *  order: managed, the --settings flag of its process (pid), the slot directory's local and project
  *  settings, yours, then the legacy key in ~/.claude.json (architecture §10.5). Read only, never written. */
-export function vim(dir: string, pid: number, home = homedir()): boolean {
-  let flag: string | undefined;
-  try {
-    const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-    // The last one, as a repeated flag goes.
-    for (const [i, a] of argv.entries()) {
-      if (a === "--settings") flag = argv[i + 1];
-      else if (a.startsWith("--settings=")) flag = a.slice("--settings=".length);
-    }
-  } catch {} // gone: the files alone
+export function vim(dir: string, pid: number, home = homedir(), native?: VimLaunch, managed = managedVimFile()): boolean {
+  let flag = native?.settings;
+  if (!detached && !native) {
+    try { flag = lastSettings(readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")); }
+    catch {} // gone: the files alone
+  }
   const sources = [
-    () => readFileSync("/etc/claude-code/managed-settings.json", "utf8"),
-    // Inline JSON, or a file, relative to the process's directory.
-    () => (flag === undefined ? "" : flag.trimStart().startsWith("{") ? flag : readFileSync(resolve(readlinkSync(`/proc/${pid}/cwd`), flag), "utf8")),
+    () => readFileSync(managed, "utf8"),
+    () => {
+      if (flag === undefined || flag.trimStart().startsWith("{")) return flag ?? "";
+      if (native && isAbsolute(flag)) return readFileSync(flag, "utf8");
+      const cwd = native ? native.cwd : readlinkSync(`/proc/${pid}/cwd`);
+      return cwd ? readFileSync(resolve(cwd, flag), "utf8") : "";
+    },
     ...[join(dir, ".claude/settings.local.json"), join(dir, ".claude/settings.json"), join(home, ".claude/settings.json"), join(home, ".claude.json")].map((f) => () => readFileSync(f, "utf8")),
   ];
   for (const read of sources) {

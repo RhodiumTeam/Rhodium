@@ -1,6 +1,9 @@
 // Holders (architecture §4): launch one per headless conversation through systemd,
 // and speak hold/1 to it. The holder itself is the Rust binary rh-hold (holder/).
-import { rmSync, statSync } from "node:fs";
+import { mkdirSync, rmSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { dialWindows, makePipe, windows } from "./windows";
+import { detached, holderExecutable, holderLive, unconfirmedMacExit } from "./detached";
 import { connect } from "node:net";
 import { dirname, join } from "node:path";
 import type { Config } from "./config";
@@ -45,16 +48,25 @@ export async function launchHolder(o: {
   holdBin?: string;
 }) {
   const { cfg, store, conversation } = o;
-  const holdBin = o.holdBin ?? join(dirname(process.execPath), "rh-hold");
+  const holdBin = holderExecutable(o.holdBin);
   const p = holderPaths(cfg, conversation);
   for (const path of [holdBin, p.dir, p.sock, p.lock]) {
-    if (!plainPath.test(path)) {
+    if (!detached && !plainPath.test(path)) {
       throw new Error(`holder: path ${JSON.stringify(path)} has characters systemd would expand`);
     }
   }
   // The conversation's last holder may still be on its way out, its ExecStopPost running. systemd
   // takes no new unit of the same name until it is gone, which is quick.
-  const gone = await unitGone(p.unit, cfg.durations.holderGone);
+  if (detached) {
+    mkdirSync(p.dir, { recursive: true });
+    const until = Date.now() + cfg.durations.holderGone;
+    while (await holderLive(holdBin, p.dir)) {
+      if (Date.now() >= until) throw new Error("a holder still owns this conversation");
+      await Bun.sleep(50);
+    }
+  }
+  if (await unconfirmedMacExit(p.dir, holdBin)) throw new Error("托管进程异常退出，尚未确认旧 agent 已结束；拒绝双开");
+  const gone = detached || await unitGone(p.unit, cfg.durations.holderGone);
   // The last agent's exit, gone before this holder is on record: from then on, after a restart, an
   // exit file with no unit always means this holder ran and ended (architecture §4.2).
   rmSync(join(p.dir, "exit"), { force: true });
@@ -73,6 +85,25 @@ export async function launchHolder(o: {
     if (!row) tx.insert("holder", { conversation, ...set, outOffset: 0 });
     else tx.update("holder", { conversation }, { ...set, outOffset: row.outOffset > size ? 0 : row.outOffset });
   });
+  if (detached) {
+    mkdirSync(dirname(p.sock), { recursive: true });
+    const pipe = windows ? makePipe(p.sock, true) : null;
+    const child = spawn(holdBin, ["run", p.dir, pipe?.name ?? p.sock, p.lock, String(cfg.durations.holdStartTimeout)], {
+      detached: true, windowsHide: true, stdio: "ignore", env: pipe ? { ...process.env, RHODIUM_PIPE_PROOF: pipe.proof } : process.env,
+    });
+    await new Promise<void>((ok, fail) => { child.once("error", fail); child.once("spawn", ok); });
+    child.unref();
+    const until = Date.now() + cfg.durations.holdStartTimeout;
+    while (Date.now() < until && child.exitCode === null) {
+      const socket = windows ? await dialWindows(p.sock).catch(() => null) : await new Promise<import("node:net").Socket | null>((ok) => {
+        const s = connect(p.sock, () => ok(s));
+        s.once("error", () => ok(null));
+      });
+      if (socket) { socket.destroy(); return p; }
+      await Bun.sleep(50);
+    }
+    throw new Error("holder did not open its endpoint");
+  }
   const argv = [
     "systemd-run",
     "--user",
@@ -149,13 +180,15 @@ type Waiter = { resolve: (v: any) => void; reject: (e: Error) => void };
  * Connects to a holder: hello, then the holder replays out.log from `offset` and goes live.
  * A newer connection to the same holder closes this one.
  */
-export function connectHolder(
+export async function connectHolder(
   sock: string,
   hello: { boot: number; offset: number },
   on: HolderEvents,
+  deadline?: number,
 ): Promise<HolderLink> {
+  const s = windows ? await dialWindows(sock, deadline) : connect(sock);
   return new Promise((resolve, reject) => {
-    const s = connect(sock);
+    const timer = deadline === undefined ? undefined : setTimeout(() => s.destroy(new Error("holder handshake timed out")), Math.max(1, deadline - Date.now()));
     const acks = new Map<string, Waiter>();
     let started: Waiter | undefined;
     let link: HolderLink | undefined;
@@ -171,6 +204,7 @@ export function connectHolder(
 
     const handle = (m: HoldMessage) => {
       if (m.type === "hello_ok") {
+        clearTimeout(timer);
         link = {
           hello: m,
           start: (spec) => wait((w) => (started = w), { type: "start", ...spec }),
@@ -212,9 +246,11 @@ export function connectHolder(
       }
       if (chunk.length) parts.push(chunk);
     });
-    s.on("connect", () => send({ type: "hello", proto: HOLD_PROTO, ...hello }).catch(() => s.destroy()));
+    const greet = () => send({ type: "hello", proto: HOLD_PROTO, ...hello }).catch(() => s.destroy());
+    if (windows) void greet(); else s.on("connect", greet);
     s.on("error", () => {}); // close follows
     s.on("close", () => {
+      clearTimeout(timer);
       // A write that was sent but not acked may or may not have reached the agent (§4.6).
       const gone = new Error("holder: connection closed");
       for (const w of acks.values()) w.reject(gone);
